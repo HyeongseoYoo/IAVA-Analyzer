@@ -4,6 +4,7 @@ module Loc = struct
   type t = int
 
   module Map = Map.Make (Int)
+
   let string_of_t (a : t) : string = string_of_int a
 end
 
@@ -20,7 +21,10 @@ module Value = struct
     | Int _, Loc _ -> -1
     | Loc _, Int _ -> 1
 
-  let string_of_t = function Int n -> string_of_int n | Loc a -> string_of_int a | Unit -> "unit"
+  let string_of_t = function
+    | Int n -> string_of_int n
+    | Loc a -> string_of_int a
+    | Unit -> "unit"
 end
 
 module ProgramPoint = struct
@@ -59,6 +63,7 @@ end
 
 module Var = struct
   type t = string
+
   let compare = String.compare
 
   module Map = Map.Make (String)
@@ -77,22 +82,21 @@ module Mem = struct
     let bindings =
       Loc.Map.bindings m
       |> List.map (fun (a, (v, p)) ->
-             Printf.sprintf "%s ↦ <%s , %s>" (Loc.string_of_t a) (Value.string_of_t v)
+             Printf.sprintf "%s ↦ <%s , %s>" (Loc.string_of_t a)
+               (Value.string_of_t v)
                (ProgramPoint.string_of_t p))
     in
     String.concat "\n" bindings
-  
+
   module Set = struct
     include Set.Make (struct
       type nonrec t = t
+
       let compare = compare
     end)
 
-    let string_of_t (ms: t) : string =
-      let elems =
-        elements ms
-        |> List.map string_of_t
-      in
+    let string_of_t (ms : t) : string =
+      let elems = elements ms |> List.map string_of_t in
       "{" ^ String.concat "\n -- \n" elems ^ "}"
   end
 end

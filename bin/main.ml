@@ -1,4 +1,5 @@
 open Variable_analysis
+
 let src = ref ""
 let opt_pp = ref false
 let opt_tab = ref false
@@ -33,9 +34,12 @@ let main () =
   let pgm = Parser.prog Lexer.read lexbuf in
   let open Syntax.Program in
   if !opt_pp then string_of_t pgm |> print_endline;
-  if !opt_tab then
-    Syntax.Tabulate.(pgm |> tabulate_all |> iter
-      (fun k e -> Label.string_of_t k ^ " " ^ Syntax.Exp.string_of_t e |> print_endline));
+  (if !opt_tab then
+     Syntax.Tabulate.(
+       pgm |> tabulate_all
+       |> iter (fun k e ->
+              Label.string_of_t k ^ " " ^ Syntax.Exp.string_of_t e
+              |> print_endline)));
   (* (if !opt_tab then
      tabulate_all pgm
      |> Lbl_map.(
@@ -49,8 +53,10 @@ let main () =
      Analyzer.(analysis pgm |> Abs_sem.string_of_t |> print_endline));
   (if !opt_analyze then
      Analyzer.(analysis pgm |> find_watermark |> print_endline)); *)
-  if not (!opt_pp || !opt_tab || !opt_tintp || !opt_dintp || !opt_analyze || !opt_analyze_detail) then
-    print_endline "Please provide an option! (-pp, -tab, -intp, -analyze)"
+  if
+    not
+      (!opt_pp || !opt_tab || !opt_tintp || !opt_dintp || !opt_analyze
+     || !opt_analyze_detail)
+  then print_endline "Please provide an option! (-pp, -tab, -intp, -analyze)"
 
 let () = main ()
-
