@@ -1,0 +1,10 @@
+(library
+ (name variable_analysis)
+ (modules syntax parser lexer analyzer domain) 
+ (libraries))
+
+(menhir
+ (modules parser))
+
+(ocamllex
+ (modules lexer))

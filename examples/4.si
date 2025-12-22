@@ -1,0 +1,13 @@
+init {
+  x := 0;
+  y := malloc(2, 0);
+  handler 0 { x := -1 };
+  handler 1 { *y[0] := 1; *y[0] := 1 }
+}
+
+main {
+  sum := 0;
+  let flag = 1 in
+  while flag = 1 do
+  (if *y[0] = 0 then flag := 1 else flag := 0)
+}

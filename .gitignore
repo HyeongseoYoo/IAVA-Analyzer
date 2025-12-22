@@ -1,0 +1,56 @@
+# =========================
+# Dune / OCaml build
+# =========================
+_build/
+*.install
+*.cmi
+*.cmo
+*.cmx
+*.cmxa
+*.cmt
+*.cmti
+*.annot
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# Dune cache / logs
+.dune/
+dune-workspace
+dune-workspace.dev
+
+# =========================
+# OCaml tooling
+# =========================
+.merlin
+.ocamlformat
+.ocamlformat-ignore
+.ocaml-lsp.log
+
+# =========================
+# Editor / OS
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# =========================
+# Local environment
+# =========================
+.opam/
+_opam/
+.opam-switch/
+.env
+.env.local
+
+# =========================
+# Logs / misc
+# =========================
+*.log
