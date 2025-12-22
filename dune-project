@@ -6,7 +6,7 @@
 (generate_opam_files true)
 
 (source
- (github HyeongseoYoo/Variable-Analysis))
+ (github HyeongseoYoo/IAVA-Analyzer))
 
 (authors "Hyeongseo Yoo <yhs0918@snu.ac.kr>")
 

@@ -1,6 +1,6 @@
 (library
  (name variable_analysis)
- (modules syntax parser lexer analyzer domain) 
+ (modules syntax parser lexer analyzer domain)
  (libraries))
 
 (menhir
