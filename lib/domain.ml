@@ -5,6 +5,8 @@ module Loc = struct
 
   module Map = Map.Make (Int)
 
+
+
   let string_of_t (a : t) : string = string_of_int a
 end
 
@@ -28,37 +30,37 @@ module Value = struct
 end
 
 module ProgramPoint = struct
-  type t = Label of Tabulate.Label.t | Unit
+  type t = Label of Exp.Lbl.t | Unit
 
   let compare p1 p2 =
     match (p1, p2) with
     | Unit, Unit -> 0
     | Unit, _ -> -1
     | _, Unit -> 1
-    | Label l1, Label l2 -> Tabulate.Label.compare l1 l2
+    | Label l1, Label l2 -> Exp.Lbl.compare l1 l2
 
   let string_of_t = function
     | Unit -> "●"
-    | Label l -> Tabulate.Label.string_of_t l
+    | Label l -> Exp.Lbl.string_of_t l
 end
 
+module IidSet = Set.Make (Int)
+
 module Interrupt = struct
-  type t = int
-
-  let compare i1 i2 = Int.compare i1 i2
-
-  module Set = Set.Make (Int)
+  type t =
+    | Disabled
+    | Enabled
 end
 
 module Outcome = struct
-  type t = I of Interrupt.t | Done
+  type t = I of int | Done
 
   let compare o1 o2 =
     match (o1, o2) with
     | Done, Done -> 0
     | Done, _ -> -1
     | _, Done -> 1
-    | I i1, I i2 -> Interrupt.compare i1 i2
+    | I i1, I i2 -> Int.compare i1 i2
 end
 
 module Var = struct
@@ -71,6 +73,16 @@ end
 
 module Env = struct
   type t = Loc.t Var.Map.t
+
+  let empty : t = Var.Map.empty
+
+  let string_of_t (env: t) : string =
+    let bindings =
+      Var.Map.bindings env
+      |> List.map (fun (x, a) ->
+             Printf.sprintf "%s ↦ %s" x (Loc.string_of_t a))
+    in
+    String.concat "\n" bindings
 end
 
 module Mem = struct
@@ -82,10 +94,8 @@ module Mem = struct
     let bindings =
       Loc.Map.bindings m
       |> List.map (fun (a, (v, p)) ->
-             Printf.sprintf "%s ↦ <%s , %s>" (Loc.string_of_t a)
-               (Value.string_of_t v)
-               (ProgramPoint.string_of_t p))
-    in
+        (Loc.string_of_t a) ^ " ↦ " ^ (Value.string_of_t v) ^ " " ^ (ProgramPoint.string_of_t p) ^ "\n";)
+      in
     String.concat "\n" bindings
 
   module Set = struct
@@ -99,4 +109,18 @@ module Mem = struct
       let elems = elements ms |> List.map string_of_t in
       "{" ^ String.concat "\n -- \n" elems ^ "}"
   end
+end
+
+module HandlerStore = struct
+  module IidMap = Map.Make(Int)
+
+  type t = (Exp.lbl_t * Env.t) IidMap.t
+
+  let empty : t = IidMap.empty
+
+  let add (hs:t) ~(iid:int) ~(body:Exp.lbl_t) ~(env:Env.t) : t =
+    IidMap.add iid (body, env) hs
+
+  let lookup (hs:t) (iid:int) : (Exp.lbl_t * Env.t) option =
+    IidMap.find_opt iid hs
 end

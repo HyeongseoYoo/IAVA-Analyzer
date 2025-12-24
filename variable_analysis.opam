@@ -6,9 +6,9 @@ maintainer: ["Hyeongseo Yoo <yhs0918@snu.ac.kr>"]
 authors: ["Hyeongseo Yoo <yhs0918@snu.ac.kr>"]
 license: "LICENSE"
 tags: ["abstract interpretation" "interrupt" "variable analysis"]
-homepage: "https://github.com/HyeongseoYoo/Variable-Analysis"
+homepage: "https://github.com/HyeongseoYoo/IAVA-Analyzer"
 doc: "https://url/to/documentation"
-bug-reports: "https://github.com/HyeongseoYoo/Variable-Analysis/issues"
+bug-reports: "https://github.com/HyeongseoYoo/IAVA-Analyzer/issues"
 depends: [
   "dune" {>= "3.17"}
   "ocaml"
@@ -30,4 +30,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "git+https://github.com/HyeongseoYoo/Variable-Analysis.git"
+dev-repo: "git+https://github.com/HyeongseoYoo/IAVA-Analyzer.git"
