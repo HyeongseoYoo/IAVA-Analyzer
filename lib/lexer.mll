@@ -72,3 +72,4 @@ and comment =
   | "*)"    { decr comment_level; if !comment_level > 0 then comment lexbuf }
   | eof     { raise (SyntaxError "Unclosed comment") }
   | _       { comment lexbuf }
+

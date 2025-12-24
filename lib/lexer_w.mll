@@ -30,6 +30,7 @@ let semi = ';' (whitespace ';')*
 let digit = ['0'-'9']
 let int = digit+
 
+
 rule read =
   parse
   | blank     { read lexbuf }
