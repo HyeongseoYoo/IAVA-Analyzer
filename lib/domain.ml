@@ -6,7 +6,6 @@ module Loc = struct
   module Map = Map.Make (Int)
 
   let init : t = 0
-
   let string_of_t (a : t) : string = "Loc " ^ string_of_int a
 end
 
@@ -39,17 +38,13 @@ module ProgramPoint = struct
     | _, Unit -> 1
     | Label l1, Label l2 -> Exp.Lbl.compare l1 l2
 
-  let string_of_t = function
-    | Unit -> "●"
-    | Label l -> Exp.Lbl.string_of_t l
+  let string_of_t = function Unit -> "●" | Label l -> Exp.Lbl.string_of_t l
 end
 
 module IidSet = Set.Make (Int)
 
 module Interrupt = struct
-  type t =
-    | Disabled
-    | Enabled
+  type t = Disabled | Enabled
 end
 
 module Outcome = struct
@@ -76,11 +71,10 @@ module Env = struct
 
   let empty : t = Var.Map.empty
 
-  let string_of_t (env: t) : string =
+  let string_of_t (env : t) : string =
     let bindings =
       Var.Map.bindings env
-      |> List.map (fun (x, a) ->
-             Printf.sprintf "%s ↦ %s" x (Loc.string_of_t a))
+      |> List.map (fun (x, a) -> Printf.sprintf "%s ↦ %s" x (Loc.string_of_t a))
     in
     String.concat "\n" bindings
 end
@@ -94,8 +88,10 @@ module Mem = struct
     let bindings =
       Loc.Map.bindings m
       |> List.map (fun (a, (v, p)) ->
-        Printf.sprintf "%s ↦ <%s, %s>" (Loc.string_of_t a) (Value.string_of_t v) (ProgramPoint.string_of_t p))
-      in
+          Printf.sprintf "%s ↦ <%s, %s>" (Loc.string_of_t a)
+            (Value.string_of_t v)
+            (ProgramPoint.string_of_t p))
+    in
     String.concat "\n" bindings
 
   module Set = struct
@@ -112,15 +108,15 @@ module Mem = struct
 end
 
 module HandlerStore = struct
-  module IidMap = Map.Make(Int)
+  module IidMap = Map.Make (Int)
 
   type t = (Exp.lbl_t * Env.t) IidMap.t
 
   let empty : t = IidMap.empty
 
-  let add (hs:t) ~(iid:int) ~(body:Exp.lbl_t) ~(env:Env.t) : t =
+  let add (hs : t) ~(iid : int) ~(body : Exp.lbl_t) ~(env : Env.t) : t =
     IidMap.add iid (body, env) hs
 
-  let lookup (hs:t) (iid:int) : (Exp.lbl_t * Env.t) option =
+  let lookup (hs : t) (iid : int) : (Exp.lbl_t * Env.t) option =
     IidMap.find_opt iid hs
 end

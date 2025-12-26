@@ -39,27 +39,29 @@ let main () =
     let open Exp in
     let print_tbl (title : string) (tbl : Exp.t Exp.Lbl_map.t) : unit =
       Printf.printf "==== %s ====\n" title;
-      tbl |> Exp.Lbl_map.bindings |> List.iter (fun (k, v) ->
-             Printf.printf "%s -> %s\n" (Exp.Lbl_map.string_of_t k) (Exp.string_of_t v));
+      tbl |> Exp.Lbl_map.bindings
+      |> List.iter (fun (k, v) ->
+          Printf.printf "%s -> %s\n"
+            (Exp.Lbl_map.string_of_t k)
+            (Exp.string_of_t v));
       print_endline ""
     in
     print_tbl "TABULATE: global" (Exp.tabulate pgm.global);
     pgm.handler
     |> List.iter (fun (h : Syntax.Handler.t) ->
-           let title = Printf.sprintf "TABULATE: handler %d" (Syntax.Handler.get_iid h) in
-           print_tbl title (Exp.tabulate (Syntax.Handler.get_body h)));
-    print_tbl "TABULATE: main" (Exp.tabulate pgm.main)
-  );
+        let title =
+          Printf.sprintf "TABULATE: handler %d" (Syntax.Handler.get_iid h)
+        in
+        print_tbl title (Exp.tabulate (Syntax.Handler.get_body h)));
+    print_tbl "TABULATE: main" (Exp.tabulate pgm.main));
   (if !opt_dintp then
      Analyzer.(def_intp pgm |> Domain.Mem.string_of_t |> print_endline));
-  (* (if !opt_tintp then
-     Analyzer.(trans_intp pgm |> Mem.string_of_t |> print_endline));
-  (if !opt_dintp then
-     Analyzer.(def_intp pgm |> Mem.string_of_t |> print_endline));
-  (if !opt_analyze_detail then
-     Analyzer.(analysis pgm |> Abs_sem.string_of_t |> print_endline));
-  (if !opt_analyze then
-     Analyzer.(analysis pgm |> find_watermark |> print_endline)); *)
+  (* (if !opt_tintp then Analyzer.(trans_intp pgm |> Mem.string_of_t |>
+     print_endline)); (if !opt_dintp then Analyzer.(def_intp pgm |>
+     Mem.string_of_t |> print_endline)); (if !opt_analyze_detail then
+     Analyzer.(analysis pgm |> Abs_sem.string_of_t |> print_endline)); (if
+     !opt_analyze then Analyzer.(analysis pgm |> find_watermark |>
+     print_endline)); *)
   if
     not
       (!opt_pp || !opt_tab || !opt_tintp || !opt_dintp || !opt_analyze

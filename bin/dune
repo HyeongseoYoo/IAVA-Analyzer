@@ -2,4 +2,3 @@
  (public_name variable_analysis)
  (name main)
  (libraries variable_analysis))
-
