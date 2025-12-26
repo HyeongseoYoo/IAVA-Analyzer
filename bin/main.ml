@@ -50,8 +50,8 @@ let main () =
            print_tbl title (Exp.tabulate (Syntax.Handler.get_body h)));
     print_tbl "TABULATE: main" (Exp.tabulate pgm.main)
   );
-  (* (if !opt_dintp then
-     Analyzer.(def_intp pgm |> Domain.Mem.string_of_t |> print_endline)); *)
+  (if !opt_dintp then
+     Analyzer.(def_intp pgm |> Domain.Mem.string_of_t |> print_endline));
   (* (if !opt_tintp then
      Analyzer.(trans_intp pgm |> Mem.string_of_t |> print_endline));
   (if !opt_dintp then

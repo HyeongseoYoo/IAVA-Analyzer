@@ -6,8 +6,8 @@ init {
 }
 
 main {
-  if x=0
+  (if x=0
   then idx:=x
-  else idx:=0;
-  *y[0] := idx
+  else idx:=0);
+  *y[0] := idx+1
 }

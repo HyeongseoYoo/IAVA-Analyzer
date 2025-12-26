@@ -9,5 +9,5 @@ main {
   sum := 0;
   let flag = 1 in
   while flag = 1 do
-  (if *y[0] = 0 then flag := 1 else flag := 0)
+  ((if sum = 5 then flag := 0 else flag := 1); sum:=sum+1)
 }

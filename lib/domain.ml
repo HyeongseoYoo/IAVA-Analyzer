@@ -5,9 +5,9 @@ module Loc = struct
 
   module Map = Map.Make (Int)
 
+  let init : t = 0
 
-
-  let string_of_t (a : t) : string = string_of_int a
+  let string_of_t (a : t) : string = "Loc " ^ string_of_int a
 end
 
 module Value = struct
@@ -20,12 +20,12 @@ module Value = struct
     | Unit, Unit -> 0
     | Unit, _ -> -1
     | _, Unit -> 1
-    | Int _, Loc _ -> -1
-    | Loc _, Int _ -> 1
+    | Int _, _ -> -1
+    | _, Int _ -> 1
 
   let string_of_t = function
-    | Int n -> string_of_int n
-    | Loc a -> string_of_int a
+    | Int n -> "Int " ^ string_of_int n
+    | Loc a -> "Loc " ^ string_of_int a
     | Unit -> "unit"
 end
 
@@ -94,7 +94,7 @@ module Mem = struct
     let bindings =
       Loc.Map.bindings m
       |> List.map (fun (a, (v, p)) ->
-        (Loc.string_of_t a) ^ " ↦ " ^ (Value.string_of_t v) ^ " " ^ (ProgramPoint.string_of_t p) ^ "\n";)
+        Printf.sprintf "%s ↦ <%s, %s>" (Loc.string_of_t a) (Value.string_of_t v) (ProgramPoint.string_of_t p))
       in
     String.concat "\n" bindings
 
