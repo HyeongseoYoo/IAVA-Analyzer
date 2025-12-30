@@ -117,6 +117,9 @@ module HandlerStore = struct
   let add (hs : t) ~(iid : int) ~(body : Exp.lbl_t) ~(env : Env.t) : t =
     IidMap.add iid (body, env) hs
 
-  let lookup (hs : t) (iid : int) : (Exp.lbl_t * Env.t) option =
-    IidMap.find_opt iid hs
+  let lookup (hs : t) (iid : int) : (Exp.lbl_t * Env.t) =
+  match IidMap.find_opt iid hs with
+  | Some h -> h
+  | None -> failwith "[HandlerStore] Invalid interrupt id"
+
 end

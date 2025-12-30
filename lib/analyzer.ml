@@ -18,8 +18,12 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
   let ({ env; mem; imode; iset; handlers; fresh_loc } : conf) = c in
-  let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in
-  match exp with
+  (* TODO: Done -> Non-Deterministic *)
+  let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in 
+  (* TEST CODE *)
+  (* let r = (if lbl = Exp.Lbl.Main 3 then { value = Value.Unit; pp = Unit; out = Outcome.I 0 } else { value = Value.Unit; pp = Unit; out = Outcome.Done }) in  *)
+  let (exp_r, exp_c) = 
+  (match exp with
   | Unit -> (r, c)
   | Int n -> ({ r with value = Value.Int n }, c)
   | Var x -> (
@@ -106,9 +110,6 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         | Value.Loc l -> l
         | _ -> failwith "Left-hand side of assignment must be a location"
       in
-      Printf.printf "[Assign] %s := <%s, %s>\n" (Loc.string_of_t l)
-        (Value.string_of_t r2.value)
-        (ProgramPoint.string_of_t (ProgramPoint.Label lbl));
       let mem' = Loc.Map.add l (r2.value, ProgramPoint.Label lbl) c2.mem in
       (r, { c2 with mem = mem' })
   | Seq (e1, e2) ->
@@ -137,7 +138,15 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         { c1 with env = env'; mem = mem'; fresh_loc = c1.fresh_loc + 1 }
       in
       let r3, c3 = eval c2 e2 in
-      (r3, { c3 with env = c1.env })
+      (r3, { c3 with env = c1.env })) in
+  match exp_r.out with
+  | Outcome.Done -> (exp_r, exp_c)
+  | Outcome.I iid -> (
+    let (exp_h, env0) = HandlerStore.lookup exp_c.handlers iid in
+    let (hdl_r, hdl_c) = eval {exp_c with env = env0; imode = Interrupt.Disabled} exp_h in
+    (* TODO: Done -> Non-Deterministic *)
+    ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
+  )
 
 let init_conf (pgm : Program.t) : conf =
   let c0 =
