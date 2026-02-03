@@ -1,33 +1,5 @@
 open Syntax
 
-module Loc = struct
-  type t = int
-
-  module Map = Map.Make (Int)
-
-  let init : t = 0
-  let string_of_t (a : t) : string = "Loc " ^ string_of_int a
-end
-
-module Value = struct
-  type t = Int of int | Loc of Loc.t | Unit
-
-  let compare v1 v2 =
-    match (v1, v2) with
-    | Int n1, Int n2 -> Int.compare n1 n2
-    | Loc a1, Loc a2 -> Int.compare a1 a2
-    | Unit, Unit -> 0
-    | Unit, _ -> -1
-    | _, Unit -> 1
-    | Int _, _ -> -1
-    | _, Int _ -> 1
-
-  let string_of_t = function
-    | Int n -> "Int " ^ string_of_int n
-    | Loc a -> "Loc " ^ string_of_int a
-    | Unit -> "unit"
-end
-
 module ProgramPoint = struct
   type t = Label of Exp.Lbl.t | Unit
 
@@ -40,6 +12,46 @@ module ProgramPoint = struct
 
   let string_of_t = function Unit -> "●" | Label l -> Exp.Lbl.string_of_t l
 end
+
+module Loc = struct
+  type t = ProgramPoint.t * int
+
+  let compare (p1, i1) (p2, i2) =
+    let c = ProgramPoint.compare p1 p2 in
+    if c <> 0 then c else Int.compare i1 i2
+
+  module Map = Map.Make (struct
+    type nonrec t = t
+
+    let compare = compare
+  end)
+
+  let init : t = (ProgramPoint.Unit, 0)
+  let of_pp ?(index = 0) (pp : ProgramPoint.t) : t = (pp, index)
+
+  let string_of_t ((pp, idx) : t) : string =
+    Printf.sprintf "Loc (%s, %d)" (ProgramPoint.string_of_t pp) idx
+end
+
+module Value = struct
+  type t = Int of int | Loc of Loc.t | Unit
+
+  let compare v1 v2 =
+    match (v1, v2) with
+    | Int n1, Int n2 -> Int.compare n1 n2
+    | Loc a1, Loc a2 -> Loc.compare a1 a2
+    | Unit, Unit -> 0
+    | Unit, _ -> -1
+    | _, Unit -> 1
+    | Int _, _ -> -1
+    | _, Int _ -> 1
+
+  let string_of_t = function
+    | Int n -> "Int " ^ string_of_int n
+    | Loc a -> Loc.string_of_t a
+    | Unit -> "unit"
+end
+
 
 module IidSet = Set.Make (Int)
 

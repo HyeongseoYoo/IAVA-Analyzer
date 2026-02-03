@@ -7,7 +7,6 @@ type conf = {
   imode : Interrupt.t;
   iset : IidSet.t;
   handlers : HandlerStore.t;
-  fresh_loc : Loc.t;
 }
 
 type result = { value : Value.t; pp : ProgramPoint.t; out : Outcome.t }
@@ -17,7 +16,7 @@ exception Runtime_error of string
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
-  let ({ env; mem; imode; iset; handlers; fresh_loc } : conf) = c in
+  let ({ env; mem; imode; iset; handlers } : conf) = c in
   (* TODO: Done -> Non-Deterministic *)
   let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in 
   (* TEST CODE *)
@@ -31,12 +30,9 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         match Var.Map.find_opt x env with
         | Some l -> ({ r with value = Value.Loc l }, c)
         | None ->
-            ( { r with value = Value.Loc fresh_loc },
-              {
-                c with
-                env = Var.Map.add x fresh_loc env;
-                fresh_loc = fresh_loc + 1;
-              } )
+            let l = Loc.of_pp (ProgramPoint.Label lbl) in
+            ( { r with value = Value.Loc l },
+              { c with env = Var.Map.add x l env } )
       else
         match Var.Map.find_opt x env with
         | Some l -> (
@@ -60,12 +56,13 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
       let v = r2.value in
       let mem' = c2.mem in
       let new_v = (v, ProgramPoint.Label lbl) in
+      let base_pp = ProgramPoint.Label lbl in
       let mem'' =
-        List.init n (fun i -> c2.fresh_loc + i)
+        List.init n (fun i -> Loc.of_pp ~index:i base_pp)
         |> List.fold_left (fun m a -> Loc.Map.add a new_v m) mem'
       in
-      ( { r with value = Value.Loc c2.fresh_loc },
-        { c with mem = mem''; fresh_loc = c2.fresh_loc + n } )
+      ( { r with value = Value.Loc (Loc.of_pp base_pp) },
+        { c with mem = mem'' } )
   | Deref (e1, e2) -> (
       let r1, c1 = eval c e1 in
       let r2, c2 = eval c1 e2 in
@@ -79,7 +76,8 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         | Value.Int i -> i
         | _ -> failwith "Deref offset must be an integer"
       in
-      let l = base + offset in
+      let base_pp, base_idx = base in
+      let l = (base_pp, base_idx + offset) in
       if lvalue then ({ r with value = Value.Loc l }, c2)
       else
         match Loc.Map.find_opt l c2.mem with
@@ -131,12 +129,10 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
       | _ -> failwith "Condition expression must evaluate to an integer")
   | Let (x, e1, e2) ->
       let r1, c1 = eval c e1 in
-      let l = c1.fresh_loc in
+      let l = Loc.of_pp (ProgramPoint.Label lbl) in
       let env' = Var.Map.add x l c1.env in
       let mem' = Loc.Map.add l (r1.value, r1.pp) c1.mem in
-      let c2 =
-        { c1 with env = env'; mem = mem'; fresh_loc = c1.fresh_loc + 1 }
-      in
+      let c2 = { c1 with env = env'; mem = mem' } in
       let r3, c3 = eval c2 e2 in
       (r3, { c3 with env = c1.env })) in
   match exp_r.out with
@@ -156,7 +152,6 @@ let init_conf (pgm : Program.t) : conf =
       imode = Interrupt.Enabled;
       iset = IidSet.empty;
       handlers = HandlerStore.empty;
-      fresh_loc = Loc.init;
     }
   in
   let _, c_globals = eval c0 pgm.global in
@@ -177,7 +172,6 @@ let init_conf (pgm : Program.t) : conf =
     imode = c_globals.imode;
     iset = iset';
     handlers = hs';
-    fresh_loc = c_globals.fresh_loc;
   }
 
 let def_intp (pgm : Program.t) : Mem.t =
