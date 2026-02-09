@@ -1,6 +1,15 @@
 module Bound = struct
   type t = Z of int | P_inf | N_inf
 
+  let compare b1 b2 =
+    match (b1, b2) with
+    | N_inf, N_inf | P_inf, P_inf -> 0
+    | N_inf, _ -> -1
+    | _, N_inf -> 1
+    | P_inf, _ -> 1
+    | _, P_inf -> -1
+    | Z n1, Z n2 -> Int.compare n1 n2
+
   let max b1 b2 =
     match (b1, b2) with
     | N_inf, b | b, N_inf -> b
@@ -58,6 +67,15 @@ let top = Itv (N_inf, P_inf)
 let bot = Bot
 
 let alpha n = Itv (Z n, Z n)
+
+let compare i1 i2 =
+  match (i1, i2) with
+  | Bot, Bot -> 0
+  | Bot, _ -> -1
+  | _, Bot -> 1
+  | Itv (l1, r1), Itv (l2, r2) ->
+      let c = Bound.compare l1 l2 in
+      if c <> 0 then c else Bound.compare r1 r2
 
 let meet i1 i2 =
   match (i1, i2) with
