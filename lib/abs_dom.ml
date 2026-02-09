@@ -115,5 +115,86 @@ module Abs_Val = struct
     let (itv1, u1, l1) = v1 in
     let (itv2, u2, l2) = v2 in
     (Itv.widen itv1 itv2, Abs_Unit.widen u1 u2, Abs_Loc.widen l1 l2)
+    
+  let leq (v1: t) (v2: t) : bool =
+    let (itv1, u1, l1) = v1 in
+    let (itv2, u2, l2) = v2 in
+    Itv.leq itv1 itv2 && Abs_Unit.leq u1 u2 && Abs_Loc.leq l1 l2
 end
 
+module PPSet = Set.Make(ProgramPoint)
+
+module Abs_Mem = struct
+  module LocMap = Map.Make(struct
+    type t = Abs_Loc.t
+    let compare = Abs_Loc.compare
+  end)
+
+  type t = (Abs_Val.t * PPSet.t) LocMap.t
+
+  let bot : t = LocMap.empty
+
+  let compare (m1 : t) (m2 : t) : int =
+    LocMap.compare
+      (fun (v1, p1) (v2, p2) ->
+        let c = Abs_Val.compare v1 v2 in
+        if c <> 0 then c else PPSet.compare p1 p2)
+      m1 m2
+
+  let join (m1 : t) (m2 : t) : t =
+    let f _key (v1, p1) (v2, p2) =
+      Some (Abs_Val.join v1 v2, PPSet.union p1 p2)
+    in
+    LocMap.union f m1 m2
+
+  let widen (m1 : t) (m2 : t) : t =
+    let f _key (v1, p1) (v2, p2) =
+      Some (Abs_Val.widen v1 v2, PPSet.union p1 p2)
+    in
+    LocMap.union f m1 m2
+
+  let leq (m1 : t) (m2 : t) : bool =
+    LocMap.for_all
+      (fun l (v1, p1) ->
+        match LocMap.find_opt l m2 with
+        | None -> false
+        | Some (v2, p2) -> Abs_Val.leq v1 v2 && PPSet.subset p1 p2)
+      m1
+end
+
+module Abs_HandlerStore = struct
+  module IidMap = Map.Make(Int)
+
+  type t = (Exp.lbl_t * Abs_Env.t) IidMap.t
+
+  let bot : t = IidMap.empty
+
+  let compare (h1 : t) (h2 : t) : int =
+    IidMap.compare
+      (fun (e1, env1) (e2, env2) ->
+        let c = Stdlib.compare e1 e2 in
+        if c <> 0 then c else Abs_Env.compare env1 env2)
+      h1 h2
+
+  let join (h1 : t) (h2 : t) : t =
+    let f _key (e1, env1) (e2, env2) =
+      let exp = if Stdlib.compare e1 e2 = 0 then e1 else e1 in
+      Some (exp, Abs_Env.join env1 env2)
+    in
+    IidMap.union f h1 h2
+
+  let widen (h1 : t) (h2 : t) : t =
+    let f _key (e1, env1) (e2, env2) =
+      let exp = if Stdlib.compare e1 e2 = 0 then e1 else e1 in
+      Some (exp, Abs_Env.widen env1 env2)
+    in
+    IidMap.union f h1 h2
+
+  let leq (h1 : t) (h2 : t) : bool =
+    IidMap.for_all
+      (fun iid (_e1, env1) ->
+        match IidMap.find_opt iid h2 with
+        | None -> false
+        | Some (_e2, env2) -> Abs_Env.leq env1 env2)
+      h1
+end
