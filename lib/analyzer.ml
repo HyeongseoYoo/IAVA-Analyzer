@@ -5,18 +5,20 @@ type conf = {
   env : Env.t;
   mem : Mem.t;
   imode : Interrupt.t;
-  iset : IidSet.t;
-  handlers : HandlerStore.t;
 }
 
 type result = { value : Value.t; pp : ProgramPoint.t; out : Outcome.t }
 
 exception Runtime_error of string
 
+let iset : IidSet.t ref = ref IidSet.empty
+
+let handlers : HandlerStore.t ref = ref HandlerStore.empty
+
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
-  let ({ env; mem; imode; iset; handlers } : conf) = c in
+  let ({ env; mem; imode } : conf) = c in
   (* TODO: Done -> Non-Deterministic *)
   let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in 
   (* TEST CODE *)
@@ -138,7 +140,7 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
   match exp_r.out with
   | Outcome.Done -> (exp_r, exp_c)
   | Outcome.I iid -> (
-    let (exp_h, env0) = HandlerStore.lookup exp_c.handlers iid in
+    let (exp_h, env0) = HandlerStore.lookup !handlers iid in
     let (hdl_r, hdl_c) = eval {exp_c with env = env0; imode = Interrupt.Disabled} exp_h in
     (* TODO: Done -> Non-Deterministic *)
     ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
@@ -150,8 +152,6 @@ let init_conf (pgm : Program.t) : conf =
       env = Env.empty;
       mem = Mem.empty;
       imode = Interrupt.Enabled;
-      iset = IidSet.empty;
-      handlers = HandlerStore.empty;
     }
   in
   let _, c_globals = eval c0 pgm.global in
@@ -166,12 +166,12 @@ let init_conf (pgm : Program.t) : conf =
       (HandlerStore.empty, IidSet.empty)
       pgm.handler
   in
+  iset := iset';
+  handlers := hs';
   {
     env = c_globals.env;
     mem = c_globals.mem;
     imode = c_globals.imode;
-    iset = iset';
-    handlers = hs';
   }
 
 let def_intp (pgm : Program.t) : Mem.t =
