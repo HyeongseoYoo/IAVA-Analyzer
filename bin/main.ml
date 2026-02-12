@@ -62,6 +62,8 @@ let main () =
      Analyzer.(analysis pgm |> Abs_sem.string_of_t |> print_endline)); (if
      !opt_analyze then Analyzer.(analysis pgm |> find_watermark |>
      print_endline)); *)
+  (if !opt_analyze_detail then
+     Analyzer.(abs_def_intp pgm |> Abs_dom.Abs_Mem.string_of_t |> print_endline));
   if
     not
       (!opt_pp || !opt_tab || !opt_tintp || !opt_dintp || !opt_analyze
