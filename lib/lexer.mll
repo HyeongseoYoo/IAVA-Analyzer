@@ -21,8 +21,8 @@ let keywords =
       ("else", ELSE);
       ("while", WHILE);
       ("do", DO);
-      ("let", LET);
-      ("in", IN);
+      (* ("let", LET);
+      ("in", IN); *)
       ("malloc", MALLOC);
     ];
   tbl

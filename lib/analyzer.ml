@@ -145,22 +145,24 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
             eval c2 lbl_exp
           else (r, c1)
       | _ -> failwith "Condition expression must evaluate to an integer")
-  | Let (x, e1, e2) ->
+  (* | Let (x, e1, e2) ->
       let r1, c1 = eval c e1 in
       let l = Loc.of_pp (ProgramPoint.Label lbl) in
       let env' = Var.Map.add x l c1.env in
       let mem' = Loc.Map.add l (r1.value, r1.pp) c1.mem in
       let c2 = { c1 with env = env'; mem = mem' } in
       let r3, c3 = eval c2 e2 in
-      (r3, { c3 with env = c1.env })) in
-  match exp_r.out with
-  | Outcome.Done -> (exp_r, exp_c)
-  | Outcome.I iid -> (
-    let (exp_h, env0) = HandlerStore.lookup !handlers iid in
-    let (hdl_r, hdl_c) = eval {exp_c with env = env0; imode = Interrupt.Disabled} exp_h in
-    (* TODO: Done -> Non-Deterministic *)
-    ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
-  )
+      (r3, { c3 with env = c1.env }) *)
+      )
+    in
+      match exp_r.out with
+        | Outcome.Done -> (exp_r, exp_c)
+        | Outcome.I iid -> (
+          let (exp_h, env0) = HandlerStore.lookup !handlers iid in
+          let (hdl_r, hdl_c) = eval {exp_c with env = env0; imode = Interrupt.Disabled} exp_h in
+          (* TODO: Done -> Non-Deterministic *)
+          ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
+        )
 
 (* Helper *)
 let join_res r1 r2 = {
@@ -334,6 +336,7 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
   | If (e1, e2, e3) -> (
       let r1, c1 = self c e1 in
       let v1 = proj_int r1.avalue in
+      print_endline("Itv in If: " ^ Itv.string_of_t v1);
       if v1 = Itv.Bool.true_ then
         let r2, c2 = self c1 e2 in
         (r2, c2)
@@ -344,14 +347,14 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
         let r2, c2 = self c1 e2 in
         let r3, c3 = self c1 e3 in
         join_out (r2, c2) (r3, c3))
-  | Let (x, e1, e2) ->
+  (* | Let (x, e1, e2) ->
       let r1, c1 = self c e1 in
       let l = Abs_Loc.alloc (ProgramPoint.Label lbl) in
       let aenv' = Abs_Env.write c1.aenv x l in
       let amem' = Abs_Mem.write c1.amem l r1.avalue pp in
       let c2 = { c1 with aenv = aenv'; amem = amem' } in
       let r2, c3 = self c2 e2 in
-      (r2, { c3 with aenv = c1.aenv })
+      (r2, { c3 with aenv = c1.aenv }) *)
   | While (_id, econd, ebody) ->
       (* join-only widening fixpoint for while *)
       let rec iterate (i:int) (input:abs_conf) : abs_conf =
@@ -446,4 +449,6 @@ let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
   print_endline (Abs_Mem.string_of_t c_init.amem);
   print_endline "=== Final Abstract Memory ===";
   let _, c_final = evalA c_init pgm.main in
+  print_endline "=== Final ENV ===";
+  print_endline (Abs_Env.string_of_t c_final.aenv); 
   c_final.amem

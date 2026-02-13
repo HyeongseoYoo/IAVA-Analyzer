@@ -247,6 +247,9 @@ let or_ i1 i2 =
       | true, false -> true_
       | _ -> false_)
 
+let is_singleton = function
+  | Bot -> false
+  | Itv (l, r) -> Bound.compare l r = 0
 let string_of_t = function
   | Bot -> "⟂"
   | Itv (l, r) -> Bound.("[" ^ string_of_t l ^ "," ^ string_of_t r ^ "]")

@@ -36,6 +36,12 @@ module Abs_Loc = struct
   let create (pp: ProgramPoint.t) (itv : Itv.t) : t =
     PPMap.add pp itv bot
 
+  let is_singleton (l : t) : bool =
+    if PPMap.cardinal l <> 1 then false
+    else
+      let (_, itv) = PPMap.choose l in
+      Itv.is_singleton itv
+
   let string_of_t (l : t) : string =
     if l = bot then "⊥"
     else begin
@@ -217,12 +223,15 @@ module Abs_Mem = struct
     | None -> (Abs_Val.bot, PPSet.empty)
 
   let write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
-    let (old_v, old_pps) = find m l in
-    let new_v = Abs_Val.join old_v v in
-    let new_pps = PPSet.add pp old_pps in
-    LocMap.add l (new_v, new_pps) m
+    if Abs_Loc.is_singleton l then
+      LocMap.add l (v, PPSet.singleton pp) m
+    else
+      let (old_v, old_pps) = find m l in
+      let new_v = Abs_Val.join old_v v in
+      let new_pps = PPSet.add pp old_pps in
+      LocMap.add l (new_v, new_pps) m
 
-    let string_of_t (m : t) : string =
+  let string_of_t (m : t) : string =
       let bindings = LocMap.bindings m in
       let binding_strs =
         List.map

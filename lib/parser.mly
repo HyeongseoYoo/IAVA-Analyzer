@@ -139,5 +139,5 @@ exp:
       { $1 }
 
     (* let-binding *)
-    | mkexp(LET; x = ID; EQ; e1 = exp; IN; e2 = exp { Exp.Let (x, e1, e2) })
-      { $1 }
+    // | mkexp(LET; x = ID; EQ; e1 = exp; IN; e2 = exp { Exp.Let (x, e1, e2) })
+    //   { $1 }
