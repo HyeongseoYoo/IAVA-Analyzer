@@ -251,6 +251,13 @@ let is_singleton = function
   | Bot -> false
   | Itv (l, r) -> Bound.compare l r = 0
 
+let single_eq i1 i2 =
+  match (i1, i2) with
+  | Bot, _ | _, Bot -> false
+  | Itv (l1, r1), Itv (l2, r2) ->
+      let open Bound in
+      l1 = r1 && l2 = r2 && l1 = l2
+
 let is_overlap i1 i2 =
   match (i1, i2) with
   | Bot, _ | _, Bot -> false

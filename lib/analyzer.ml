@@ -28,8 +28,9 @@ exception Runtime_error of string
 
 let var_tbl : VarTbl.t ref = ref VarTbl.empty
 let iset : IidSet.t ref = ref IidSet.empty
-let mainid : Int.t ref = ref 0
 let handlers : HandlerStore.t ref = ref HandlerStore.empty
+
+let widen_cnt = 10
 
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
@@ -218,12 +219,18 @@ let loc_overlap (l1:Abs_Loc.t) (l2:Abs_Loc.t) : bool =
 let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
   let (itv1, _u1, loc1) = v1 in
   let (itv2, _u2, loc2) = v2 in
-  let itv_check = (itv1 = Itv.bot || itv2 = Itv.bot) in
-  let loc_check = (loc1 = Abs_Loc.bot || loc2 = Abs_Loc.bot) in
-  if itv_check && loc_check then Itv.Bool.false_
+  print_endline ("[Equal Check] " ^ Abs_Val.string_of_t v1 ^ " vs " ^ Abs_Val.string_of_t v2);
+  let itv_bot = (itv1 = Itv.bot || itv2 = Itv.bot) in
+  let loc_bot = (loc1 = Abs_Loc.bot || loc2 = Abs_Loc.bot) in
+  if itv_bot && loc_bot then Itv.Bool.false_
   else (
-    (*TO-DO - bug*)
-    Itv.Bool.top
+    let itv_must_true = Itv.single_eq itv1 itv2 in
+    let itv_must_false = not (Itv.is_overlap itv1 itv2) in
+    let loc_must_true = Abs_Loc.compare loc1 loc2 = 0 in
+    let loc_must_false = not (loc_overlap loc1 loc2) in
+    if itv_must_true && loc_must_true then Itv.Bool.true_
+    else if itv_must_false && loc_must_false then Itv.Bool.false_
+    else Itv.Bool.top
   )
 
 let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf =
@@ -337,12 +344,12 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
       let rec iterate (i:int) (input:abs_conf) : abs_conf =
         let rcond, ccond = self input econd in
         let cond_itv = proj_int rcond.avalue in
-        if cond_itv = Itv.Bool.false_ then input
+        if Itv.maybe_false cond_itv then input
         else begin
           let _rbody, cbody = self ccond ebody in
           let joined = join_conf input cbody in
           (* widen condition *)
-          let next = if i = 0 then joined else widen_conf input joined in
+          let next = if i < widen_cnt then joined else widen_conf input joined in
           if leq_conf next input then input
           else iterate (i+1) next
         end
@@ -410,18 +417,16 @@ let init_confa (pgm : Program.t) : abs_conf =
   in
   iset := iset';
   handlers := hs';
-  mainid := IidSet.cardinal iset';
   {
     amem = c_globals.amem;
     aimode = c_globals.aimode;
   }
 
 let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
-  print_endline "<<<Abstract Interpretation>>>";
-  print_endline "=== Initial Configuration ===";
   let c_init = init_confa pgm in
   print_endline "=== Initial Abstract Memory ===";
   print_endline (Abs_Mem.string_of_t c_init.amem);
-  print_endline "=== Final Abstract Memory ===";
+  print_endline "=== analyzing... ===";
   let _, c_final = evalA c_init pgm.main in
+  print_endline "=== Final Abstract Memory ===";
   c_final.amem

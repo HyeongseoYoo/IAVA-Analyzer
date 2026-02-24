@@ -50,6 +50,15 @@ module Abs_Loc = struct
     | AHeapLoc {lbl = lbl1; offset = off1}, AHeapLoc {lbl = lbl2; offset = off2} ->
         Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.leq off1 off2
     | _ -> false
+  
+  let single_eq l1 l2 =
+    match (l1, l2) with
+    | Bot, _ | _, Bot -> false
+    | AVarLoc {id = id1; offset = off1}, AVarLoc {id = id2; offset = off2} ->
+        Var.compare id1 id2 = 0 && Itv.single_eq off1 off2
+    | AHeapLoc {lbl = lbl1; offset = off1}, AHeapLoc {lbl = lbl2; offset = off2} ->
+        Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.single_eq off1 off2
+    | _ -> false
 
   let join l1 l2 =
     match (l1, l2) with
