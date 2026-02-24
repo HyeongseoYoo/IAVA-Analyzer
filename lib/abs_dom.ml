@@ -2,59 +2,81 @@ open Syntax
 open Domain
 
 module PPMap = Map.Make(ProgramPoint)
+module LblMap = Map.Make(Exp.Lbl)
 
 module Abs_Loc = struct
-  type t = Itv.t PPMap.t
+  type t = Bot | AVarLoc of {id: Var.t; offset: Itv.t} | AHeapLoc of {lbl: Exp.Lbl.t; offset: Itv.t} | Top
 
-  let bot = PPMap.empty
+  let bot = Bot
+  let top = Top
 
-  let compare (l1 : t) (l2 : t) : int =
-    PPMap.compare Itv.compare l1 l2
-  
-  let alpha (loc : Loc.t) : t = 
-    let (pp, n) = loc in
-    PPMap.singleton pp (Itv.alpha n)
+  let compare l1 l2 =
+    match (l1, l2) with
+    | Bot, Bot | Top, Top -> 0
+    | Bot, _ -> -1
+    | _, Bot -> 1
+    | Top, _ -> 1
+    | _, Top -> -1
+    | AVarLoc {id = id1; offset = off1}, AVarLoc {id = id2; offset = off2} ->
+        let c = Var.compare id1 id2 in
+        if c <> 0 then c else Itv.compare off1 off2
+    | AHeapLoc {lbl = lbl1; offset = off1}, AHeapLoc {lbl = lbl2; offset = off2} ->
+        let c = Exp.Lbl.compare lbl1 lbl2 in
+        if c <> 0 then c else Itv.compare off1 off2
+    | AVarLoc _, AHeapLoc _ -> -1
+    | AHeapLoc _, AVarLoc _ -> 1
 
-  let join (l1 : t) (l2 : t) : t =
-    let f _key itv1 itv2 = Some (Itv.join itv1 itv2) in
-    PPMap.union f l1 l2
+  let alpha (l : Loc.t) : t =
+    match l with
+    | VarLoc {id; offset} -> AVarLoc {id; offset = Itv.alpha offset}
+    | HeapLoc {lbl; offset} -> AHeapLoc {lbl; offset = Itv.alpha offset}
 
-  let widen (l1 : t) (l2 : t) : t =
-    let f _key itv1 itv2 = Some (Itv.widen itv1 itv2) in
-    PPMap.union f l1 l2
-  
-  let leq (l1 : t) (l2 : t) : bool =
-    PPMap.for_all
-      (fun pp itv1 ->
-        match PPMap.find_opt pp l2 with
-        | None -> Itv.leq itv1 Itv.bot
-        | Some itv2 -> Itv.leq itv1 itv2)
-      l1
-  let alloc (pp : ProgramPoint.t) : t =
-    PPMap.add pp (Itv.alpha 0) bot
+  let get (id: Var.t) : t = AVarLoc {id; offset = Itv.alpha 0}
+  let alloc (lbl: Exp.Lbl.t) (offset: Itv.t) : t = AHeapLoc {lbl; offset}
 
-  let create (pp: ProgramPoint.t) (itv : Itv.t) : t =
-    PPMap.add pp itv bot
+  let offset_add (base: t) (offset: Itv.t) : t =
+    match base with
+      | Bot -> Bot
+      | Top -> Top
+      | AVarLoc { id; offset = base_off } -> AVarLoc { id; offset = Itv.add base_off offset }
+      | AHeapLoc { lbl; offset = base_off } -> AHeapLoc { lbl; offset = Itv.add base_off offset }
 
-  let is_singleton (l : t) : bool =
-    if PPMap.cardinal l <> 1 then false
-    else
-      let (_, itv) = PPMap.choose l in
-      Itv.is_singleton itv
+  let leq l1 l2 =
+    match (l1, l2) with
+    | Bot, _ -> true
+    | _, Top -> true
+    | AVarLoc {id = id1; offset = off1}, AVarLoc {id = id2; offset = off2} ->
+        Var.compare id1 id2 = 0 && Itv.leq off1 off2
+    | AHeapLoc {lbl = lbl1; offset = off1}, AHeapLoc {lbl = lbl2; offset = off2} ->
+        Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.leq off1 off2
+    | _ -> false
 
-  let string_of_t (l : t) : string =
-    if l = bot then "⊥"
-    else begin
-    let bindings = PPMap.bindings l in
-    let binding_strs =
-      List.map
-        (fun (pp, itv) ->
-          let pp_str = ProgramPoint.string_of_t pp
-          and itv_str = Itv.string_of_t itv in
-          Printf.sprintf "<%s, %s>" pp_str itv_str)
-        bindings
-    in
-    "{" ^ String.concat "; " binding_strs ^ "}" end
+  let join l1 l2 =
+    match (l1, l2) with
+    | Bot, l | l, Bot -> l
+    | Top, _ | _, Top -> Top
+    | AVarLoc {id = id1; offset = off1}, AVarLoc {id = id2; offset = off2} when Var.compare id1 id2 = 0 ->
+        AVarLoc {id = id1; offset = Itv.join off1 off2}
+    | AHeapLoc {lbl = lbl1; offset = off1}, AHeapLoc {lbl = lbl2; offset = off2} when Exp.Lbl.compare lbl1 lbl2 = 0 ->
+        AHeapLoc {lbl = lbl1; offset = Itv.join off1 off2}
+    | _ -> Top
+
+  let widen l1 l2 =
+    match (l1, l2) with
+    | Bot, l | l, Bot -> l
+    | Top, _ | _, Top -> Top
+    | AVarLoc {id = id1; offset = off1}, AVarLoc {id = id2; offset = off2} when Var.compare id1 id2 = 0 ->
+        AVarLoc {id = id1; offset = Itv.widen off1 off2}
+    | AHeapLoc {lbl = lbl1; offset = off1}, AHeapLoc {lbl = lbl2; offset = off2} when Exp.Lbl.compare lbl1 lbl2 = 0 ->
+        AHeapLoc {lbl = lbl1; offset = Itv.widen off1 off2}
+    | _ -> Top
+
+  let string_of_t = function
+    | Bot -> "⊥"
+    | Top -> "⊤"
+    | AVarLoc {id; offset} -> Printf.sprintf "%s+%s" id (Itv.string_of_t offset)
+    | AHeapLoc {lbl; offset} -> Printf.sprintf "%s+%s" (Exp.Lbl.string_of_t lbl) (Itv.string_of_t offset)
+
 end
 
 module Abs_Unit = struct
@@ -223,13 +245,16 @@ module Abs_Mem = struct
     | None -> (Abs_Val.bot, PPSet.empty)
 
   let write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
-    if Abs_Loc.is_singleton l then
-      LocMap.add l (v, PPSet.singleton pp) m
-    else
+    match l with
+    | Abs_Loc.AVarLoc {id; offset} ->  LocMap.add l (v, PPSet.singleton pp) m
+    | _ -> 
       let (old_v, old_pps) = find m l in
       let new_v = Abs_Val.join old_v v in
       let new_pps = PPSet.add pp old_pps in
       LocMap.add l (new_v, new_pps) m
+
+let fold (f : Abs_Loc.t -> (Abs_Val.t * PPSet.t) -> 'a -> 'a) (m : t) (init : 'a) : 'a =
+  LocMap.fold (fun l (v, pps) acc -> f l (v, pps) acc) m init
 
   let string_of_t (m : t) : string =
       let bindings = LocMap.bindings m in
@@ -246,46 +271,5 @@ module Abs_Mem = struct
             Printf.sprintf "%s ↦ <%s, {%s}>" l_str v_str pps_str)
           bindings
       in
-      "{ " ^ String.concat "; " binding_strs ^ " }"
-end
-
-module Abs_HandlerStore = struct
-  module IidMap = Map.Make(Int)
-
-  type t = (Exp.lbl_t * Abs_Env.t) IidMap.t
-
-  let bot : t = IidMap.empty
-
-  let lookup (hs : t) (iid : int) : (Exp.lbl_t * Abs_Env.t) option =
-    IidMap.find_opt iid hs
-  let compare (h1 : t) (h2 : t) : int =
-    IidMap.compare
-      (fun (e1, env1) (e2, env2) ->
-        let c = Stdlib.compare e1 e2 in
-        if c <> 0 then c else Abs_Env.compare env1 env2)
-      h1 h2
-
-  let join (h1 : t) (h2 : t) : t =
-    let f _key (e1, env1) (e2, env2) =
-      let exp = if Stdlib.compare e1 e2 = 0 then e1 else e1 in
-      Some (exp, Abs_Env.join env1 env2)
-    in
-    IidMap.union f h1 h2
-
-  let widen (h1 : t) (h2 : t) : t =
-    let f _key (e1, env1) (e2, env2) =
-      let exp = if Stdlib.compare e1 e2 = 0 then e1 else e1 in
-      Some (exp, Abs_Env.widen env1 env2)
-    in
-    IidMap.union f h1 h2
-
-  let leq (h1 : t) (h2 : t) : bool =
-    IidMap.for_all
-      (fun iid (_e1, env1) ->
-        match IidMap.find_opt iid h2 with
-        | None -> false
-        | Some (_e2, env2) -> Abs_Env.leq env1 env2)
-      h1
-  let add (hs : t) (iid : int) (exp : Exp.lbl_t) (env : Abs_Env.t) : t =
-    IidMap.add iid (exp, env) hs
+      String.concat "\n" binding_strs
 end

@@ -250,6 +250,15 @@ let or_ i1 i2 =
 let is_singleton = function
   | Bot -> false
   | Itv (l, r) -> Bound.compare l r = 0
+
+let is_overlap i1 i2 =
+  match (i1, i2) with
+  | Bot, _ | _, Bot -> false
+  | Itv (l1, r1), Itv (l2, r2) -> (
+      match Bound.(l1 <= r2, l2 <= r1) with
+      | true, true -> true
+      | true, false -> false
+      | false, _ -> false)
 let string_of_t = function
   | Bot -> "⟂"
   | Itv (l, r) -> Bound.("[" ^ string_of_t l ^ "," ^ string_of_t r ^ "]")

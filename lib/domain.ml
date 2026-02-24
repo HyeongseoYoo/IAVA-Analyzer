@@ -13,24 +13,41 @@ module ProgramPoint = struct
   let string_of_t = function Unit -> "●" | Label l -> Exp.Lbl.string_of_t l
 end
 
-module Loc = struct
-  type t = ProgramPoint.t * int
+module Var = struct
+  type t = string
 
-  let compare (p1, i1) (p2, i2) =
-    let c = ProgramPoint.compare p1 p2 in
-    if c <> 0 then c else Int.compare i1 i2
+  let compare = String.compare
+
+  module Map = Map.Make (String)
+end
+
+
+module Loc = struct
+  type t = VarLoc of {id: Var.t; offset: int} | HeapLoc of {lbl: Exp.Lbl.t; offset: int}
 
   module Map = Map.Make (struct
     type nonrec t = t
 
     let compare = compare
   end)
+  let compare l1 l2 =
+    match (l1, l2) with
+    | VarLoc {id = id1; offset = off1}, VarLoc {id = id2; offset = off2} ->
+        let c = Var.compare id1 id2 in
+        if c <> 0 then c else Int.compare off1 off2
+    | HeapLoc {lbl = lbl1; offset = off1}, HeapLoc {lbl = lbl2; offset = off2} ->
+        let c = Exp.Lbl.compare lbl1 lbl2 in
+        if c <> 0 then c else Int.compare off1 off2
+    | VarLoc _, HeapLoc _ -> -1
+    | HeapLoc _, VarLoc _ -> 1
 
-  let init : t = (ProgramPoint.Unit, 0)
-  let of_pp ?(index = 0) (pp : ProgramPoint.t) : t = (pp, index)
+  let get x = VarLoc {id = x; offset = 0}
+  let alloc lbl n = HeapLoc {lbl; offset = n}
 
-  let string_of_t ((pp, idx) : t) : string =
-    Printf.sprintf "Loc (%s, %d)" (ProgramPoint.string_of_t pp) idx
+  let string_of_t = function
+    | VarLoc {id; offset} -> Printf.sprintf "%s+%d" id offset
+    | HeapLoc {lbl; offset} -> Printf.sprintf "%s+%d" (Exp.Lbl.string_of_t lbl) offset
+
 end
 
 module Value = struct
@@ -70,12 +87,26 @@ module Outcome = struct
     | I i1, I i2 -> Int.compare i1 i2
 end
 
-module Var = struct
-  type t = string
 
-  let compare = String.compare
+module VarSet = Set.Make (Var)
 
-  module Map = Map.Make (String)
+module VarTbl = struct
+  type t = int Var.Map.t
+
+  let empty : t = Var.Map.empty
+
+  let find (tbl : t) (x : Var.t) : int =
+    match Var.Map.find_opt x tbl with
+    | Some n -> n
+    | None -> failwith ("[VarTbl] Variable not found: " ^ x)
+
+  let build (vars : VarSet.t) : t =
+    let rec build' vars n tbl =
+      match VarSet.elements vars with
+      | [] -> tbl
+      | x :: _ -> build' (VarSet.remove x vars) (n + 1) (Var.Map.add x n tbl)
+    in
+    build' vars 0 Var.Map.empty
 end
 
 module Env = struct
@@ -122,14 +153,14 @@ end
 module HandlerStore = struct
   module IidMap = Map.Make (Int)
 
-  type t = (Exp.lbl_t * Env.t) IidMap.t
+  type t = Exp.lbl_t IidMap.t
 
   let empty : t = IidMap.empty
 
-  let add (hs : t) ~(iid : int) ~(body : Exp.lbl_t) ~(env : Env.t) : t =
-    IidMap.add iid (body, env) hs
+  let add (hs : t) (iid : int) (body : Exp.lbl_t) : t =
+    IidMap.add iid body hs
 
-  let lookup (hs : t) (iid : int) : (Exp.lbl_t * Env.t) =
+  let lookup (hs : t) (iid : int) : Exp.lbl_t =
   match IidMap.find_opt iid hs with
   | Some h -> h
   | None -> failwith "[HandlerStore] Invalid interrupt id"

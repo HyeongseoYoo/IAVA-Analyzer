@@ -9,7 +9,6 @@ type conf = {
 }
 
 type abs_conf = {
-  aenv : Abs_Env.t;
   amem : Abs_Mem.t;
   aimode : Interrupt.t;
 }
@@ -27,9 +26,10 @@ type abs_res = {
 
 exception Runtime_error of string
 
+let var_tbl : VarTbl.t ref = ref VarTbl.empty
 let iset : IidSet.t ref = ref IidSet.empty
+let mainid : Int.t ref = ref 0
 let handlers : HandlerStore.t ref = ref HandlerStore.empty
-let abs_handlers : Abs_HandlerStore.t ref = ref Abs_HandlerStore.bot
 
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
@@ -44,23 +44,12 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
   | Unit -> (r, c)
   | Int n -> ({ r with value = Value.Int n }, c)
   | Var x -> (
-      if lvalue then
-        match Var.Map.find_opt x env with
-        | Some l -> ({ r with value = Value.Loc l }, c)
-        | None ->
-            let l = Loc.of_pp (ProgramPoint.Label lbl) in
-            ( { r with value = Value.Loc l },
-              { c with env = Var.Map.add x l env } )
+      let l = Loc.get x in
+      if lvalue then ({ r with value = Value.Loc l }, c)
       else
-        match Var.Map.find_opt x env with
-        | Some l -> (
-            match Loc.Map.find_opt l mem with
-            | Some (v, p) -> ({ r with value = v; pp = p }, c)
-            | None ->
-                raise
-                  (Runtime_error
-                     ("[Mem] Location " ^ Loc.string_of_t l ^ " not found")))
-        | None -> raise (Runtime_error ("[Env] Variable " ^ x ^ " not found")))
+        match Loc.Map.find_opt l mem with
+          | Some (v, p) -> ({ r with value = v; pp = p }, c)
+          | None -> raise (Runtime_error ("[Mem] Location " ^ Loc.string_of_t l ^ " not found")))
   | Enable -> (r, { c with imode = Interrupt.Enabled })
   | Disable -> (r, { c with imode = Interrupt.Disabled })
   | Malloc (e1, e2) ->
@@ -72,15 +61,12 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         | _ -> failwith "Malloc size must be an integer"
       in
       let v = r2.value in
-      let mem' = c2.mem in
-      let new_v = (v, ProgramPoint.Label lbl) in
-      let base_pp = ProgramPoint.Label lbl in
-      let mem'' =
-        List.init n (fun i -> Loc.of_pp ~index:i base_pp)
-        |> List.fold_left (fun m a -> Loc.Map.add a new_v m) mem'
-      in
-      ( { r with value = Value.Loc (Loc.of_pp base_pp) },
-        { c with mem = mem'' } )
+      let new_r = (v, ProgramPoint.Label lbl) in
+      let mem' =
+      List.init n (fun i -> Loc.alloc lbl i)
+      |> List.fold_left (fun m a -> Loc.Map.add a new_r m) c2.mem
+    in
+    ( { r with value = Value.Loc (Loc.alloc lbl 0) }, { c2 with mem = mem' } )
   | Deref (e1, e2) -> (
       let r1, c1 = eval c e1 in
       let r2, c2 = eval c1 e2 in
@@ -94,8 +80,13 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         | Value.Int i -> i
         | _ -> failwith "Deref offset must be an integer"
       in
-      let base_pp, base_idx = base in
-      let l = (base_pp, base_idx + offset) in
+      let l =
+      match base with
+      | Loc.VarLoc { id; offset = off } ->
+          Loc.VarLoc { id; offset = off + offset }
+      | Loc.HeapLoc { lbl; offset = off } ->
+          Loc.HeapLoc { lbl; offset = off + offset }
+      in
       if lvalue then ({ r with value = Value.Loc l }, c2)
       else
         match Loc.Map.find_opt l c2.mem with
@@ -145,23 +136,15 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
             eval c2 lbl_exp
           else (r, c1)
       | _ -> failwith "Condition expression must evaluate to an integer")
-  (* | Let (x, e1, e2) ->
-      let r1, c1 = eval c e1 in
-      let l = Loc.of_pp (ProgramPoint.Label lbl) in
-      let env' = Var.Map.add x l c1.env in
-      let mem' = Loc.Map.add l (r1.value, r1.pp) c1.mem in
-      let c2 = { c1 with env = env'; mem = mem' } in
-      let r3, c3 = eval c2 e2 in
-      (r3, { c3 with env = c1.env }) *)
       )
     in
-      match exp_r.out with
-        | Outcome.Done -> (exp_r, exp_c)
-        | Outcome.I iid -> (
-          let (exp_h, env0) = HandlerStore.lookup !handlers iid in
-          let (hdl_r, hdl_c) = eval {exp_c with env = env0; imode = Interrupt.Disabled} exp_h in
-          (* TODO: Done -> Non-Deterministic *)
-          ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
+    match exp_r.out with
+      | Outcome.Done -> (exp_r, exp_c)
+      | Outcome.I iid -> (
+        let exp_h = HandlerStore.lookup !handlers iid in
+        let (hdl_r, hdl_c) = eval {exp_c with imode = Interrupt.Disabled} exp_h in
+        (* TODO: Done -> Non-Deterministic *)
+        ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
         )
 
 (* Helper *)
@@ -171,27 +154,20 @@ let join_res r1 r2 = {
 }
 
 let join_conf c1 c2 = {
-  aenv = Abs_Env.join c1.aenv c2.aenv;
   amem = Abs_Mem.join c1.amem c2.amem;
-  aimode = (match (c1.aimode, c2.aimode) with
-    | Interrupt.Enabled, _ | _, Interrupt.Enabled -> Interrupt.Enabled
-    | _ -> Interrupt.Disabled);
+  aimode = c2.aimode; (* Follow final imode *)
 }
 
 let join_out (r1, c1) (r2, c2) =
   (join_res r1 r2, join_conf c1 c2)
 
 let widen_conf c1 c2 = {
-  aenv = Abs_Env.widen c1.aenv c2.aenv;
   amem = Abs_Mem.widen c1.amem c2.amem;
-  aimode =
-    (match (c1.aimode, c2.aimode) with
-     | Interrupt.Enabled, _ | _, Interrupt.Enabled -> Interrupt.Enabled
-     | _ -> Interrupt.Disabled);
+  aimode = c2.aimode; (* Follow final imode *)
 }
 
 let leq_conf c1 c2 =
-  Abs_Env.leq c1.aenv c2.aenv && Abs_Mem.leq c1.amem c2.amem
+  Abs_Mem.leq c1.amem c2.amem
   && (match (c1.aimode, c2.aimode) with
       | Interrupt.Disabled, Interrupt.Enabled -> true
       | Interrupt.Disabled, Interrupt.Disabled -> true
@@ -199,7 +175,7 @@ let leq_conf c1 c2 =
       | Interrupt.Enabled, Interrupt.Disabled -> false)
 
 let interrupt_transform (lbl:Exp.lbl_t) (c: abs_conf) : abs_conf =
-  let ({ aenv; amem; aimode } : abs_conf) = c in
+  let ({ amem; aimode } : abs_conf) = c in
   match aimode with
   | _ -> c (* TODO: Implement interrupt_transform *)
 
@@ -225,24 +201,20 @@ let proj_loc (v:Abs_Val.t) : Abs_Loc.t =
 let get_offset (itv:Itv.t) : Itv.t =
   match itv with
   | Bot -> Bot
-  | Itv (_, P_inf) | Itv (N_inf, _) -> Itv.bot
-  | Itv (Z l, Z r) -> (if l <= 0 then Itv.bot else Itv (Z 0, Z (r-1)))
+  | Itv (_, P_inf) -> Itv.bot
+  | Itv (_, Z r) -> (if r <= 0 then Itv.bot else Itv (Z 0, Z (r-1)))
   | _ -> Itv.bot
-let offset_checked ~(who:string) (base:Abs_Loc.t) (off:Itv.t) : Abs_Loc.t =
-  PPMap.mapi
-    (fun pp valid ->
-      let access = Itv.add valid off in
-      if Itv.leq access valid then access
-      else
-        raise (Runtime_error
-          (Printf.sprintf
-             "[%s] Deref out-of-bounds: pp=%s, valid=%s, off=%s, access=%s"
-             who
-             (ProgramPoint.string_of_t pp)
-             (Itv.string_of_t valid)
-             (Itv.string_of_t off)
-             (Itv.string_of_t access))))
-    base
+
+let loc_overlap (l1:Abs_Loc.t) (l2:Abs_Loc.t) : bool =
+  match (l1, l2) with
+  | Abs_Loc.Bot, _ | _, Abs_Loc.Bot -> false
+  | Abs_Loc.Top, _ | _, Abs_Loc.Top -> true
+  | Abs_Loc.AVarLoc {id = id1; offset = off1}, Abs_Loc.AVarLoc {id = id2; offset = off2} ->
+      Var.compare id1 id2 = 0 && Itv.is_overlap off1 off2
+  | Abs_Loc.AHeapLoc {lbl = lbl1; offset = off1}, Abs_Loc.AHeapLoc {lbl = lbl2; offset = off2} ->
+      Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.is_overlap off1 off2
+  | _ -> false
+
 let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
   let (itv1, _u1, loc1) = v1 in
   let (itv2, _u2, loc2) = v2 in
@@ -250,13 +222,13 @@ let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
   let loc_check = (loc1 = Abs_Loc.bot || loc2 = Abs_Loc.bot) in
   if itv_check && loc_check then Itv.Bool.false_
   else (
-    (*TO-DO*)
+    (*TO-DO - bug*)
     Itv.Bool.top
   )
 
 let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
-  let ({ aenv; amem; aimode } : abs_conf) = c in
+  let ({ amem; aimode } : abs_conf) = c in
   let r = { avalue = Abs_Val.bot; app = PPSet.empty } in
   let pp = ProgramPoint.Label lbl in
   (* TO-DO : after evaluating internal e, check interrupt mode and do post-step*)
@@ -264,20 +236,12 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
   | Unit -> ({ r with avalue = abs_unit () }, c)
   | Int n -> ({ r with avalue = abs_int (Itv.alpha n) }, c)
   | Var x -> (
-      if lvalue then
-        match Abs_Env.find aenv x with
-        | Some l -> ({ r with avalue = abs_loc l}, c)
-        | None ->
-            let l = Abs_Loc.alloc (ProgramPoint.Label lbl) in
-            let aenv' = Abs_Env.write aenv x l in
-            ( { r with avalue = abs_loc l},
-              { c with aenv = aenv' } )
-      else
-        match Abs_Env.find aenv x with
-        | Some l -> 
-            let (v, p') = Abs_Mem.find amem l in
-            ({ avalue = v; app = p'; }, c)
-        | None -> raise (Runtime_error ("[Abs_Env] Variable " ^ x ^ " not found")))
+      let l = Abs_Loc.get x in
+        if lvalue then ({ r with avalue = abs_loc l}, c)
+        else
+          match Abs_Mem.LocMap.find_opt l amem with
+          | Some (v, p') -> ({ avalue = v; app = p'; }, c)
+          | None -> raise (Runtime_error ("[Abs_Mem] Variable " ^ x ^ " not found")))
   | Enable -> ({r with avalue = abs_unit ()}, { c with aimode = Interrupt.Enabled })
   | Disable -> ({r with avalue = abs_unit ()}, { c with aimode = Interrupt.Disabled })
   | Malloc (e1, e2) ->
@@ -286,16 +250,14 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
       (* let c1 = post_step e1 c1 in *)
       let r2, c2 = self c1 e2 in
       (* let c2 = post_step e2 c2 in *)
-      let n_itv = get_offset (proj_int r1.avalue) in
+      let n_itv = get_offset (proj_int r1.avalue) in (* offset logic*)
       let v = r2.avalue in
       (match n_itv with
-      | Bot -> raise (Runtime_error ("[Malloc] Number of allocation cannot be zero"))
+      | Bot -> raise (Runtime_error ("[Malloc] Number of allocation cannot be bot"))
       | Itv _ -> (
-        let base_pp = ProgramPoint.Label lbl in
-        let amem' = c2.amem in
-        let base_loc = Abs_Loc.create base_pp n_itv in
-        let amem'' =  Abs_Mem.write amem' base_loc v pp in
-        ({ r with avalue = abs_loc base_loc }, { c2 with amem = amem'' } )
+        let l = Abs_Loc.alloc lbl n_itv in
+        let amem' =  Abs_Mem.write c2.amem l v pp in
+        ({ r with avalue = abs_loc l }, { c2 with amem = amem' } )
       ))
   | Deref (e1, e2) -> (
     let r1, c1 = self c e1 in
@@ -304,12 +266,27 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
       (* let c2 = post_step e2 c2 in *)
     let base = proj_loc r1.avalue in
     let off = proj_int r2.avalue in
-    let aloc = offset_checked ~who:"Deref" base off in
-    (* TO-DO: base에서 aloc 쪼개서 amem 변형하기 *)
-    if lvalue then ({ r with avalue = abs_loc aloc }, c2 )
+    let loc = Abs_Loc.offset_add base off in
+    if lvalue then ({ r with avalue = abs_loc loc }, c2 )
     else (
-      let (v, pps) = Abs_Mem.find c2.amem aloc in
-      ({ avalue = v; app = pps }, c2))
+      match loc with
+      | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2)
+      | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2)
+      | Abs_Loc.AVarLoc _ | Abs_Loc.AHeapLoc _ -> (
+        let (v_join, pp_join) =
+            Abs_Mem.fold
+              (fun (k : Abs_Loc.t) ((v, pps) : Abs_Val.t * PPSet.t)
+                   (acc_v, acc_pps) ->
+                      if loc_overlap loc k then
+                        (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
+                      else
+                        (acc_v, acc_pps))
+              c2.amem
+              (Abs_Val.bot, PPSet.empty)
+          in
+          ({ avalue = v_join; app = pp_join }, c2)
+      )
+    )
   )
   | Bop (bop, e1, e2) -> (
       let r1, c1 = self c e1 in
@@ -389,7 +366,7 @@ let init_conf (pgm : Program.t) : conf =
     List.fold_left
       (fun (hs, iset) (d : Handler.t) ->
         let hs =
-          HandlerStore.add hs ~iid:d.iid ~body:d.body ~env:c_globals.env
+          HandlerStore.add hs d.iid d.body
         in
         let iset = IidSet.add (Handler.get_iid d) iset in
         (hs, iset))
@@ -415,7 +392,6 @@ let def_intp (pgm : Program.t) : Mem.t =
 let init_confa (pgm : Program.t) : abs_conf =
   let c0 =
     {
-      aenv = Abs_Env.bot;
       amem = Abs_Mem.bot;
       aimode = Interrupt.Enabled;
     }
@@ -425,30 +401,27 @@ let init_confa (pgm : Program.t) : abs_conf =
     List.fold_left
       (fun (hs, iset) (d : Handler.t) ->
         let hs =
-          Abs_HandlerStore.add hs d.iid d.body c_globals.aenv
+          HandlerStore.add hs d.iid d.body
         in
         let iset = IidSet.add (Handler.get_iid d) iset in
         (hs, iset))
-      (Abs_HandlerStore.bot, IidSet.empty)
+      (HandlerStore.empty, IidSet.empty)
       pgm.handler
   in
   iset := iset';
-  abs_handlers := hs';
+  handlers := hs';
+  mainid := IidSet.cardinal iset';
   {
-    aenv = c_globals.aenv;
     amem = c_globals.amem;
     aimode = c_globals.aimode;
   }
 
-
-
 let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
   print_endline "<<<Abstract Interpretation>>>";
+  print_endline "=== Initial Configuration ===";
   let c_init = init_confa pgm in
   print_endline "=== Initial Abstract Memory ===";
   print_endline (Abs_Mem.string_of_t c_init.amem);
   print_endline "=== Final Abstract Memory ===";
   let _, c_final = evalA c_init pgm.main in
-  print_endline "=== Final ENV ===";
-  print_endline (Abs_Env.string_of_t c_final.aenv); 
   c_final.amem
