@@ -74,6 +74,19 @@ module IidSet = Set.Make (Int)
 
 module Interrupt = struct
   type t = Disabled | Enabled
+
+  let compare i1 i2 =
+    match (i1, i2) with
+    | Disabled, Disabled -> 0
+    | Disabled, Enabled -> -1
+    | Enabled, Disabled -> 1
+    | Enabled, Enabled -> 0
+  
+  let join i1 i2 =
+    match (i1, i2) with
+    | Disabled, Disabled -> Disabled
+    | _ -> Enabled
+  let string_of_t = function Disabled -> "Disabled" | Enabled -> "Enabled"
 end
 
 module Outcome = struct
@@ -160,9 +173,6 @@ module HandlerStore = struct
   let add (hs : t) (iid : int) (body : Exp.lbl_t) : t =
     IidMap.add iid body hs
 
-  let lookup (hs : t) (iid : int) : Exp.lbl_t =
-  match IidMap.find_opt iid hs with
-  | Some h -> h
-  | None -> failwith "[HandlerStore] Invalid interrupt id"
-
+  let lookup (hs : t) (iid : int) : Exp.lbl_t option =
+    IidMap.find_opt iid hs
 end

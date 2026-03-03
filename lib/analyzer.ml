@@ -142,11 +142,13 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     match exp_r.out with
       | Outcome.Done -> (exp_r, exp_c)
       | Outcome.I iid -> (
-        let exp_h = HandlerStore.lookup !handlers iid in
-        let (hdl_r, hdl_c) = eval {exp_c with imode = Interrupt.Disabled} exp_h in
+        match HandlerStore.lookup !handlers iid with
         (* TODO: Done -> Non-Deterministic *)
+        | None -> ({exp_r with out = Outcome.Done}, exp_c) (* No handler, treat as Done *)
+        | Some exp -> (
+          let (hdl_r, hdl_c) = eval {exp_c with imode = Interrupt.Disabled} exp in
         ({exp_r with out = Outcome.Done}, { exp_c with mem = hdl_c.mem; } ) 
-        )
+        ))
 
 (* Helper *)
 let join_res r1 r2 = {
@@ -156,7 +158,7 @@ let join_res r1 r2 = {
 
 let join_conf c1 c2 = {
   amem = Abs_Mem.join c1.amem c2.amem;
-  aimode = c2.aimode; (* Follow final imode *)
+  aimode = Interrupt.join c1.aimode c2.aimode;
 }
 
 let join_out (r1, c1) (r2, c2) =
@@ -164,7 +166,7 @@ let join_out (r1, c1) (r2, c2) =
 
 let widen_conf c1 c2 = {
   amem = Abs_Mem.widen c1.amem c2.amem;
-  aimode = c2.aimode; (* Follow final imode *)
+  aimode = Interrupt.join c1.aimode c2.aimode;
 }
 
 let leq_conf c1 c2 =
@@ -174,15 +176,6 @@ let leq_conf c1 c2 =
       | Interrupt.Disabled, Interrupt.Disabled -> true
       | Interrupt.Enabled, Interrupt.Enabled -> true
       | Interrupt.Enabled, Interrupt.Disabled -> false)
-
-let interrupt_transform (lbl:Exp.lbl_t) (c: abs_conf) : abs_conf =
-  let ({ amem; aimode } : abs_conf) = c in
-  match aimode with
-  | _ -> c (* TODO: Implement interrupt_transform *)
-
-
-let post_step (lbl: Exp.lbl_t) (c: abs_conf) : abs_conf =
-  interrupt_transform lbl c
 
 let abs_unit () : Abs_Val.t =
   (Itv.bot, Abs_Unit.Unit, Abs_Loc.bot)
@@ -233,13 +226,14 @@ let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
     else Itv.Bool.top
   )
 
-let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf =
+let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
-  let ({ amem; aimode } : abs_conf) = c in
+  let ({ amem; _ } : abs_conf) = c in
   let r = { avalue = Abs_Val.bot; app = PPSet.empty } in
   let pp = ProgramPoint.Label lbl in
   (* TO-DO : after evaluating internal e, check interrupt mode and do post-step*)
-  match exp with
+  let (res, c_after_eval) =
+  (match exp with
   | Unit -> ({ r with avalue = abs_unit () }, c)
   | Int n -> ({ r with avalue = abs_int (Itv.alpha n) }, c)
   | Var x -> (
@@ -253,24 +247,20 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
   | Disable -> ({r with avalue = abs_unit ()}, { c with aimode = Interrupt.Disabled })
   | Malloc (e1, e2) ->
       let r1, c1 = self c e1 in
-      (* TO-DO : post-step or not *)
-      (* let c1 = post_step e1 c1 in *)
       let r2, c2 = self c1 e2 in
-      (* let c2 = post_step e2 c2 in *)
       let n_itv = get_offset (proj_int r1.avalue) in (* offset logic*)
       let v = r2.avalue in
       (match n_itv with
       | Bot -> raise (Runtime_error ("[Malloc] Number of allocation cannot be bot"))
       | Itv _ -> (
         let l = Abs_Loc.alloc lbl n_itv in
+        let base_l = Abs_Loc.alloc lbl (Itv (Z 0, Z 0)) in
         let amem' =  Abs_Mem.write c2.amem l v pp in
-        ({ r with avalue = abs_loc l }, { c2 with amem = amem' } )
+        ({ r with avalue = abs_loc base_l }, { c2 with amem = amem' } )
       ))
   | Deref (e1, e2) -> (
     let r1, c1 = self c e1 in
-      (* TO-DO : post-step or not *)
     let r2, c2 = self c1 e2 in
-      (* let c2 = post_step e2 c2 in *)
     let base = proj_loc r1.avalue in
     let off = proj_int r2.avalue in
     let loc = Abs_Loc.offset_add base off in
@@ -331,14 +321,6 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
         let r2, c2 = self c1 e2 in
         let r3, c3 = self c1 e3 in
         join_out (r2, c2) (r3, c3))
-  (* | Let (x, e1, e2) ->
-      let r1, c1 = self c e1 in
-      let l = Abs_Loc.alloc (ProgramPoint.Label lbl) in
-      let aenv' = Abs_Env.write c1.aenv x l in
-      let amem' = Abs_Mem.write c1.amem l r1.avalue pp in
-      let c2 = { c1 with aenv = aenv'; amem = amem' } in
-      let r2, c3 = self c2 e2 in
-      (r2, { c3 with aenv = c1.aenv }) *)
   | While (_id, econd, ebody) ->
       (* join-only widening fixpoint for while *)
       let rec iterate (i:int) (input:abs_conf) : abs_conf =
@@ -355,7 +337,23 @@ let evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(
         end
       in
       let output = iterate 0 c in
-      ({ avalue = abs_unit (); app = PPSet.empty }, output)
+      ({ avalue = abs_unit (); app = PPSet.empty }, output)) in
+  match c_after_eval.aimode with
+  | Disabled -> (res, c_after_eval)
+  | Enabled -> (
+    let c_after_post = post_step self c_after_eval in
+    (res, c_after_post)
+  )
+and post_step (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) (c: abs_conf) : abs_conf =
+  let input_c = c in
+    let joined = IidSet.fold (fun iid acc -> 
+      match HandlerStore.lookup !handlers iid with
+      | None -> acc
+      | Some handler_exp ->
+        let  (_r, c') = self {input_c with aimode = Interrupt.Disabled} handler_exp in
+        join_conf acc c') !iset input_c in
+    {joined with aimode = c.aimode} (* imode should not change in post step *)
+
 
 let rec evalA ?(lvalue=false) (c:abs_conf) (lbl_exp:Exp.lbl_t) : abs_res * abs_conf =
   evA evalA ~lvalue c lbl_exp
@@ -400,7 +398,7 @@ let init_confa (pgm : Program.t) : abs_conf =
   let c0 =
     {
       amem = Abs_Mem.bot;
-      aimode = Interrupt.Enabled;
+      aimode = Interrupt.Disabled;
     }
   in
   let _, c_globals = evalA c0 pgm.global in
@@ -419,11 +417,11 @@ let init_confa (pgm : Program.t) : abs_conf =
   handlers := hs';
   {
     amem = c_globals.amem;
-    aimode = c_globals.aimode;
+    aimode = Interrupt.Enabled;
   }
 
 let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
-  let c_init = init_confa pgm in
+  let c_init = init_confa pgm in (* TODO : Block interrupt control whithin the handler *)
   print_endline "=== Initial Abstract Memory ===";
   print_endline (Abs_Mem.string_of_t c_init.amem);
   print_endline "=== analyzing... ===";

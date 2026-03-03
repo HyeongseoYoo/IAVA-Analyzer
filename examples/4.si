@@ -1,13 +1,18 @@
 init {
-  x := 0;
-  y := malloc(2, 0);
-  handler 0 { x := -1 };
-  handler 1 { *y[0] := 1; *y[0] := 1 }
+  INIT := 0;
+  SVC := 1;
+  IRQ := 2;
+  FIQ := 3;
+  INVALID := 100; 
+
+  CurrentUser := INIT;
+  Status := malloc(4, 0);
+
+  handler 0 { CurrentUser := INVALID }
 }
 
 main {
-  sum := 0;
-  flag := 1;
-  while flag = 1 do
-  ((if sum = 5 then flag := 0 else flag := 1); sum:=sum+1)
+  if CurrentUser = INVALID
+  then CurrentUser := INIT
+  else *Status[CurrentUser] := 1
 }
