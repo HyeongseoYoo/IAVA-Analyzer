@@ -36,9 +36,8 @@ module Abs_Loc = struct
 
   let offset_add (base: t) (offset: Itv.t) : t =
     match base with
-      | Bot -> Bot
       | Top -> Top
-      | AVarLoc { id; offset = base_off } -> AVarLoc { id; offset = Itv.add base_off offset }
+      | Bot | AVarLoc _ -> Bot
       | AHeapLoc { lbl; offset = base_off } -> AHeapLoc { lbl; offset = Itv.add base_off offset }
 
   let leq l1 l2 =

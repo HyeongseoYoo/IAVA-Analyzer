@@ -10,6 +10,16 @@ module Bound = struct
     | _, P_inf -> -1
     | Z n1, Z n2 -> Int.compare n1 n2
 
+  let pred = function
+    | Z n -> Z (n - 1)
+    | P_inf -> P_inf
+    | N_inf -> N_inf
+
+  let succ = function
+    | Z n -> Z (n + 1)
+    | P_inf -> P_inf
+    | N_inf -> N_inf
+
   let max b1 b2 =
     match (b1, b2) with
     | N_inf, b | b, N_inf -> b
@@ -130,6 +140,20 @@ let neg = function
       Itv (~-r, ~-l)
 
 let ( ~-- ) = neg
+
+let left i =
+  match i with
+  | Bot -> Bot
+  | Itv (Z n, _) -> Itv (N_inf, Z (n-1))
+  | Itv (N_inf, _) -> Bot
+  | Itv (P_inf, _) -> Itv (N_inf, P_inf)
+
+let right i =
+  match i with
+  | Bot -> Bot
+  | Itv (_, Z n) -> Itv (Z (n+1), P_inf)
+  | Itv (_, P_inf) -> Bot
+  | Itv (_, N_inf) -> Itv (N_inf, P_inf)
 
 module Bool = struct
   let true_ = Itv (Z 1, Z 1)

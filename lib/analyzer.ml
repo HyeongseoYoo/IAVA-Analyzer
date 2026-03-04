@@ -29,6 +29,7 @@ exception Runtime_error of string
 let var_tbl : VarTbl.t ref = ref VarTbl.empty
 let iset : IidSet.t ref = ref IidSet.empty
 let handlers : HandlerStore.t ref = ref HandlerStore.empty
+let size_tbl : Itv.t LblMap.t ref = ref LblMap.empty
 
 let widen_cnt = 10
 
@@ -209,6 +210,23 @@ let loc_overlap (l1:Abs_Loc.t) (l2:Abs_Loc.t) : bool =
       Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.is_overlap off1 off2
   | _ -> false
 
+let itv_overlap (loc: Abs_Loc.t) : (Itv.t * Itv.t * Itv.t) =
+  match loc with
+  | Abs_Loc.Bot | Abs_Loc.AVarLoc _ -> (Bot, Bot, Bot)
+  | Abs_Loc.Top -> (Itv.top, Itv.top, Itv.top)
+  | Abs_Loc.AHeapLoc {lbl = base; offset = off} ->
+    (let size = match LblMap.find_opt base !size_tbl with
+      | Some s -> s
+      | None -> Itv.bot
+    in
+    (match (size, off) with
+    | Bot, _ | _, Bot -> (Bot, Bot, Bot)
+    | _, _ ->
+      let in_itv = Itv.meet size off in
+      let left_oob = Itv.meet off (Itv.left size) in
+      let right_oob = Itv.meet off (Itv.right size) in
+      (in_itv, left_oob, right_oob)))
+
 let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
   let (itv1, _u1, loc1) = v1 in
   let (itv2, _u2, loc2) = v2 in
@@ -248,12 +266,14 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
   | Malloc (e1, e2) ->
       let r1, c1 = self c e1 in
       let r2, c2 = self c1 e2 in
-      let n_itv = get_offset (proj_int r1.avalue) in (* offset logic*)
+      (* TO-DO: if there is a negative value in range n_itv, it should be added in error list *)
+      let n_itv = get_offset (proj_int r1.avalue) in (* max positive offset *)
       let v = r2.avalue in
       (match n_itv with
       | Bot -> raise (Runtime_error ("[Malloc] Number of allocation cannot be bot"))
       | Itv _ -> (
         let l = Abs_Loc.alloc lbl n_itv in
+        size_tbl := LblMap.add lbl n_itv !size_tbl;
         let base_l = Abs_Loc.alloc lbl (Itv (Z 0, Z 0)) in
         let amem' =  Abs_Mem.write c2.amem l v pp in
         ({ r with avalue = abs_loc base_l }, { c2 with amem = amem' } )
@@ -263,10 +283,20 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
     let r2, c2 = self c1 e2 in
     let base = proj_loc r1.avalue in
     let off = proj_int r2.avalue in
-    let loc = Abs_Loc.offset_add base off in
-    if lvalue then ({ r with avalue = abs_loc loc }, c2 )
+
+    let origin_loc = Abs_Loc.offset_add base off in
+    let in_itv, left_oob, right_oob = itv_overlap origin_loc in
+    let safe_loc = Abs_Loc.offset_add base in_itv in
+
+    (* TO-DO: Write error on config *)
+
+    if lvalue then (
+      match in_itv with
+      | Itv.Bot -> ({ r with avalue = Abs_Val.bot }, c2)
+      | _ -> ({ r with avalue = abs_loc safe_loc }, c2)
+    )
     else (
-      match loc with
+      match safe_loc with
       | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2)
       | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2)
       | Abs_Loc.AVarLoc _ | Abs_Loc.AHeapLoc _ -> (
@@ -274,7 +304,7 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
             Abs_Mem.fold
               (fun (k : Abs_Loc.t) ((v, pps) : Abs_Val.t * PPSet.t)
                    (acc_v, acc_pps) ->
-                      if loc_overlap loc k then
+                      if loc_overlap safe_loc k then
                         (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
                       else
                         (acc_v, acc_pps))

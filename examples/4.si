@@ -14,5 +14,6 @@ init {
 main {
   if CurrentUser = INVALID
   then CurrentUser := INIT
-  else *Status[CurrentUser] := 1
+  else *Status[CurrentUser] := 1;
+  CurrentUser := SVC
 }
