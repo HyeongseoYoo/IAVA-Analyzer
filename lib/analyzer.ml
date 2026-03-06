@@ -11,6 +11,7 @@ type conf = {
 type abs_conf = {
   amem : Abs_Mem.t;
   aimode : Interrupt.t;
+  errs: ErrorSet.t;
 }
 
 type result = {
@@ -160,6 +161,7 @@ let join_res r1 r2 = {
 let join_conf c1 c2 = {
   amem = Abs_Mem.join c1.amem c2.amem;
   aimode = Interrupt.join c1.aimode c2.aimode;
+  errs = ErrorSet.union c1.errs c2.errs;
 }
 
 let join_out (r1, c1) (r2, c2) =
@@ -168,6 +170,7 @@ let join_out (r1, c1) (r2, c2) =
 let widen_conf c1 c2 = {
   amem = Abs_Mem.widen c1.amem c2.amem;
   aimode = Interrupt.join c1.aimode c2.aimode;
+  errs = ErrorSet.union c1.errs c2.errs;
 }
 
 let leq_conf c1 c2 =
@@ -210,27 +213,31 @@ let loc_overlap (l1:Abs_Loc.t) (l2:Abs_Loc.t) : bool =
       Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.is_overlap off1 off2
   | _ -> false
 
+let find_size (lbl:Exp.Lbl.t) : Itv.t =
+  match LblMap.find_opt lbl !size_tbl with
+  | Some s -> s
+  | None -> Itv.bot
+
 let itv_overlap (loc: Abs_Loc.t) : (Itv.t * Itv.t * Itv.t) =
   match loc with
   | Abs_Loc.Bot | Abs_Loc.AVarLoc _ -> (Bot, Bot, Bot)
   | Abs_Loc.Top -> (Itv.top, Itv.top, Itv.top)
   | Abs_Loc.AHeapLoc {lbl = base; offset = off} ->
-    (let size = match LblMap.find_opt base !size_tbl with
-      | Some s -> s
-      | None -> Itv.bot
-    in
+    (let size = find_size base in
     (match (size, off) with
     | Bot, _ | _, Bot -> (Bot, Bot, Bot)
     | _, _ ->
       let in_itv = Itv.meet size off in
+      (* print_endline ("Size " ^ Itv.string_of_t size ^ ", Left "^ Itv.string_of_t (Itv.left size)  ^ ", Right " ^ Itv.string_of_t (Itv.right size) ^ ", Offset " ^ Itv.string_of_t off); *)
       let left_oob = Itv.meet off (Itv.left size) in
       let right_oob = Itv.meet off (Itv.right size) in
+      (* print_endline ("Left oob " ^ Itv.string_of_t left_oob ^ ", Right oob "^ Itv.string_of_t right_oob); *)
       (in_itv, left_oob, right_oob)))
 
 let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
   let (itv1, _u1, loc1) = v1 in
   let (itv2, _u2, loc2) = v2 in
-  print_endline ("[Equal Check] " ^ Abs_Val.string_of_t v1 ^ " vs " ^ Abs_Val.string_of_t v2);
+  (* print_endline ("[Equal Check] " ^ Abs_Val.string_of_t v1 ^ " vs " ^ Abs_Val.string_of_t v2); *)
   let itv_bot = (itv1 = Itv.bot || itv2 = Itv.bot) in
   let loc_bot = (loc1 = Abs_Loc.bot || loc2 = Abs_Loc.bot) in
   if itv_bot && loc_bot then Itv.Bool.false_
@@ -244,14 +251,45 @@ let equal_check (v1:Abs_Val.t) (v2:Abs_Val.t) : Itv.t =
     else Itv.Bool.top
   )
 
+let is_pp_handler (pp: ProgramPoint.t) : bool =
+  match pp with
+  | ProgramPoint.Label (Exp.Lbl.Handler _) -> true
+  | _ -> false
+
+let ppset_has_handler (pps: PPSet.t) : bool =
+  PPSet.exists is_pp_handler pps
+
+let add_deref_oob_errors
+    ~(at:ProgramPoint.t)
+    ~(access:Error.access)          (* Read / Write *)
+    ~(base:Abs_Loc.t)
+    (* ~(offset:Itv.t) *)
+    ~(in_itv:Itv.t)
+    ~(left_oob:Itv.t)
+    ~(right_oob:Itv.t)
+    ~(base_pp:PPSet.t)             (* r1.pp *)
+    ~(offset_pp:PPSet.t)           (* r2.pp *)
+    (c:abs_conf) : abs_conf =
+  (* OOB가 전혀 없으면 그대로 *)
+  if left_oob = Itv.bot && right_oob = Itv.bot then c
+  else
+    let handler_caused = ppset_has_handler base_pp || ppset_has_handler offset_pp in
+    match (left_oob, right_oob) with
+    | Bot, Bot -> c
+    | Itv _, Bot | Bot, Itv _ | Itv _, Itv _ -> let err =
+          Error.make
+            ~at ~access ~base ~in_itv
+            ~left_oob ~right_oob
+            ~base_pp ~offset_pp ~handler_caused
+      in { c with errs = ErrorSet.add err c.errs }
+
 let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
   let ({ amem; _ } : abs_conf) = c in
   let r = { avalue = Abs_Val.bot; app = PPSet.empty } in
   let pp = ProgramPoint.Label lbl in
-  (* TO-DO : after evaluating internal e, check interrupt mode and do post-step*)
   let (res, c_after_eval) =
-  (match exp with
+  (match exp with 
   | Unit -> ({ r with avalue = abs_unit () }, c)
   | Int n -> ({ r with avalue = abs_int (Itv.alpha n) }, c)
   | Var x -> (
@@ -286,19 +324,22 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
 
     let origin_loc = Abs_Loc.offset_add base off in
     let in_itv, left_oob, right_oob = itv_overlap origin_loc in
-    let safe_loc = Abs_Loc.offset_add base in_itv in
-
+    let safe_loc = Abs_Loc.join base (Abs_Loc.offset_add base in_itv) in
     (* TO-DO: Write error on config *)
 
+    let access = if lvalue then Error.Write else Error.Read in
+    let c2_err =
+      add_deref_oob_errors ~at:pp ~access:access ~base:origin_loc ~in_itv
+        ~left_oob:left_oob ~right_oob:right_oob ~base_pp:r1.app ~offset_pp:r2.app c2 in
     if lvalue then (
       match in_itv with
-      | Itv.Bot -> ({ r with avalue = Abs_Val.bot }, c2)
-      | _ -> ({ r with avalue = abs_loc safe_loc }, c2)
+      | Itv.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
+      | _ -> ({ r with avalue = abs_loc safe_loc }, c2_err)
     )
     else (
       match safe_loc with
-      | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2)
-      | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2)
+      | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
+      | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2_err)
       | Abs_Loc.AVarLoc _ | Abs_Loc.AHeapLoc _ -> (
         let (v_join, pp_join) =
             Abs_Mem.fold
@@ -311,7 +352,7 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
               c2.amem
               (Abs_Val.bot, PPSet.empty)
           in
-          ({ avalue = v_join; app = pp_join }, c2)
+          ({ avalue = v_join; app = pp_join }, c2_err)
       )
     )
   )
@@ -340,7 +381,6 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
   | If (e1, e2, e3) -> (
       let r1, c1 = self c e1 in
       let v1 = proj_int r1.avalue in
-      print_endline("Itv in If: " ^ Itv.string_of_t v1);
       if v1 = Itv.Bool.true_ then
         let r2, c2 = self c1 e2 in
         (r2, c2)
@@ -429,6 +469,7 @@ let init_confa (pgm : Program.t) : abs_conf =
     {
       amem = Abs_Mem.bot;
       aimode = Interrupt.Disabled;
+      errs = ErrorSet.empty;
     }
   in
   let _, c_globals = evalA c0 pgm.global in
@@ -448,6 +489,7 @@ let init_confa (pgm : Program.t) : abs_conf =
   {
     amem = c_globals.amem;
     aimode = Interrupt.Enabled;
+    errs = c_globals.errs;
   }
 
 let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
@@ -456,5 +498,7 @@ let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
   print_endline (Abs_Mem.string_of_t c_init.amem);
   print_endline "=== analyzing... ===";
   let _, c_final = evalA c_init pgm.main in
+  print_endline "=== Error Messages ===";
+  print_endline (ErrorSet.string_of_t c_final.errs);
   print_endline "=== Final Abstract Memory ===";
   c_final.amem

@@ -3,6 +3,7 @@ open Domain
 
 module PPMap = Map.Make(ProgramPoint)
 module LblMap = Map.Make(Exp.Lbl)
+module PPSet = Set.Make(ProgramPoint)
 
 module Abs_Loc = struct
   type t = Bot | AVarLoc of {id: Var.t; offset: Itv.t} | AHeapLoc of {lbl: Exp.Lbl.t; offset: Itv.t} | Top
@@ -82,7 +83,7 @@ module Abs_Loc = struct
   let string_of_t = function
     | Bot -> "⊥"
     | Top -> "⊤"
-    | AVarLoc {id; offset} -> Printf.sprintf "%s+%s" id (Itv.string_of_t offset)
+    | AVarLoc {id; offset} -> Printf.sprintf "%s" id
     | AHeapLoc {lbl; offset} -> Printf.sprintf "%s+%s" (Exp.Lbl.string_of_t lbl) (Itv.string_of_t offset)
 
 end
@@ -209,8 +210,6 @@ module Abs_Val = struct
     Printf.sprintf "<%s, %s, %s>" itv_str u_str l_str
 end
 
-module PPSet = Set.Make(ProgramPoint)
-
 module Abs_Mem = struct
   module LocMap = Map.Make(struct
     type t = Abs_Loc.t
@@ -281,3 +280,113 @@ let fold (f : Abs_Loc.t -> (Abs_Val.t * PPSet.t) -> 'a -> 'a) (m : t) (init : 'a
       in
       String.concat "\n" binding_strs
 end
+
+module Error = struct
+  type access = Read | Write
+  type t = {
+    at: ProgramPoint.t;
+    access: access;
+    base: Abs_Loc.t;
+    (* offset: Itv.t; *)
+    in_itv: Itv.t;
+    left_oob: Itv.t;
+    right_oob: Itv.t;
+
+    base_pp: PPSet.t;
+    offset_pp: PPSet.t;
+
+    handler_caused: bool;
+  }
+
+  let make
+      ~(at:ProgramPoint.t)
+      ~(access:access)
+      ~(base:Abs_Loc.t)
+      (* ~(offset:Itv.t) *)
+      ~(in_itv:Itv.t)
+      ~(left_oob:Itv.t)
+      ~(right_oob:Itv.t)
+      ~(base_pp:PPSet.t)
+      ~(offset_pp:PPSet.t)
+      ~(handler_caused:bool)
+      : t =
+    { at; access; base; in_itv; left_oob; right_oob; base_pp; offset_pp; handler_caused }
+
+  (* Set에 넣으려면 total order 필요 *)
+  let compare_access a1 a2 =
+    match (a1, a2) with
+    | Read, Read | Write, Write -> 0
+    | Read, Write -> -1
+    | Write, Read -> 1
+
+  let compare (e1:t) (e2:t) : int =
+    let c = ProgramPoint.compare e1.at e2.at in
+    if c <> 0 then c else
+    let c = compare_access e1.access e2.access in
+    if c <> 0 then c else
+    let c = Abs_Loc.compare e1.base e2.base in
+    if c <> 0 then c else
+    (* let c = Itv.compare e1.offset e2.offset in
+    if c <> 0 then c else *)
+    let c = Itv.compare e1.in_itv e2.in_itv in
+    if c <> 0 then c else
+    let c = Itv.compare e1.left_oob e2.left_oob in
+    if c <> 0 then c else
+    let c = Itv.compare e1.right_oob e2.right_oob in
+    if c <> 0 then c else
+    let c = PPSet.compare e1.base_pp e2.base_pp in
+    if c <> 0 then c else
+    let c = PPSet.compare e1.offset_pp e2.offset_pp in
+    if c <> 0 then c else
+    Bool.compare e1.handler_caused e2.handler_caused
+
+  let string_of_access = function
+    | Read -> "Read"
+    | Write -> "Write"
+
+  let string_of_ppset (pps:PPSet.t) : string =
+    let elems =
+      PPSet.fold
+        (fun pp acc ->
+          let s =
+            try ProgramPoint.string_of_t pp with _ -> "<pp>"
+          in
+          s :: acc)
+        pps
+        []
+    in
+    "{" ^ String.concat ", " (List.rev elems) ^ "}"
+  let to_string (e:t) : string =
+    let at_s =
+      (* 예: ProgramPoint.string_of_t 가 없으면 직접 구현/교체 *)
+      try ProgramPoint.string_of_t e.at with _ -> "<pp>"
+    in
+    Printf.sprintf
+      "[OOB:%s]%s at=%s base=%s in=%s left=%s right=%s base_src=%s off_src=%s"
+      (string_of_access e.access)
+      (if e.handler_caused then " (handler-caused)" else "")
+      at_s
+      (Abs_Loc.string_of_t e.base)
+      (* (Itv.string_of_t e.offset) *)
+      (Itv.string_of_t e.in_itv)
+      (Itv.string_of_t e.left_oob)
+      (Itv.string_of_t e.right_oob)
+      (string_of_ppset e.base_pp)
+      (string_of_ppset e.offset_pp)
+
+  let is_handler_caused (e:t) = e.handler_caused
+end
+
+module ErrorSet = struct
+  module S = Set.Make(struct
+    type t = Error.t
+    let compare = Error.compare
+  end)
+  include S
+
+  let string_of_t (es:t) : string =
+    let elems = elements es |> List.map Error.to_string in
+    "{" ^ String.concat ", " elems ^ "}"
+end
+
+
