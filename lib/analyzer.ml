@@ -311,7 +311,7 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
       | Bot -> raise (Runtime_error ("[Malloc] Number of allocation cannot be bot"))
       | Itv _ -> (
         let l = Abs_Loc.alloc lbl n_itv in
-        size_tbl := LblMap.add lbl n_itv !size_tbl;
+        size_tbl := LblMap.add lbl n_itv !size_tbl; (* [0, n-1] *)
         let base_l = Abs_Loc.alloc lbl (Itv (Z 0, Z 0)) in
         let amem' =  Abs_Mem.write c2.amem l v pp in
         ({ r with avalue = abs_loc base_l }, { c2 with amem = amem' } )
@@ -319,25 +319,49 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
   | Deref (e1, e2) -> (
     let r1, c1 = self c e1 in
     let r2, c2 = self c1 e2 in
-    let base = proj_loc r1.avalue in
-    let off = proj_int r2.avalue in
+    let base_loc = proj_loc r1.avalue in
+    let offset_itv  = proj_int r2.avalue in
 
-    let origin_loc = Abs_Loc.offset_add base off in
-    let in_itv, left_oob, right_oob = itv_overlap origin_loc in
-    let safe_loc = Abs_Loc.join base (Abs_Loc.offset_add base in_itv) in
-    (* TO-DO: Write error on config *)
+    let shifted_loc = Abs_Loc.offset_add base_loc offset_itv in
+    let full_base_loc, safe_itv, left_oob, right_oob =
+      match base_loc with
+      | Abs_Loc.AHeapLoc { lbl; _ } ->
+          let size_itv = find_size lbl in
+          let full_loc = Abs_Loc.AHeapLoc { lbl; offset = size_itv } in
+          let safe_itv, left_oob, right_oob = itv_overlap shifted_loc in
+          (full_loc, safe_itv, left_oob, right_oob)
+      | Abs_Loc.AVarLoc _ | Abs_Loc.Bot ->
+          (Abs_Loc.Bot, Itv.bot, Itv.bot, Itv.bot)
+      | Abs_Loc.Top ->
+          (Abs_Loc.Top, Itv.top, Itv.top, Itv.top)
+    in
+
+    let read_loc =
+      match base_loc with
+      | Abs_Loc.AHeapLoc { lbl; _ } ->
+          Abs_Loc.AHeapLoc { lbl; offset = safe_itv }
+      | Abs_Loc.AVarLoc _  | Abs_Loc.Bot -> Abs_Loc.Bot
+      | Abs_Loc.Top -> Abs_Loc.Top
+    in
+
+    let write_loc =
+      match base_loc with
+      | Abs_Loc.AHeapLoc _ -> full_base_loc
+      | Abs_Loc.AVarLoc _  | Abs_Loc.Bot -> Abs_Loc.Bot
+      | Abs_Loc.Top -> Abs_Loc.Top
+    in
 
     let access = if lvalue then Error.Write else Error.Read in
     let c2_err =
-      add_deref_oob_errors ~at:pp ~access:access ~base:origin_loc ~in_itv
+      add_deref_oob_errors ~at:pp ~access:access ~base:shifted_loc ~in_itv:safe_itv
         ~left_oob:left_oob ~right_oob:right_oob ~base_pp:r1.app ~offset_pp:r2.app c2 in
     if lvalue then (
-      match in_itv with
-      | Itv.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
-      | _ -> ({ r with avalue = abs_loc safe_loc }, c2_err)
+      match write_loc with
+      | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
+      | _ -> ({ r with avalue = abs_loc write_loc }, c2_err)
     )
     else (
-      match safe_loc with
+      match read_loc with
       | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
       | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2_err)
       | Abs_Loc.AVarLoc _ | Abs_Loc.AHeapLoc _ -> (
@@ -345,7 +369,7 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
             Abs_Mem.fold
               (fun (k : Abs_Loc.t) ((v, pps) : Abs_Val.t * PPSet.t)
                    (acc_v, acc_pps) ->
-                      if loc_overlap safe_loc k then
+                      if loc_overlap read_loc k then
                         (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
                       else
                         (acc_v, acc_pps))
@@ -411,7 +435,7 @@ let rec evA (self: ?lvalue : bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf
   match c_after_eval.aimode with
   | Disabled -> (res, c_after_eval)
   | Enabled -> (
-    let c_after_post = post_step self c_after_eval in
+    let c_after_post = post_steps self c_after_eval in
     (res, c_after_post)
   )
 and post_step (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf) (c: abs_conf) : abs_conf =
@@ -420,9 +444,24 @@ and post_step (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_con
       match HandlerStore.lookup !handlers iid with
       | None -> acc
       | Some handler_exp ->
-        let  (_r, c') = self {input_c with aimode = Interrupt.Disabled} handler_exp in
-        join_conf acc c') !iset input_c in
-    {joined with aimode = c.aimode} (* imode should not change in post step *)
+        let  (_r, c') = self {input_c with aimode = Interrupt.Disabled} handler_exp
+        in
+          join_conf acc c') !iset input_c in
+    { joined with aimode = c.aimode } (* imode should not change in post step *)
+
+and post_steps (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
+  (c0 : abs_conf) : abs_conf =
+  let rec iterate (i:int) (cur:abs_conf) : abs_conf =
+    let stepped = post_step self cur in
+    let joined = join_conf cur stepped in
+    if leq_conf joined cur then cur
+    else
+      let next = widen_conf cur joined
+      in
+      if leq_conf next cur then cur
+      else iterate (i+1) next
+  in
+  iterate 0 c0
 
 
 let rec evalA ?(lvalue=false) (c:abs_conf) (lbl_exp:Exp.lbl_t) : abs_res * abs_conf =

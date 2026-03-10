@@ -260,8 +260,8 @@ module Abs_Mem = struct
       let new_pps = PPSet.add pp old_pps in
       LocMap.add l (new_v, new_pps) m
 
-let fold (f : Abs_Loc.t -> (Abs_Val.t * PPSet.t) -> 'a -> 'a) (m : t) (init : 'a) : 'a =
-  LocMap.fold (fun l (v, pps) acc -> f l (v, pps) acc) m init
+  let fold (f : Abs_Loc.t -> (Abs_Val.t * PPSet.t) -> 'a -> 'a) (m : t) (init : 'a) : 'a =
+    LocMap.fold (fun l (v, pps) acc -> f l (v, pps) acc) m init
 
   let string_of_t (m : t) : string =
       let bindings = LocMap.bindings m in

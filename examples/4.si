@@ -8,7 +8,11 @@ init {
   CurrentUser := INIT;
   Status := malloc(4, 0);
 
-  handler 0 { CurrentUser := INVALID }
+  Test := 0;
+
+  handler 0 { CurrentUser := INVALID };
+  handler 1 { *Status[CurrentUser] := -1 };
+  handler 2 { Test := Test + 1 }
 }
 
 main {
