@@ -21,33 +21,36 @@ module Var = struct
   module Map = Map.Make (String)
 end
 
-
 module Loc = struct
-  type t = VarLoc of {id: Var.t; offset: int} | HeapLoc of {lbl: Exp.Lbl.t; offset: int}
+  type t =
+    | VarLoc of { id : Var.t; offset : int }
+    | HeapLoc of { lbl : Exp.Lbl.t; offset : int }
 
   module Map = Map.Make (struct
     type nonrec t = t
 
     let compare = compare
   end)
+
   let compare l1 l2 =
     match (l1, l2) with
-    | VarLoc {id = id1; offset = off1}, VarLoc {id = id2; offset = off2} ->
+    | VarLoc { id = id1; offset = off1 }, VarLoc { id = id2; offset = off2 } ->
         let c = Var.compare id1 id2 in
         if c <> 0 then c else Int.compare off1 off2
-    | HeapLoc {lbl = lbl1; offset = off1}, HeapLoc {lbl = lbl2; offset = off2} ->
+    | ( HeapLoc { lbl = lbl1; offset = off1 },
+        HeapLoc { lbl = lbl2; offset = off2 } ) ->
         let c = Exp.Lbl.compare lbl1 lbl2 in
         if c <> 0 then c else Int.compare off1 off2
     | VarLoc _, HeapLoc _ -> -1
     | HeapLoc _, VarLoc _ -> 1
 
-  let get x = VarLoc {id = x; offset = 0}
-  let alloc lbl n = HeapLoc {lbl; offset = n}
+  let get x = VarLoc { id = x; offset = 0 }
+  let alloc lbl n = HeapLoc { lbl; offset = n }
 
   let string_of_t = function
-    | VarLoc {id; offset} -> Printf.sprintf "%s+%d" id offset
-    | HeapLoc {lbl; offset} -> Printf.sprintf "%s+%d" (Exp.Lbl.string_of_t lbl) offset
-
+    | VarLoc { id; offset } -> Printf.sprintf "%s+%d" id offset
+    | HeapLoc { lbl; offset } ->
+        Printf.sprintf "%s+%d" (Exp.Lbl.string_of_t lbl) offset
 end
 
 module Value = struct
@@ -69,7 +72,6 @@ module Value = struct
     | Unit -> "unit"
 end
 
-
 module IidSet = Set.Make (Int)
 
 module Interrupt = struct
@@ -81,11 +83,10 @@ module Interrupt = struct
     | Disabled, Enabled -> -1
     | Enabled, Disabled -> 1
     | Enabled, Enabled -> 0
-  
+
   let join i1 i2 =
-    match (i1, i2) with
-    | Disabled, Disabled -> Disabled
-    | _ -> Enabled
+    match (i1, i2) with Disabled, Disabled -> Disabled | _ -> Enabled
+
   let string_of_t = function Disabled -> "Disabled" | Enabled -> "Enabled"
 end
 
@@ -99,7 +100,6 @@ module Outcome = struct
     | _, Done -> 1
     | I i1, I i2 -> Int.compare i1 i2
 end
-
 
 module VarSet = Set.Make (Var)
 
@@ -169,10 +169,6 @@ module HandlerStore = struct
   type t = Exp.lbl_t IidMap.t
 
   let empty : t = IidMap.empty
-
-  let add (hs : t) (iid : int) (body : Exp.lbl_t) : t =
-    IidMap.add iid body hs
-
-  let lookup (hs : t) (iid : int) : Exp.lbl_t option =
-    IidMap.find_opt iid hs
+  let add (hs : t) (iid : int) (body : Exp.lbl_t) : t = IidMap.add iid body hs
+  let lookup (hs : t) (iid : int) : Exp.lbl_t option = IidMap.find_opt iid hs
 end

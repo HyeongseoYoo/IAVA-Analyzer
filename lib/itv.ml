@@ -10,15 +10,8 @@ module Bound = struct
     | _, P_inf -> -1
     | Z n1, Z n2 -> Int.compare n1 n2
 
-  let pred = function
-    | Z n -> Z (n - 1)
-    | P_inf -> P_inf
-    | N_inf -> N_inf
-
-  let succ = function
-    | Z n -> Z (n + 1)
-    | P_inf -> P_inf
-    | N_inf -> N_inf
+  let pred = function Z n -> Z (n - 1) | P_inf -> P_inf | N_inf -> N_inf
+  let succ = function Z n -> Z (n + 1) | P_inf -> P_inf | N_inf -> N_inf
 
   let max b1 b2 =
     match (b1, b2) with
@@ -75,7 +68,6 @@ type t = Bot | Itv of Bound.t * Bound.t
 
 let top = Itv (N_inf, P_inf)
 let bot = Bot
-
 let alpha n = Itv (Z n, Z n)
 
 let compare i1 i2 =
@@ -144,14 +136,14 @@ let ( ~-- ) = neg
 let left i =
   match i with
   | Bot -> Bot
-  | Itv (Z n, _) -> Itv (N_inf, Z (n-1))
+  | Itv (Z n, _) -> Itv (N_inf, Z (n - 1))
   | Itv (N_inf, _) -> Bot
   | Itv (P_inf, _) -> Itv (N_inf, P_inf)
 
 let right i =
   match i with
   | Bot -> Bot
-  | Itv (_, Z n) -> Itv (Z (n+1), P_inf)
+  | Itv (_, Z n) -> Itv (Z (n + 1), P_inf)
   | Itv (_, P_inf) -> Bot
   | Itv (_, N_inf) -> Itv (N_inf, P_inf)
 
@@ -174,12 +166,11 @@ let less i1 i2 =
       | false, _ -> true_)
 
 let lt i1 i2 = less i1 i2
+
 let ge i1 i2 =
   let b = lt i1 i2 in
   let open Bool in
-  if b = true_ then false_
-  else if b = false_ then true_
-  else top
+  if b = true_ then false_ else if b = false_ then true_ else top
 
 let gt i1 i2 =
   let open Bool in
@@ -190,12 +181,11 @@ let gt i1 i2 =
       | true, true -> false_
       | true, false -> top
       | false, _ -> true_)
+
 let le i1 i2 =
   let b = gt i1 i2 in
   let open Bool in
-  if b = true_ then false_
-  else if b = false_ then true_
-  else top
+  if b = true_ then false_ else if b = false_ then true_ else top
 
 let eq i1 i2 =
   let b1 = ge i1 i2 in
@@ -208,9 +198,7 @@ let eq i1 i2 =
 let ne i1 i2 =
   let b = eq i1 i2 in
   let open Bool in
-  if b = true_ then false_
-  else if b = false_ then true_
-  else top
+  if b = true_ then false_ else if b = false_ then true_ else top
 
 (* Interval domain partial order *)
 let leq i1 i2 =
@@ -271,9 +259,7 @@ let or_ i1 i2 =
       | true, false -> true_
       | _ -> false_)
 
-let is_singleton = function
-  | Bot -> false
-  | Itv (l, r) -> Bound.compare l r = 0
+let is_singleton = function Bot -> false | Itv (l, r) -> Bound.compare l r = 0
 
 let single_eq i1 i2 =
   match (i1, i2) with
@@ -290,6 +276,7 @@ let is_overlap i1 i2 =
       | true, true -> true
       | true, false -> false
       | false, _ -> false)
+
 let string_of_t = function
   | Bot -> "⟂"
   | Itv (l, r) -> Bound.("[" ^ string_of_t l ^ "," ^ string_of_t r ^ "]")

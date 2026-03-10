@@ -46,7 +46,7 @@ module Exp = struct
     | Seq of lbl_t * lbl_t
     | If of lbl_t * lbl_t * lbl_t
     | While of Lbl.t (*ghost*) * lbl_t * lbl_t
-    (* | Let of string * lbl_t * lbl_t *)
+  (* | Let of string * lbl_t * lbl_t *)
 
   module Lbl_map = struct
     include Map.Make (struct
@@ -71,7 +71,8 @@ module Exp = struct
       | Deref (e1, e2)
       | Malloc (e1, e2)
       | Assign (e1, e2)
-      | Seq (e1, e2) -> tbl |> tabulate' e1 |> tabulate' e2
+      | Seq (e1, e2) ->
+          tbl |> tabulate' e1 |> tabulate' e2
       (* | Let (_, e1, e2) -> tbl |> tabulate' e1 |> tabulate' e2 *)
       | If (e1, e2, e3) -> tbl |> tabulate' e1 |> tabulate' e2 |> tabulate' e3
       | While (glbl, e1, e2) ->
@@ -112,10 +113,8 @@ module Exp = struct
           let e2', l2 = relabel' l1 e2 in
           let glbl = Lbl.succ_lbl l2 in
           ({ lbl = my_lbl; exp = While (glbl, e1', e2') }, glbl)
-      (* | Let (x, e1, e2) ->
-          let e1', l1 = relabel' my_lbl e1 in
-          let e2', l2 = relabel' l1 e2 in
-          ({ lbl = my_lbl; exp = Let (x, e1', e2') }, l2) *)
+      (* | Let (x, e1, e2) -> let e1', l1 = relabel' my_lbl e1 in let e2', l2 =
+         relabel' l1 e2 in ({ lbl = my_lbl; exp = Let (x, e1', e2') }, l2) *)
       | If (e1, e2, e3) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
@@ -153,9 +152,8 @@ module Exp = struct
     | While (_, e1, e2) ->
         Printf.sprintf "while %s\ndo %s" (string_of_lbl_t e1)
           (string_of_lbl_t e2)
-    (* | Let (x, e1, e2) ->
-        Printf.sprintf "let %s = %s in\n%s" x (string_of_lbl_t e1)
-          (string_of_lbl_t e2) *)
+  (* | Let (x, e1, e2) -> Printf.sprintf "let %s = %s in\n%s" x (string_of_lbl_t
+     e1) (string_of_lbl_t e2) *)
 end
 
 module Handler = struct
