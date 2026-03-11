@@ -1,0 +1,46 @@
+(*
+   Example 7: Bad block table 갱신
+
+   의도:
+   - media scan interrupt가 bad block을 발견하면 BadFound := 1 이 된다.
+   - 또 다른 interrupt는 다음 기록 위치 BadBlkIdx를 증가시킨다.
+   - main은 BadFound를 보고 bad block table에 mark를 남길지 말지 결정한다.
+   - 핵심은 if에서 검사한 BadFound를 branch 내부에서도 다시 쓰고,
+     기록 위치 BadBlkIdx 역시 interrupt에 의해 바뀔 수 있다는 점이다.
+*)
+
+init {
+  BadFound := 0;
+  BadBlkIdx := 0;
+  ScanRound := 0;
+  BadTable := malloc(10, 0);
+
+  handler 0 {
+    (* media scan이 bad block 발견 *)
+    BadFound := 1
+  };
+  handler 1 {
+    (* scan 진행 중 다음 bad block slot으로 이동 *)
+    BadBlkIdx := BadBlkIdx + 1;
+    ScanRound := ScanRound + 1
+  }
+}
+
+main {
+  *BadTable[0] := BadFound;
+  *BadTable[1] := BadBlkIdx;
+
+  if BadFound = 0
+  then (
+    (* 아직 bad block이 발견되지 않았다고 판단 *)
+    *BadTable[2] := BadFound
+  )
+  else (
+    (* 발견되었다고 판단하여 현재 index에 mark *)
+    *BadTable[BadBlkIdx] := BadFound;
+    *BadTable[3] := BadBlkIdx
+  );
+
+  *BadTable[4] := ScanRound;
+  *BadTable[5] := BadFound
+}

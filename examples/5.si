@@ -1,0 +1,52 @@
+(* 
+   Example 5: Submission Queue doorbell 처리
+
+   의도:
+   - host가 새 command를 넣으면 interrupt handler 0이 SqTail을 증가시킨다.
+   - main은 SqHead = SqTail 이면 "queue empty"라고 판단하고,
+     아니면 command를 하나 fetch해서 SqHead를 증가시키고 FetchCount를 올린다.
+   - 핵심은 if 조건에서 검사한 SqTail이 branch 내부에서도 그대로 사용된다는 점이다.
+   - 따라서 interrupt가 SqTail을 바꾸면,
+     1. empty / non-empty 판단이 달라질 수 있고
+     2. 내부에서 기록하는 값도 달라질 수 있다.
+*)
+
+init {
+  SqHead := 0;
+  SqTail := 0;
+  FetchCount := 0;
+  Trace := malloc(8, 0);
+
+  handler 0 {
+    (* host가 doorbell을 울려 새 command가 들어옴 *)
+    SqTail := SqTail + 1
+  };
+  handler 1 {
+    (* debug interrupt: 현재 tail 값을 trace에 남김 *)
+    *Trace[7] := SqTail
+  }
+}
+
+main {
+  (* 현재 queue 상태를 먼저 기록 *)
+  *Trace[0] := SqHead;
+  *Trace[1] := SqTail;
+
+  if SqHead = SqTail
+  then (
+    (* queue가 비어 있다고 판단 *)
+    *Trace[2] := SqTail;
+    *Trace[3] := 0
+  )
+  else (
+    (* queue에 command가 있다고 판단 *)
+    *Trace[2] := SqTail;
+    SqHead := SqHead + 1;
+    FetchCount := FetchCount + 1;
+    *Trace[3] := FetchCount
+  );
+
+  *Trace[4] := SqHead;
+  *Trace[5] := SqTail;
+  *Trace[6] := FetchCount
+}

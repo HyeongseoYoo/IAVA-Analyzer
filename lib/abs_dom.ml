@@ -405,5 +405,5 @@ module ErrorSet = struct
 
   let string_of_t (es : t) : string =
     let elems = elements es |> List.map Error.to_string in
-    "{" ^ String.concat ", " elems ^ "}"
+    "{" ^ String.concat "\n" elems ^ "}"
 end

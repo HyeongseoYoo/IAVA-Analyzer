@@ -13,7 +13,7 @@ let var_tbl : VarTbl.t ref = ref VarTbl.empty
 let iset : IidSet.t ref = ref IidSet.empty
 let handlers : HandlerStore.t ref = ref HandlerStore.empty
 let size_tbl : Itv.t LblMap.t ref = ref LblMap.empty
-let widen_cnt = 10
+let widen_cnt = 3
 
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
@@ -400,19 +400,18 @@ let rec evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           let r3, c3 = self c1 e3 in
           join_out (r2, c2) (r3, c3)
     | While (_id, econd, ebody) ->
-        (* join-only widening fixpoint for while *)
         let rec iterate (i : int) (input : abs_conf) : abs_conf =
           let rcond, ccond = self input econd in
           let cond_itv = proj_int rcond.avalue in
-          if Itv.maybe_false cond_itv then input
+          if cond_itv = Itv.Bool.false_ then ccond
           else begin
             let _rbody, cbody = self ccond ebody in
-            let joined = join_conf input cbody in
+            let next = if cond_itv = Itv.Bool.top then join_conf ccond cbody else cbody in
             (* widen condition *)
-            let next =
-              if i < widen_cnt then joined else widen_conf input joined
+            let wconf =
+              if i < widen_cnt then next else widen_conf input next
             in
-            if leq_conf next input then input else iterate (i + 1) next
+            if leq_conf wconf input then input else iterate (i + 1) wconf
           end
         in
         let output = iterate 0 c in
@@ -451,7 +450,7 @@ and post_steps
     let joined = join_conf cur stepped in
     if leq_conf joined cur then cur
     else
-      let next = widen_conf cur joined in
+      let next = if i < widen_cnt then joined else widen_conf cur joined in
       if leq_conf next cur then cur else iterate (i + 1) next
   in
   iterate 0 c0

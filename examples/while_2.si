@@ -1,0 +1,39 @@
+(*
+   Target WHILE-3: GC migration 완료를 기다리는 loop
+
+   의도:
+   - 정상 handler 0은 VictimValid = 1 일 때만 GcDone := 1 로 바꾼다.
+   - fault handler 1이 VictimValid := 0 으로 만들면,
+     migration 완료 interrupt가 와도 GcDone이 1이 되지 않을 수 있다.
+   - main은 GcDone이 1이 되길 기다리며 루프를 돈다.
+   - GcDone은 조건과 loop body 내부 trace 양쪽에서 다시 사용된다.
+*)
+
+init {
+  VictimValid := 1;
+  GcDone := 0;
+  RetryCnt := 0;
+  GcTrace := malloc(10, 0);
+
+  handler 0 {
+    if VictimValid = 1
+    then GcDone := 1
+    else GcDone := 0
+  };
+  handler 1 {
+    (* media error로 victim block이 무효화됨 *)
+    VictimValid := 0
+  }
+}
+
+main {
+  while GcDone = 0 do (
+    *GcTrace[0] := GcDone;
+    RetryCnt := RetryCnt + 1;
+    *GcTrace[1] := RetryCnt
+  );
+
+  *GcTrace[2] := VictimValid;
+  *GcTrace[3] := GcDone;
+  *GcTrace[4] := RetryCnt
+}

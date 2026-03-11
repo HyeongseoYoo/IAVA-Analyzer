@@ -1,0 +1,45 @@
+(*
+   Example 9: Namespace 상태 기록
+
+   의도:
+   - admin path에서 namespace가 active/inactive 상태로 바뀔 수 있다.
+   - main은 NsState를 보고 namespace status table을 갱신한다.
+   - 여기서 NsState는 if 조건에도 쓰이고, branch 내부에서 기록값으로도 다시 쓰인다.
+   - NsId도 interrupt에 의해 바뀔 수 있어서, 어느 slot에 기록할지도 달라질 수 있다.
+*)
+
+init {
+  ACTIVE := 1;
+  INACTIVE := 0;
+  NsState := ACTIVE;
+  NsId := 0;
+  NsTrace := malloc(10, 0);
+
+  handler 0 {
+    (* admin command가 namespace 비활성화 *)
+    NsState := INACTIVE
+  };
+  handler 1 {
+    (* 다른 namespace를 선택 *)
+    NsId := NsId + 1
+  }
+}
+
+main {
+  *NsTrace[0] := NsState;
+  *NsTrace[1] := NsId;
+
+  if NsState = ACTIVE
+  then (
+    (* active namespace라고 보고 active mark 기록 *)
+    *NsTrace[NsId] := NsState;
+    *NsTrace[8] := NsState
+  )
+  else (
+    (* inactive namespace라고 보고 상태 기록 *)
+    *NsTrace[NsId] := NsState;
+    *NsTrace[8] := NsState
+  );
+
+  *NsTrace[9] := NsId
+}

@@ -1,0 +1,50 @@
+(*
+   Example 6: Completion Queue 소비
+
+   의도:
+   - device가 completion을 올리면 handler 0이 CqTail을 증가시킨다.
+   - main은 CqHead = CqTail 이면 처리할 completion이 없다고 보고,
+     아니면 CqHead 위치의 completion을 소비했다고 가정하고 head를 증가시킨다.
+   - if에서 검사한 CqTail이 branch 내부에서도 그대로 기록된다.
+   - 따라서 interrupt가 CqTail을 바꾸면 분기와 내부 로직 모두 바뀐다.
+*)
+
+init {
+  CqHead := 0;
+  CqTail := 0;
+  DoneCount := 0;
+  CqTrace := malloc(8, 0);
+
+  handler 0 {
+    (* completion 하나 도착 *)
+    CqTail := CqTail + 1
+  };
+  handler 1 {
+    (* debug interrupt *)
+    *CqTrace[7] := CqTail
+  }
+}
+
+main {
+  *CqTrace[0] := CqHead;
+  *CqTrace[1] := CqTail;
+
+  if CqHead = CqTail
+  then (
+    (* completion이 없다고 판단 *)
+    *CqTrace[2] := CqTail;
+    *CqTrace[3] := 0
+  )
+  else (
+    (* completion이 있다고 판단 *)
+    *CqTrace[2] := CqTail;
+    *CqTrace[CqHead] := 1;
+    CqHead := CqHead + 1;
+    DoneCount := DoneCount + 1;
+    *CqTrace[3] := DoneCount
+  );
+
+  *CqTrace[4] := CqHead;
+  *CqTrace[5] := CqTail;
+  *CqTrace[6] := DoneCount
+}

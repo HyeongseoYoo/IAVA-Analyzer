@@ -1,0 +1,46 @@
+(*
+   Example 8: Garbage Collection / Wear-Leveling 시작 여부 판단
+
+   의도:
+   - NeedGc = 1 이면 victim block을 골라 migration을 시작해야 한다.
+   - handler 0은 GC 필요 상태를 켜고,
+     handler 1은 victim 후보 block 번호를 바꾼다.
+   - main은 NeedGc를 검사하고, branch 내부에서도 NeedGc와 VictimBlk를 다시 사용한다.
+   - 따라서 interrupt로 인해 "GC가 필요한지"와 "어느 block을 victim으로 볼지"가 모두 달라질 수 있다.
+*)
+
+init {
+  NeedGc := 0;
+  VictimBlk := 0;
+  MoveIssued := 0;
+  GcTrace := malloc(10, 0);
+
+  handler 0 {
+    (* background monitor가 GC 필요 신호를 올림 *)
+    NeedGc := 1
+  };
+  handler 1 {
+    (* victim 후보 변경 *)
+    VictimBlk := VictimBlk + 1
+  }
+}
+
+main {
+  *GcTrace[0] := NeedGc;
+  *GcTrace[1] := VictimBlk;
+
+  if NeedGc = 0
+  then (
+    (* 아직 GC가 필요 없다고 판단 *)
+    *GcTrace[2] := NeedGc
+  )
+  else (
+    (* GC가 필요하다고 판단 *)
+    *GcTrace[VictimBlk] := NeedGc;
+    MoveIssued := VictimBlk + 1;
+    *GcTrace[2] := NeedGc;
+    *GcTrace[3] := VictimBlk
+  );
+
+  *GcTrace[4] := MoveIssued
+}
