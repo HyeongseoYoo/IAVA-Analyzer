@@ -135,7 +135,7 @@ exp:
     | mkexp(IF; c = exp; THEN; t = exp; ELSE; f = exp { Exp.If (c, t, f) })
       { $1 }
 
-    | mkexp(WHILE; c = exp; DO; body = exp { Exp.While (Exp.Lbl.Init 0, c ,body) })
+    | mkexp(WHILE; c = exp; DO; LPAREN; body = exp  ; RPAREN { Exp.While (Exp.Lbl.Init 0, c ,body) })
       { $1 }
 
     (* let-binding *)

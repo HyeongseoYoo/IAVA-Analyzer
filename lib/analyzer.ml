@@ -3,7 +3,7 @@ open Domain
 open Abs_dom
 
 type conf = { env : Env.t; mem : Mem.t; imode : Interrupt.t }
-type abs_conf = { amem : Abs_Mem.t; aimode : Interrupt.t; errs : ErrorSet.t }
+type abs_conf = { asem : Abs_Sem.t; amem : Abs_Mem.t; aimode : Interrupt.t; errs : ErrorSet.t }
 type result = { value : Value.t; pp : ProgramPoint.t; out : Outcome.t }
 type abs_res = { avalue : Abs_Val.t; app : PPSet.t }
 
@@ -144,6 +144,7 @@ let join_res r1 r2 =
 
 let join_conf c1 c2 =
   {
+    asem = Abs_Sem.join c1.asem c2.asem;
     amem = Abs_Mem.join c1.amem c2.amem;
     aimode = Interrupt.join c1.aimode c2.aimode;
     errs = ErrorSet.union c1.errs c2.errs;
@@ -153,12 +154,15 @@ let join_out (r1, c1) (r2, c2) = (join_res r1 r2, join_conf c1 c2)
 
 let widen_conf c1 c2 =
   {
+    asem = Abs_Sem.widen c1.asem c2.asem;
     amem = Abs_Mem.widen c1.amem c2.amem;
     aimode = Interrupt.join c1.aimode c2.aimode;
     errs = ErrorSet.union c1.errs c2.errs;
   }
 
 let leq_conf c1 c2 =
+  Abs_Sem.leq c1.asem c2.asem
+  &&
   Abs_Mem.leq c1.amem c2.amem
   &&
   match (c1.aimode, c2.aimode) with
@@ -166,6 +170,9 @@ let leq_conf c1 c2 =
   | Interrupt.Disabled, Interrupt.Disabled -> true
   | Interrupt.Enabled, Interrupt.Enabled -> true
   | Interrupt.Enabled, Interrupt.Disabled -> false
+
+let record_sem (pp : ProgramPoint.t) (c : abs_conf) : abs_conf =
+  { c with asem = Abs_Sem.weak_write c.asem pp c.amem }
 
 let abs_unit () : Abs_Val.t = (Itv.bot, Abs_Unit.Unit, Abs_Loc.bot)
 let abs_int (itv : Itv.t) : Abs_Val.t = (itv, Abs_Unit.bot, Abs_Loc.bot)
@@ -263,7 +270,39 @@ let add_deref_oob_errors ~(at : ProgramPoint.t) ~(access : Error.access)
         in
         { c with errs = ErrorSet.add err c.errs }
 
-let rec evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
+let post_step
+    (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
+    (c : abs_conf) : abs_conf =
+  let input_c = c in
+  let joined =
+    IidSet.fold
+      (fun iid acc ->
+        match HandlerStore.lookup !handlers iid with
+        | None -> acc
+        | Some handler_exp ->
+            let _r, c' =
+              self { input_c with aimode = Interrupt.Disabled } handler_exp
+            in
+            join_conf acc c')
+      !iset input_c
+  in
+  { joined with aimode = c.aimode }
+(* imode should not change in post step *)
+
+let post_steps
+    (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
+    (c0 : abs_conf) : abs_conf =
+  let rec iterate (i : int) (cur : abs_conf) : abs_conf =
+    let stepped = post_step self cur in
+    let joined = join_conf cur stepped in
+    if leq_conf joined cur then cur
+    else
+      let next = if i < widen_cnt then joined else widen_conf cur joined in
+      if leq_conf next cur then cur else iterate (i + 1) next
+  in
+  iterate 0 c0
+
+let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf
     =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
@@ -309,7 +348,6 @@ let rec evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let r2, c2 = self c1 e2 in
         let base_loc = proj_loc r1.avalue in
         let offset_itv = proj_int r2.avalue in
-
         let shifted_loc = Abs_Loc.offset_add base_loc offset_itv in
         let full_base_loc, safe_itv, left_oob, right_oob =
           match base_loc with
@@ -389,6 +427,7 @@ let rec evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     | If (e1, e2, e3) ->
         let r1, c1 = self c e1 in
         let v1 = proj_int r1.avalue in
+        print_endline ("[If Condition] " ^ Itv.string_of_t v1);
         if v1 = Itv.Bool.true_ then
           let r2, c2 = self c1 e2 in
           (r2, c2)
@@ -417,43 +456,14 @@ let rec evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let output = iterate 0 c in
         ({ avalue = abs_unit (); app = PPSet.empty }, output)
   in
-  match c_after_eval.aimode with
-  | Disabled -> (res, c_after_eval)
+  match c.aimode with (* Check imode of input config *)
+  | Disabled -> 
+      let c_recorded = record_sem pp c_after_eval in
+      (res, c_recorded)
   | Enabled ->
       let c_after_post = post_steps self c_after_eval in
-      (res, c_after_post)
-
-and post_step
-    (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
-    (c : abs_conf) : abs_conf =
-  let input_c = c in
-  let joined =
-    IidSet.fold
-      (fun iid acc ->
-        match HandlerStore.lookup !handlers iid with
-        | None -> acc
-        | Some handler_exp ->
-            let _r, c' =
-              self { input_c with aimode = Interrupt.Disabled } handler_exp
-            in
-            join_conf acc c')
-      !iset input_c
-  in
-  { joined with aimode = c.aimode }
-(* imode should not change in post step *)
-
-and post_steps
-    (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
-    (c0 : abs_conf) : abs_conf =
-  let rec iterate (i : int) (cur : abs_conf) : abs_conf =
-    let stepped = post_step self cur in
-    let joined = join_conf cur stepped in
-    if leq_conf joined cur then cur
-    else
-      let next = if i < widen_cnt then joined else widen_conf cur joined in
-      if leq_conf next cur then cur else iterate (i + 1) next
-  in
-  iterate 0 c0
+      let c_recorded = record_sem pp c_after_post in
+      (res, c_recorded)
 
 let rec evalA ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
     abs_res * abs_conf =
@@ -485,7 +495,7 @@ let def_intp (pgm : Program.t) : Mem.t =
 
 let init_confa (pgm : Program.t) : abs_conf =
   let c0 =
-    { amem = Abs_Mem.bot; aimode = Interrupt.Disabled; errs = ErrorSet.empty }
+    { asem = Abs_Sem.bot; amem = Abs_Mem.bot; aimode = Interrupt.Disabled; errs = ErrorSet.empty }
   in
   let _, c_globals = evalA c0 pgm.global in
   let hs', iset' =
@@ -499,16 +509,23 @@ let init_confa (pgm : Program.t) : abs_conf =
   in
   iset := iset';
   handlers := hs';
-  { amem = c_globals.amem; aimode = Interrupt.Enabled; errs = c_globals.errs }
+  { asem = c_globals.asem; amem = c_globals.amem; aimode = Interrupt.Enabled; errs = c_globals.errs }
 
-let abs_def_intp (pgm : Program.t) : Abs_Mem.t =
+
+let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
+  Abs_Sem.fold
+    (fun pp mem acc ->
+      match pp with
+      | ProgramPoint.Label (Exp.Lbl.Main _) | ProgramPoint.Label (Exp.Lbl.Init 1) -> Abs_Sem.write acc pp mem
+      | _ -> acc)
+    asem
+    Abs_Sem.bot
+
+let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let c_init = init_confa pgm in
-  (* TODO : Block interrupt control whithin the handler *)
-  print_endline "=== Initial Abstract Memory ===";
-  print_endline (Abs_Mem.string_of_t c_init.amem);
   print_endline "=== analyzing... ===";
   let _, c_final = evalA c_init pgm.main in
   print_endline "=== Error Messages ===";
   print_endline (ErrorSet.string_of_t c_final.errs);
   print_endline "=== Final Abstract Memory ===";
-  c_final.amem
+  filter_main_sem c_final.asem

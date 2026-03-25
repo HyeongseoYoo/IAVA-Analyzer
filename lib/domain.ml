@@ -48,7 +48,7 @@ module Loc = struct
   let alloc lbl n = HeapLoc { lbl; offset = n }
 
   let string_of_t = function
-    | VarLoc { id; offset } -> Printf.sprintf "%s+%d" id offset
+    | VarLoc { id; _ } -> Printf.sprintf "%s" id
     | HeapLoc { lbl; offset } ->
         Printf.sprintf "%s+%d" (Exp.Lbl.string_of_t lbl) offset
 end

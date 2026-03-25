@@ -22,10 +22,10 @@ module Exp = struct
       | Handler (id, n) -> Handler (id, n + 1)
 
     let string_of_t = function
-      | Init n -> "[Init]" ^ string_of_int n
-      | Main n -> "[Main]" ^ string_of_int n
+      | Init n -> "[I" ^ string_of_int n ^ "]"
+      | Main n -> "[M" ^ string_of_int n ^ "]"
       | Handler (iid, n) ->
-          "[Handler " ^ string_of_int iid ^ "]" ^ string_of_int n
+          "[H" ^ string_of_int iid ^ "-" ^ string_of_int n ^ "]"
   end
 
   type bop = Eq | Plus

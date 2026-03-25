@@ -1,0 +1,145 @@
+==== TABULATE: global ====
+[L][I1] -> [I2]: ([I3]: (CmdStatus) := [I4]: (1));
+[I5]: ([I6]: ([I7]: (CmdDone) := [I8]: (0));
+[I9]: ([I10]: (WaitCnt) := [I11]: (0)))
+[L][I2] -> [I3]: (CmdStatus) := [I4]: (1)
+[L][I3] -> CmdStatus
+[L][I4] -> 1
+[L][I5] -> [I6]: ([I7]: (CmdDone) := [I8]: (0));
+[I9]: ([I10]: (WaitCnt) := [I11]: (0))
+[L][I6] -> [I7]: (CmdDone) := [I8]: (0)
+[L][I7] -> CmdDone
+[L][I8] -> 0
+[L][I9] -> [I10]: (WaitCnt) := [I11]: (0)
+[L][I10] -> WaitCnt
+[L][I11] -> 0
+
+==== TABULATE: handler 0 ====
+[L][H0-1] -> if [H0-2]: (([H0-3]: (CmdStatus) = [H0-4]: (1)))
+then [H0-5]: ([H0-6]: (CmdDone) := [H0-7]: (1))
+else [H0-8]: (unit)
+[L][H0-2] -> ([H0-3]: (CmdStatus) = [H0-4]: (1))
+[L][H0-3] -> CmdStatus
+[L][H0-4] -> 1
+[L][H0-5] -> [H0-6]: (CmdDone) := [H0-7]: (1)
+[L][H0-6] -> CmdDone
+[L][H0-7] -> 1
+[L][H0-8] -> unit
+
+==== TABULATE: handler 1 ====
+[L][H1-1] -> [H1-2]: (CmdStatus) := [H1-3]: (0)
+[L][H1-2] -> CmdStatus
+[L][H1-3] -> 0
+
+==== TABULATE: main ====
+[L][M1] -> while [M2]: (([M3]: (CmdDone) = [M4]: (0)))
+do [M5]: ([M6]: (WaitCnt) := [M7]: (([M8]: (WaitCnt) + [M9]: (1))))
+[L][M2] -> ([M3]: (CmdDone) = [M4]: (0))
+[L][M3] -> CmdDone
+[L][M4] -> 0
+[L][M5] -> [M6]: (WaitCnt) := [M7]: (([M8]: (WaitCnt) + [M9]: (1)))
+[L][M6] -> WaitCnt
+[L][M7] -> ([M8]: (WaitCnt) + [M9]: (1))
+[L][M8] -> WaitCnt
+[L][M9] -> 1
+[G][M10] -> while [M2]: (([M3]: (CmdDone) = [M4]: (0)))
+do [M5]: ([M6]: (WaitCnt) := [M7]: (([M8]: (WaitCnt) + [M9]: (1))))
+
+=== analyzing... ===
+[If Condition] [1,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+[If Condition] [0,1]
+=== Final Abstract Memory ===
+{[I1] -> 
+CmdDone ↦ <<[0,0], ⊥, ⊥>, {[I6]}>
+CmdStatus ↦ <<[1,1], ⊥, ⊥>, {[I2]}>
+WaitCnt ↦ <<[0,0], ⊥, ⊥>, {[I9]}>
+
+[M1] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[1,∞], ⊥, ⊥>, {[M5]}>
+
+[M2] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>
+
+[M3] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>
+
+[M4] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>
+
+[M5] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[1,∞], ⊥, ⊥>, {[M5]}>
+
+[M6] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>
+
+[M7] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>
+
+[M8] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>
+
+[M9] -> 
+CmdDone ↦ <<[0,1], ⊥, ⊥>, {[I6], [H0-5]}>
+CmdStatus ↦ <<[0,1], ⊥, ⊥>, {[I2], [H1-1]}>
+WaitCnt ↦ <<[0,∞], ⊥, ⊥>, {[I9], [M5]}>}

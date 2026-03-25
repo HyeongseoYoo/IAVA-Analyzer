@@ -10,38 +10,21 @@
 *)
 
 init {
-  CmdArmed := 1;
+  CmdStatus := 1;
   CmdDone := 0;
   WaitCnt := 0;
-  Trace := malloc(10, 0);
 
   handler 0 {
-    if CmdArmed = 1
+    if CmdStatus = 1
     then CmdDone := 1
-    else CmdDone := 0
+    else unit
   };
   handler 1 {
-    (* fault interrupt: command armed 상태가 깨짐 *)
-    CmdArmed := 0
+    CmdStatus := 0
   }
 }
-
 main {
-  x := 1;
-
-  (*
-  HW 작업이 끝나고 그에 따른 Interrupt 0 에 의해 CmdDone이 1로 바뀔 것을 기다리는 동작 중인데,
-  HW가 껐다 켜져버리면서 모든게 사라지고 이 상황에서 Interrupt 1이 발생하여 상태를 초기화 함
-  HW가 리부트 됐기 때문에 동작 종료 신호인 Interrupt 0이 오지 않는 상황이 발생하여 무한루프에 빠질 수 있음
-  -> 여기서 interrupt 에 의해 무한루프가 발생할 수 있음을 어떻게 detect 할 것인지?
-  *)
-  while CmdDone = 0 do (
-    *Trace[0] := CmdDone;
-    WaitCnt := WaitCnt + 1;
-    *Trace[1] := WaitCnt
-  );
-
-  *Trace[2] := CmdDone;
-  *Trace[3] := CmdArmed;
-  *Trace[4] := WaitCnt
+    while CmdDone = 0 do (
+    WaitCnt := WaitCnt + 1
+  )
 }
