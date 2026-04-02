@@ -16,12 +16,21 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_executable(cpp_frontend
   src/main.cpp
-  src/DumpAction.cpp
-  src/DumpVisitor.cpp
-  src/TranslatorAction.cpp
-  src/TranslatorConsumer.cpp
-  src/Translator.cpp
+
+  src/dump/DumpAction.cpp
+  src/dump/DumpVisitor.cpp
+
+  src/translator/TranslatorAction.cpp
+  src/translator/TranslatorConsumer.cpp
+  src/translator/Translator.cpp
+
+  src/ir/IRPrinter.cpp
+
+  src/lowering/AstToIr.cpp
+  src/lowering/Lowering.cpp
 )
+
+target_include_directories(cpp_frontend PRIVATE src)
 
 target_link_libraries(cpp_frontend
   PRIVATE

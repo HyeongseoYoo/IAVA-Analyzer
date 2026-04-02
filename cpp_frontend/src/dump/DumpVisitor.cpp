@@ -1,4 +1,4 @@
-#include "DumpVisitor.h"
+#include "dump/DumpVisitor.h"
 
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"

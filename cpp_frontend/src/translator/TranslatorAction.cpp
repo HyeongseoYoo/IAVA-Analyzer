@@ -1,8 +1,8 @@
-#include "TranslatorAction.h"
+#include "translator/TranslatorAction.h"
 
 #include <memory>
 
-#include "TranslatorConsumer.h"
+#include "translator/TranslatorConsumer.h"
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/Frontend/CompilerInstance.h"

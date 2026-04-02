@@ -1,6 +1,6 @@
-#include "DumpAction.h"
+#include "dump/DumpAction.h"
 
-#include "DumpVisitor.h"
+#include "dump/DumpVisitor.h"
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/Frontend/CompilerInstance.h"

@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "IR.h"
+#include "ir/IR.h"
 
 namespace clang {
 class ASTContext;

@@ -1,6 +1,7 @@
-#include "TranslatorConsumer.h"
+#include "translator/TranslatorConsumer.h"
 
-#include "Translator.h"
+#include "ir/IRPrinter.h"
+#include "translator/Translator.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
@@ -14,8 +15,5 @@ void TranslatorConsumer::HandleTranslationUnit(clang::ASTContext &Context) {
   Translator translator(Context);
   ir::Program program = translator.translateTranslationUnit(TU);
 
-  llvm::outs() << "[IR summary] "
-               << "globals=" << program.globals.size()
-               << ", enums=" << program.enums.size()
-               << ", functions=" << program.functions.size() << "\n";
+  ir::IRPrinter::print(program);
 }

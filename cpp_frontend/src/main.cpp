@@ -1,7 +1,7 @@
 #include <memory>
 
-#include "DumpAction.h"
-#include "TranslatorAction.h"
+#include "dump/DumpAction.h"
+#include "translator/TranslatorAction.h"
 
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"

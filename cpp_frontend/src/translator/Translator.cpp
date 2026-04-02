@@ -1,5 +1,5 @@
-#include "Translator.h"
-#include "IR.h"
+#include "translator/Translator.h"
+#include "ir/IR.h"
 
 #include <string>
 
@@ -8,6 +8,8 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/Support/Casting.h"
+
+#include "lowering/AstToIr.h"
 
 Translator::Translator(clang::ASTContext &Context) : Context(Context) {}
 
@@ -67,6 +69,12 @@ ir::Function Translator::translateFunctionDecl(clang::FunctionDecl *FD) {
     param.type = Param->getType().getAsString();
     function.params.push_back(param);
   }
+
+  if (FD->hasBody()) { // body 추가하는 부분부터 다시 봐야함
+    AstToIr lowering(Context);
+    function.body = lowering.translateStmt(FD->getBody());
+  }
+
   return function;
 }
 
