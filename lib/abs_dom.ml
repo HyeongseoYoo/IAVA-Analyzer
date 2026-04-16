@@ -99,7 +99,7 @@ module Abs_Loc = struct
   let string_of_t = function
     | Bot -> "⊥"
     | Top -> "⊤"
-    | AVarLoc { id; offset } -> Printf.sprintf "%s" id
+    | AVarLoc { id; offset = _ } -> Printf.sprintf "%s" id
     | AHeapLoc { lbl; offset } ->
         Printf.sprintf "%s+%s" (Exp.Lbl.string_of_t lbl)
           (Itv.string_of_t offset)
@@ -266,7 +266,7 @@ module Abs_Mem = struct
 
   let write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
     match l with
-    | Abs_Loc.AVarLoc { id; offset } -> LocMap.add l (v, PPSet.singleton pp) m
+    | Abs_Loc.AVarLoc { id = _; offset = _ } -> LocMap.add l (v, PPSet.singleton pp) m
     | _ ->
         let old_v, old_pps = find m l in
         let new_v = Abs_Val.join old_v v in

@@ -18,7 +18,7 @@ let widen_cnt = 3
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
   let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
-  let ({ env; mem; imode } : conf) = c in
+  let ({ env = _; mem; imode = _ } : conf) = c in
   (* TODO: Done -> Non-Deterministic *)
   let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in
   (* TEST CODE *)
@@ -90,11 +90,55 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
             if Value.compare r1.value r2.value = 0 then
               ({ r with value = Value.Int 1 }, c2)
             else ({ r with value = Value.Int 0 }, c2)
+        | Lt -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (if i1 < i2 then 1 else 0) }, c2)
+            | _ -> failwith "Undefined operation")
+        | Gt -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (if i1 > i2 then 1 else 0) }, c2)
+            | _ -> failwith "Undefined operation")
+        | Ne ->
+            if Value.compare r1.value r2.value <> 0 then
+              ({ r with value = Value.Int 1 }, c2)
+            else ({ r with value = Value.Int 0 }, c2)
+        | Le -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (if i1 <= i2 then 1 else 0) }, c2)
+            | _ -> failwith "Undefined operation")
+        | Ge -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (if i1 >= i2 then 1 else 0) }, c2)
+            | _ -> failwith "Undefined operation")
         | Plus -> (
             match (r1.value, r2.value) with
             | Value.Int i1, Value.Int i2 ->
                 let res = i1 + i2 in
                 ({ r with value = Value.Int res }, c2)
+            | _ -> failwith "Undefined operation")
+        | Minus -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (i1 - i2) }, c2)
+            | _ -> failwith "Undefined operation")
+        | Times -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (i1 * i2) }, c2)
+            | _ -> failwith "Undefined operation")
+        | And -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (if i1 <> 0 && i2 <> 0 then 1 else 0) }, c2)
+            | _ -> failwith "Undefined operation")
+        | Or -> (
+            match (r1.value, r2.value) with
+            | Value.Int i1, Value.Int i2 ->
+                ({ r with value = Value.Int (if i1 <> 0 || i2 <> 0 then 1 else 0) }, c2)
             | _ -> failwith "Undefined operation"))
     | Assign (e1, e2) ->
         let r1, c1 = eval c e1 ~lvalue:true in
@@ -133,7 +177,7 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
           ({ exp_r with out = Outcome.Done }, exp_c)
           (* No handler, treat as Done *)
       | Some exp ->
-          let hdl_r, hdl_c =
+          let _hdl_r, hdl_c =
             eval { exp_c with imode = Interrupt.Disabled } exp
           in
           ({ exp_r with out = Outcome.Done }, { exp_c with mem = hdl_c.mem }))
@@ -410,11 +454,48 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
                 app = PPSet.empty;
               },
               c2 )
+        | Lt ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.lt v1 v2); app = PPSet.empty }, c2)
+        | Gt ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.gt v1 v2); app = PPSet.empty }, c2)
+        | Ne ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.ne v1 v2); app = PPSet.empty }, c2)
+        | Le ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.le v1 v2); app = PPSet.empty }, c2)
+        | Ge ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.ge v1 v2); app = PPSet.empty }, c2)
         | Plus ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
             let res = Itv.add v1 v2 in
-            ({ avalue = abs_int res; app = PPSet.union r1.app r2.app }, c2))
+            ({ avalue = abs_int res; app = PPSet.union r1.app r2.app }, c2)
+        | Minus ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            let res = Itv.add v1 (Itv.neg v2) in
+            ({ avalue = abs_int res; app = PPSet.union r1.app r2.app }, c2)
+        | Times ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.mul v1 v2); app = PPSet.union r1.app r2.app }, c2)
+        | And ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.and_ v1 v2); app = PPSet.empty }, c2)
+        | Or ->
+            let v1 = proj_int r1.avalue in
+            let v2 = proj_int r2.avalue in
+            ({ avalue = abs_int (Itv.or_ v1 v2); app = PPSet.empty }, c2))
     | Assign (e1, e2) ->
         let r1, c1 = self ~lvalue:true c e1 in
         let r2, c2 = self c1 e2 in

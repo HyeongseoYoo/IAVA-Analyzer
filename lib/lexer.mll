@@ -55,6 +55,8 @@ rule read =
   | '*'       { STAR }
   | ":="      { COLONEQ }
   | "&"       { AMP }
+  | "||"      { OR }
+  | "&&"      { AND }
   | '('       { LPAREN }
   | ')'       { RPAREN }
   | '{'       { LBRACE }

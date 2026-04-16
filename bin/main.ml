@@ -36,7 +36,6 @@ let main () =
   if !opt_pp then string_of_t pgm |> print_endline;
   if !opt_tab then (
     let open Syntax in
-    let open Exp in
     let print_tbl (title : string) (tbl : Exp.t Exp.Lbl_map.t) : unit =
       Printf.printf "==== %s ====\n" title;
       tbl |> Exp.Lbl_map.bindings

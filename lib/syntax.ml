@@ -28,7 +28,7 @@ module Exp = struct
           "[H" ^ string_of_int iid ^ "-" ^ string_of_int n ^ "]"
   end
 
-  type bop = Eq | Plus
+  type bop = Eq | Lt | Gt | Ne | Le | Ge | Plus | Minus | Times | And | Or
 
   type lbl_t = { lbl : Lbl.t; exp : t }
   and lbl = (Lbl.t, Lbl.t) Either.t
@@ -123,12 +123,23 @@ module Exp = struct
     in
     fst (relabel' lt le)
 
-  let string_of_bop : bop -> string = function Plus -> "+" | Eq -> "="
+  let string_of_bop : bop -> string = function
+    | Eq -> "="
+    | Lt -> "<"
+    | Gt -> ">"
+    | Ne -> "<>"
+    | Le -> "<="
+    | Ge -> ">="
+    | Plus -> "+"
+    | Minus -> "-"
+    | Times -> "*"
+    | And -> "&&"
+    | Or -> "||"
 
   let rec string_of_lbl_t ({ lbl; exp } : lbl_t) =
     Printf.sprintf "%s: (%s)" (Lbl.string_of_t lbl) (string_of_t exp)
 
-  and string_of_t ?(lvl : int = 0) : t -> string = function
+  and string_of_t : t -> string = function
     | Unit -> "unit"
     | Int n -> string_of_int n
     | Var x -> x

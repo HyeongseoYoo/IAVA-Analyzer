@@ -1,6 +1,5 @@
 %{
 open Syntax
-open Exp
 %}
 
 (* ===== tokens ===== *)
@@ -22,6 +21,7 @@ open Exp
 %token SEMI
 %token COLONEQ
 %token AMP
+%token OR AND
 %token EQ LT GT NE LE GE
 %token MINUS PLUS STAR
 
@@ -31,9 +31,11 @@ open Exp
 
 %right SEMI
 %right COLONEQ
+%left OR
+%left AND
 %left EQ LT GT NE LE GE
 %left PLUS MINUS
-%nonassoc STAR
+%left STAR
 
 (* ===== start symbol ===== *)
 
@@ -111,10 +113,28 @@ exp:
     | mkexp(DISABLE { Exp.Disable })
       { $1 }
 
-    (* binary operators: Eq / Plus *)
+    (* binary operators *)
     | mkexp(e1 = exp; EQ;   e2 = exp { Exp.Bop (Exp.Eq,   e1, e2) })
       { $1 }
+    | mkexp(e1 = exp; LT;   e2 = exp { Exp.Bop (Exp.Lt,   e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; GT;   e2 = exp { Exp.Bop (Exp.Gt,   e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; NE;   e2 = exp { Exp.Bop (Exp.Ne,   e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; LE;   e2 = exp { Exp.Bop (Exp.Le,   e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; GE;   e2 = exp { Exp.Bop (Exp.Ge,   e1, e2) })
+      { $1 }
     | mkexp(e1 = exp; PLUS; e2 = exp { Exp.Bop (Exp.Plus, e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; MINUS; e2 = exp { Exp.Bop (Exp.Minus, e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; STAR; e2 = exp { Exp.Bop (Exp.Times, e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; AND; e2 = exp { Exp.Bop (Exp.And, e1, e2) })
+      { $1 }
+    | mkexp(e1 = exp; OR; e2 = exp { Exp.Bop (Exp.Or, e1, e2) })
       { $1 }
 
     (* heap *)
