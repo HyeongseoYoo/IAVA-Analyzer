@@ -12,6 +12,7 @@ init {
 }
 
 main {
+  enable;
   if CurrentUser = INVALID
   then CurrentUser := INIT
   else *Status[CurrentUser] := 1

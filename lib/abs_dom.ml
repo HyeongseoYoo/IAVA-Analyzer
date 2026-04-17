@@ -266,7 +266,8 @@ module Abs_Mem = struct
 
   let write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
     match l with
-    | Abs_Loc.AVarLoc { id = _; offset = _ } -> LocMap.add l (v, PPSet.singleton pp) m
+    | Abs_Loc.AVarLoc { id = _; offset = _ } ->
+        LocMap.add l (v, PPSet.singleton pp) m
     | _ ->
         let old_v, old_pps = find m l in
         let new_v = Abs_Val.join old_v v in
@@ -396,16 +397,18 @@ end
 
 module Abs_Sem = struct
   type t = Abs_Mem.t PPMap.t
-  
-  let bot = PPMap.empty
 
+  let bot = PPMap.empty
   let compare (s1 : t) (s2 : t) : int = PPMap.compare Abs_Mem.compare s1 s2
+
   let join (s1 : t) (s2 : t) : t =
     let f _key m1 m2 = Some (Abs_Mem.join m1 m2) in
     PPMap.union f s1 s2
-  let widen (s1 : t) (s2 : t) : t = 
+
+  let widen (s1 : t) (s2 : t) : t =
     let f _key m1 m2 = Some (Abs_Mem.widen m1 m2) in
     PPMap.union f s1 s2
+
   let leq (s1 : t) (s2 : t) : bool =
     PPMap.for_all
       (fun pp m1 ->
@@ -413,13 +416,16 @@ module Abs_Sem = struct
         | None -> Abs_Mem.leq m1 Abs_Mem.bot
         | Some m2 -> Abs_Mem.leq m1 m2)
       s1
+
   let find (s : t) (pp : ProgramPoint.t) : Abs_Mem.t =
     match PPMap.find_opt pp s with Some m -> m | None -> Abs_Mem.bot
+
   let fold (f : ProgramPoint.t -> Abs_Mem.t -> 'a -> 'a) (s : t) (init : 'a) :
       'a =
     PPMap.fold f s init
 
   let write (s : t) (pp : ProgramPoint.t) (m : Abs_Mem.t) : t = PPMap.add pp m s
+
   (* pp 위치의 기존 memory와 join해서 누적 저장 *)
   let weak_write (s : t) (pp : ProgramPoint.t) (m : Abs_Mem.t) : t =
     let old_m = find s pp in
@@ -439,8 +445,10 @@ module Abs_Sem = struct
           (s, m_s) :: acc)
         s []
     in
-    "{" ^ String.concat "\n\n" (List.map (fun (pp_s, m_s) -> pp_s ^ " -> \n" ^ m_s) (List.rev elems)) ^ "}"
-
+    "{"
+    ^ String.concat "\n\n"
+        (List.map (fun (pp_s, m_s) -> pp_s ^ " -> \n" ^ m_s) (List.rev elems))
+    ^ "}"
 end
 
 module ErrorSet = struct

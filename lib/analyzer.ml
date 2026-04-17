@@ -3,7 +3,14 @@ open Domain
 open Abs_dom
 
 type conf = { env : Env.t; mem : Mem.t; imode : Interrupt.t }
-type abs_conf = { asem : Abs_Sem.t; amem : Abs_Mem.t; aimode : Interrupt.t; errs : ErrorSet.t }
+
+type abs_conf = {
+  asem : Abs_Sem.t;
+  amem : Abs_Mem.t;
+  aimode : Interrupt.t;
+  errs : ErrorSet.t;
+}
+
 type result = { value : Value.t; pp : ProgramPoint.t; out : Outcome.t }
 type abs_res = { avalue : Abs_Val.t; app : PPSet.t }
 
@@ -133,12 +140,20 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
         | And -> (
             match (r1.value, r2.value) with
             | Value.Int i1, Value.Int i2 ->
-                ({ r with value = Value.Int (if i1 <> 0 && i2 <> 0 then 1 else 0) }, c2)
+                ( {
+                    r with
+                    value = Value.Int (if i1 <> 0 && i2 <> 0 then 1 else 0);
+                  },
+                  c2 )
             | _ -> failwith "Undefined operation")
         | Or -> (
             match (r1.value, r2.value) with
             | Value.Int i1, Value.Int i2 ->
-                ({ r with value = Value.Int (if i1 <> 0 || i2 <> 0 then 1 else 0) }, c2)
+                ( {
+                    r with
+                    value = Value.Int (if i1 <> 0 || i2 <> 0 then 1 else 0);
+                  },
+                  c2 )
             | _ -> failwith "Undefined operation"))
     | Assign (e1, e2) ->
         let r1, c1 = eval c e1 ~lvalue:true in
@@ -206,8 +221,7 @@ let widen_conf c1 c2 =
 
 let leq_conf c1 c2 =
   Abs_Sem.leq c1.asem c2.asem
-  &&
-  Abs_Mem.leq c1.amem c2.amem
+  && Abs_Mem.leq c1.amem c2.amem
   &&
   match (c1.aimode, c2.aimode) with
   | Interrupt.Disabled, Interrupt.Enabled -> true
@@ -217,6 +231,113 @@ let leq_conf c1 c2 =
 
 let record_sem (pp : ProgramPoint.t) (c : abs_conf) : abs_conf =
   { c with asem = Abs_Sem.weak_write c.asem pp c.amem }
+
+(* Narrow v1 assuming (v1 bop v2) is true *)
+let narrow_left (bop : Exp.bop) (v1 : Itv.t) (v2 : Itv.t) : Itv.t =
+  match bop with
+  | Lt ->
+      let upper =
+        match v2 with
+        | Itv.Bot -> Itv.Bot
+        | Itv.Itv (_, r) -> Itv.Itv (Itv.Bound.N_inf, Itv.Bound.pred r)
+      in
+      Itv.meet v1 upper
+  | Le ->
+      let upper =
+        match v2 with
+        | Itv.Bot -> Itv.Bot
+        | Itv.Itv (_, r) -> Itv.Itv (Itv.Bound.N_inf, r)
+      in
+      Itv.meet v1 upper
+  | Gt ->
+      let lower =
+        match v2 with
+        | Itv.Bot -> Itv.Bot
+        | Itv.Itv (l, _) -> Itv.Itv (Itv.Bound.succ l, Itv.Bound.P_inf)
+      in
+      Itv.meet v1 lower
+  | Ge ->
+      let lower =
+        match v2 with
+        | Itv.Bot -> Itv.Bot
+        | Itv.Itv (l, _) -> Itv.Itv (l, Itv.Bound.P_inf)
+      in
+      Itv.meet v1 lower
+  | Eq -> Itv.meet v1 v2
+  | Ne -> (
+      match v2 with
+      | Itv.Itv (Itv.Bound.Z n, Itv.Bound.Z m) when n = m -> (
+          match v1 with
+          | Itv.Itv (Itv.Bound.Z l, r) when l = n ->
+              Itv.meet v1 (Itv.Itv (Itv.Bound.Z (l + 1), r))
+          | Itv.Itv (l, Itv.Bound.Z r) when r = n ->
+              Itv.meet v1 (Itv.Itv (l, Itv.Bound.Z (r - 1)))
+          | _ -> v1)
+      | _ -> v1)
+  | _ -> v1
+
+let negate_bop (bop : Exp.bop) : Exp.bop =
+  match bop with
+  | Lt -> Ge
+  | Le -> Gt
+  | Gt -> Le
+  | Ge -> Lt
+  | Eq -> Ne
+  | Ne -> Eq
+  | other -> other
+
+let flip_bop (bop : Exp.bop) : Exp.bop =
+  match bop with Lt -> Gt | Le -> Ge | Gt -> Lt | Ge -> Le | other -> other
+
+let get_itv_from_exp (e : Exp.t) (amem : Abs_Mem.t) : Itv.t =
+  match e with
+  | Int n -> Itv.alpha n
+  | Var x -> (
+      let loc = Abs_Loc.get x in
+      match Abs_Mem.LocMap.find_opt loc amem with
+      | Some ((itv, _, _), _) -> itv
+      | None -> Itv.bot)
+  | _ -> Itv.top
+
+let narrow_var_in_amem (x : string) (bop : Exp.bop) (other_itv : Itv.t)
+    (amem : Abs_Mem.t) : Abs_Mem.t =
+  let loc = Abs_Loc.get x in
+  match Abs_Mem.LocMap.find_opt loc amem with
+  | None -> amem
+  | Some ((curr_itv, u, l), pp) ->
+      let narrowed = narrow_left bop curr_itv other_itv in
+      Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem
+
+(* Refine abstract memory for a branch of an if-expression. [branch=true]
+   assumes [cond_exp] is truthy (≠ 0). [branch=false] assumes [cond_exp] is
+   falsy (= 0). *)
+let refine_amem (cond_exp : Exp.lbl_t) (branch : bool) (amem : Abs_Mem.t) :
+    Abs_Mem.t =
+  match cond_exp.exp with
+  | Bop (bop, lhs_e, rhs_e) -> (
+      let actual_bop = if branch then bop else negate_bop bop in
+      let v_lhs = get_itv_from_exp lhs_e.exp amem in
+      let v_rhs = get_itv_from_exp rhs_e.exp amem in
+      let amem1 =
+        match lhs_e.exp with
+        | Var x -> narrow_var_in_amem x actual_bop v_rhs amem
+        | _ -> amem
+      in
+      match rhs_e.exp with
+      | Var x -> narrow_var_in_amem x (flip_bop actual_bop) v_lhs amem1
+      | _ -> amem1)
+  | Var x -> (
+      let loc = Abs_Loc.get x in
+      match Abs_Mem.LocMap.find_opt loc amem with
+      | None -> amem
+      | Some ((curr_itv, u, l), pp) ->
+          (* false branch: x = 0; true branch: no precise refinement for ≠ 0 in
+             interval domain *)
+          if branch then amem
+          else
+            let narrowed = Itv.meet curr_itv (Itv.alpha 0) in
+            Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem)
+  | _ -> amem
 
 let abs_unit () : Abs_Val.t = (Itv.bot, Abs_Unit.Unit, Abs_Loc.bot)
 let abs_int (itv : Itv.t) : Abs_Val.t = (itv, Abs_Unit.bot, Abs_Loc.bot)
@@ -449,6 +570,11 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let r2, c2 = self c1 e2 in
         match bop with
         | Eq ->
+            print_endline
+              ("[Equal Check] "
+              ^ Abs_Val.string_of_t r1.avalue
+              ^ " vs "
+              ^ Abs_Val.string_of_t r2.avalue);
             ( {
                 avalue = abs_int (equal_check r1.avalue r2.avalue);
                 app = PPSet.empty;
@@ -487,7 +613,11 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         | Times ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.mul v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.mul v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | And ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
@@ -516,8 +646,14 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           let r3, c3 = self c1 e3 in
           (r3, c3)
         else
-          let r2, c2 = self c1 e2 in
-          let r3, c3 = self c1 e3 in
+          let c1_true = { c1 with amem = refine_amem e1 true c1.amem } in
+          let c1_false = { c1 with amem = refine_amem e1 false c1.amem } in
+          print_endline
+            ("[Refined True Branch] " ^ Abs_Mem.string_of_t c1_true.amem);
+          print_endline
+            ("[Refined False Branch] " ^ Abs_Mem.string_of_t c1_false.amem);
+          let r2, c2 = self c1_true e2 in
+          let r3, c3 = self c1_false e3 in
           join_out (r2, c2) (r3, c3)
     | While (_id, econd, ebody) ->
         let rec iterate (i : int) (input : abs_conf) : abs_conf =
@@ -526,19 +662,20 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           if cond_itv = Itv.Bool.false_ then ccond
           else begin
             let _rbody, cbody = self ccond ebody in
-            let next = if cond_itv = Itv.Bool.top then join_conf ccond cbody else cbody in
-            (* widen condition *)
-            let wconf =
-              if i < widen_cnt then next else widen_conf input next
+            let next =
+              if cond_itv = Itv.Bool.top then join_conf ccond cbody else cbody
             in
+            (* widen condition *)
+            let wconf = if i < widen_cnt then next else widen_conf input next in
             if leq_conf wconf input then input else iterate (i + 1) wconf
           end
         in
         let output = iterate 0 c in
         ({ avalue = abs_unit (); app = PPSet.empty }, output)
   in
-  match c.aimode with (* Check imode of input config *)
-  | Disabled -> 
+  match c.aimode with
+  (* Check imode of input config *)
+  | Disabled ->
       let c_recorded = record_sem pp c_after_eval in
       (res, c_recorded)
   | Enabled ->
@@ -576,7 +713,12 @@ let def_intp (pgm : Program.t) : Mem.t =
 
 let init_confa (pgm : Program.t) : abs_conf =
   let c0 =
-    { asem = Abs_Sem.bot; amem = Abs_Mem.bot; aimode = Interrupt.Disabled; errs = ErrorSet.empty }
+    {
+      asem = Abs_Sem.bot;
+      amem = Abs_Mem.bot;
+      aimode = Interrupt.Disabled;
+      errs = ErrorSet.empty;
+    }
   in
   let _, c_globals = evalA c0 pgm.global in
   let hs', iset' =
@@ -590,17 +732,22 @@ let init_confa (pgm : Program.t) : abs_conf =
   in
   iset := iset';
   handlers := hs';
-  { asem = c_globals.asem; amem = c_globals.amem; aimode = Interrupt.Enabled; errs = c_globals.errs }
-
+  {
+    asem = c_globals.asem;
+    amem = c_globals.amem;
+    aimode = Interrupt.Enabled;
+    errs = c_globals.errs;
+  }
 
 let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
   Abs_Sem.fold
     (fun pp mem acc ->
       match pp with
-      | ProgramPoint.Label (Exp.Lbl.Main _) | ProgramPoint.Label (Exp.Lbl.Init 1) -> Abs_Sem.write acc pp mem
+      | ProgramPoint.Label (Exp.Lbl.Main _)
+      | ProgramPoint.Label (Exp.Lbl.Init 1) ->
+          Abs_Sem.write acc pp mem
       | _ -> acc)
-    asem
-    Abs_Sem.bot
+    asem Abs_Sem.bot
 
 let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let c_init = init_confa pgm in
