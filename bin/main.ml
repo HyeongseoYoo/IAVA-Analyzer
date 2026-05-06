@@ -7,6 +7,8 @@ let opt_tintp = ref false
 let opt_dintp = ref false
 let opt_analyze = ref false
 let opt_analyze_detail = ref false
+let opt_prov = ref false
+let opt_report = ref false
 
 let main () =
   Arg.parse
@@ -25,6 +27,12 @@ let main () =
       ( "-analyzedetail",
         Arg.Unit (fun _ -> opt_analyze_detail := true),
         "Watercheck analyzer - Detail version" );
+      ( "-prov",
+        Arg.Unit (fun _ -> opt_prov := true),
+        "provenance analysis: trace bug origins (no LLM)" );
+      ( "-report",
+        Arg.Unit (fun _ -> opt_report := true),
+        "LLM bug report: provenance analysis + Claude explanation" );
     ]
     (fun x -> src := x)
     ("Usage : " ^ Filename.basename Sys.argv.(0) ^ " [-option] [filename] ");
@@ -63,10 +71,18 @@ let main () =
      print_endline)); *)
   (if !opt_analyze_detail then
      Analyzer.(abs_def_intp pgm |> Abs_dom.Abs_Sem.string_of_t |> print_endline));
+  (if !opt_prov || !opt_report then begin
+     let asem, errs = Analyzer.abs_analyze pgm in
+     let chains = Provenance.analyze errs asem pgm in
+     if !opt_prov then
+       print_endline (Provenance.string_of_report chains);
+     if !opt_report then
+       print_endline (Reporter.explain chains)
+   end);
   if
     not
       (!opt_pp || !opt_tab || !opt_tintp || !opt_dintp || !opt_analyze
-     || !opt_analyze_detail)
-  then print_endline "Please provide an option! (-pp, -tab, -intp, -analyze)"
+     || !opt_analyze_detail || !opt_prov || !opt_report)
+  then print_endline "Please provide an option! (-pp, -tab, -intp, -analyze, -prov, -report)"
 
 let () = main ()

@@ -1,5 +1,6 @@
 %{
 open Syntax
+open Lexing
 %}
 
 (* ===== tokens ===== *)
@@ -8,7 +9,6 @@ open Syntax
 %token ENABLE DISABLE UNIT
 %token IF THEN ELSE
 %token WHILE DO
-%token LET IN
 %token MALLOC
 
 %token <int> INT
@@ -20,7 +20,6 @@ open Syntax
 %token COMMA
 %token SEMI
 %token COLONEQ
-%token AMP
 %token OR AND
 %token EQ LT GT NE LE GE
 %token MINUS PLUS STAR
@@ -29,7 +28,7 @@ open Syntax
 
 (* ===== precedence ===== *)
 
-%right SEMI
+%nonassoc ELSE
 %right COLONEQ
 %left OR
 %left AND
@@ -48,13 +47,13 @@ open Syntax
 %type  <Handler.t> handler_def
 %%
 
-%inline mkexp(symb): symb { Exp.{lbl = Exp.Lbl.Init 0; exp = $1 } }
+%inline mkexp(symb): symb { Exp.{lbl = Exp.Lbl.Init 0; exp = $1; line = Some $startpos.pos_lnum } }
 
 (* ===== program ===== *)
 
 prog:
   INIT LBRACE ib = init_body RBRACE
-  MAIN LBRACE m0 = exp RBRACE
+  MAIN LBRACE m0 = exp_seq RBRACE
   EOF
     {
       let (g0, h0) = ib in
@@ -77,15 +76,15 @@ prog:
 
 
 init_body:
-/* empty */ { (Exp.{lbl = Exp.Lbl.Init 0; exp = Exp.Unit}, []) }
+/* empty */ { (Exp.{lbl = Exp.Lbl.Init 0; exp = Exp.Unit; line = None}, []) }
 | exp_seq handler_defs
     { ($1, $2) }
 ;
 
 exp_seq:
   | exp { $1 }
-  | exp SEMI exp_seq { Exp.{ lbl = Exp.Lbl.Init 0; exp = Exp.Seq ($1, $3)} }
-  | exp SEMI { $1 }
+  | exp_seq SEMI exp { Exp.{ lbl = Exp.Lbl.Init 0; exp = Exp.Seq ($1, $3); line = Some $startpos.pos_lnum } }
+  | exp_seq SEMI { $1 }
 ;
 
 handler_defs:
@@ -95,12 +94,12 @@ handler_defs:
 ;
 
 handler_def:
-  HANDLER INT LBRACE exp RBRACE { Handler.{ iid = $2; body = $4 } }
+  HANDLER INT LBRACE exp_seq RBRACE { Handler.{ iid = $2; body = $4 } }
 ;
 
 (* ===== expressions ===== *)
 exp:
-    | LPAREN e = exp RPAREN { e }
+    | LPAREN e = exp_seq RPAREN { e }
     (* atoms *)
     | mkexp(UNIT { Exp.Unit })
       { $1 }
@@ -148,14 +147,11 @@ exp:
     | mkexp(e1 = exp; COLONEQ; e2 = exp { Exp.Assign (e1, e2) })
       { $1 }
 
-    | mkexp(e1 = exp; SEMI; e2 = exp { Exp.Seq (e1, e2) })
-      { $1 }
-
     (* control *)
     | mkexp(IF; c = exp; THEN; t = exp; ELSE; f = exp { Exp.If (c, t, f) })
       { $1 }
 
-    | mkexp(WHILE; c = exp; DO; LPAREN; body = exp  ; RPAREN { Exp.While (Exp.Lbl.Init 0, c ,body) })
+    | mkexp(WHILE; c = exp; DO; LPAREN; body = exp_seq; RPAREN { Exp.While (Exp.Lbl.Init 0, c, body) })
       { $1 }
 
     (* let-binding *)

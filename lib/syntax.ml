@@ -30,7 +30,7 @@ module Exp = struct
 
   type bop = Eq | Lt | Gt | Ne | Le | Ge | Plus | Minus | Times | And | Or
 
-  type lbl_t = { lbl : Lbl.t; exp : t }
+  type lbl_t = { lbl : Lbl.t; exp : t; line : int option }
   and lbl = (Lbl.t, Lbl.t) Either.t
 
   and t =
@@ -63,7 +63,7 @@ module Exp = struct
   end
 
   let tabulate (l_exp : lbl_t) : t Lbl_map.t =
-    let rec tabulate' ({ lbl; exp } : lbl_t) (tbl : t Lbl_map.t) =
+    let rec tabulate' ({ lbl; exp; _ } : lbl_t) (tbl : t Lbl_map.t) =
       let tbl = Lbl_map.add (Either.left lbl) exp tbl in
       match exp with
       | Unit | Int _ | Var _ | Enable | Disable -> tbl
@@ -83,43 +83,43 @@ module Exp = struct
     tabulate' l_exp Lbl_map.empty
 
   let relabel (le : lbl_t) (lt : Lbl.t) : lbl_t =
-    let rec relabel' (lbl : Lbl.t) ({ exp; _ } : lbl_t) : lbl_t * Lbl.t =
+    let rec relabel' (lbl : Lbl.t) ({ exp; line; _ } : lbl_t) : lbl_t * Lbl.t =
       let my_lbl = Lbl.succ_lbl lbl in
       match exp with
       | Unit | Int _ | Var _ | Enable | Disable ->
-          ({ lbl = my_lbl; exp }, my_lbl)
+          ({ lbl = my_lbl; exp; line }, my_lbl)
       | Bop (b, e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
-          ({ lbl = my_lbl; exp = Bop (b, e1', e2') }, l2)
+          ({ lbl = my_lbl; exp = Bop (b, e1', e2'); line }, l2)
       | Deref (e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
-          ({ lbl = my_lbl; exp = Deref (e1', e2') }, l2)
+          ({ lbl = my_lbl; exp = Deref (e1', e2'); line }, l2)
       | Malloc (e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
-          ({ lbl = my_lbl; exp = Malloc (e1', e2') }, l2)
+          ({ lbl = my_lbl; exp = Malloc (e1', e2'); line }, l2)
       | Assign (e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
-          ({ lbl = my_lbl; exp = Assign (e1', e2') }, l2)
+          ({ lbl = my_lbl; exp = Assign (e1', e2'); line }, l2)
       | Seq (e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
-          ({ lbl = my_lbl; exp = Seq (e1', e2') }, l2)
+          ({ lbl = my_lbl; exp = Seq (e1', e2'); line }, l2)
       | While (_, e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
           let glbl = Lbl.succ_lbl l2 in
-          ({ lbl = my_lbl; exp = While (glbl, e1', e2') }, glbl)
+          ({ lbl = my_lbl; exp = While (glbl, e1', e2'); line }, glbl)
       (* | Let (x, e1, e2) -> let e1', l1 = relabel' my_lbl e1 in let e2', l2 =
-         relabel' l1 e2 in ({ lbl = my_lbl; exp = Let (x, e1', e2') }, l2) *)
+         relabel' l1 e2 in ({ lbl = my_lbl; exp = Let (x, e1', e2'); line }, l2) *)
       | If (e1, e2, e3) ->
           let e1', l1 = relabel' my_lbl e1 in
           let e2', l2 = relabel' l1 e2 in
           let e3', l3 = relabel' l2 e3 in
-          ({ lbl = my_lbl; exp = If (e1', e2', e3') }, l3)
+          ({ lbl = my_lbl; exp = If (e1', e2', e3'); line }, l3)
     in
     fst (relabel' lt le)
 
@@ -136,7 +136,7 @@ module Exp = struct
     | And -> "&&"
     | Or -> "||"
 
-  let rec string_of_lbl_t ({ lbl; exp } : lbl_t) =
+  let rec string_of_lbl_t ({ lbl; exp; _ } : lbl_t) =
     Printf.sprintf "%s: (%s)" (Lbl.string_of_t lbl) (string_of_t exp)
 
   and string_of_t : t -> string = function

@@ -24,7 +24,7 @@ let widen_cnt = 3
 
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
     =
-  let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
+  let ({ lbl; exp; _ } : Exp.lbl_t) = lbl_exp in
   let ({ env = _; mem; imode = _ } : conf) = c in
   (* TODO: Done -> Non-Deterministic *)
   let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in
@@ -470,7 +470,7 @@ let post_steps
 let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf
     =
-  let ({ lbl; exp } : Exp.lbl_t) = lbl_exp in
+  let ({ lbl; exp; _ } : Exp.lbl_t) = lbl_exp in
   let ({ amem; _ } : abs_conf) = c in
   let r = { avalue = Abs_Val.bot; app = PPSet.empty } in
   let pp = ProgramPoint.Label lbl in
@@ -757,3 +757,8 @@ let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   print_endline (ErrorSet.string_of_t c_final.errs);
   print_endline "=== Final Abstract Memory ===";
   filter_main_sem c_final.asem
+
+let abs_analyze (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
+  let c_init = init_confa pgm in
+  let _, c_final = evalA c_init pgm.main in
+  (c_final.asem, c_final.errs)

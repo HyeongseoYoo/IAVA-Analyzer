@@ -1,0 +1,304 @@
+open Syntax
+open Domain
+open Abs_dom
+
+(* ===== Types ===== *)
+
+type bug_kind = LeftOOB | RightOOB | BothOOB
+
+type source_site = {
+  pp : ProgramPoint.t;
+  line : int option;
+  expr : string;
+  value : Abs_Val.t;
+}
+
+type prov_node = { site : source_site; children : prov_node list }
+
+type chain = {
+  error : Error.t;
+  err_site : source_site;
+  base_prov : prov_node list;
+  offset_prov : prov_node list;
+}
+
+(* ===== Helpers ===== *)
+
+let bug_kind_of (e : Error.t) : bug_kind =
+  match (e.left_oob, e.right_oob) with
+  | Itv.Bot, _ -> RightOOB
+  | _, Itv.Bot -> LeftOOB
+  | _ -> BothOOB
+
+let string_of_bug_kind = function
+  | LeftOOB -> "index too small (left OOB)"
+  | RightOOB -> "index too large (right OOB)"
+  | BothOOB -> "index out of bounds (both directions)"
+
+(* Format an expression without internal label prefixes, for human display. *)
+let rec fmt_exp : Exp.t -> string = function
+  | Exp.Unit -> "unit"
+  | Exp.Int n -> string_of_int n
+  | Exp.Var x -> x
+  | Exp.Enable -> "enable"
+  | Exp.Disable -> "disable"
+  | Exp.Bop (bop, e1, e2) ->
+      Printf.sprintf "(%s %s %s)" (fmt_exp e1.exp)
+        (Exp.string_of_bop bop)
+        (fmt_exp e2.exp)
+  | Exp.Deref (e1, e2) ->
+      Printf.sprintf "*%s[%s]" (fmt_exp e1.exp) (fmt_exp e2.exp)
+  | Exp.Malloc (e1, e2) ->
+      Printf.sprintf "malloc(%s, %s)" (fmt_exp e1.exp) (fmt_exp e2.exp)
+  | Exp.Assign (e1, e2) ->
+      Printf.sprintf "%s := %s" (fmt_exp e1.exp) (fmt_exp e2.exp)
+  | Exp.Seq (e1, e2) ->
+      Printf.sprintf "%s; %s" (fmt_exp e1.exp) (fmt_exp e2.exp)
+  | Exp.If (c, t, f) ->
+      Printf.sprintf "if %s then %s else %s" (fmt_exp c.exp) (fmt_exp t.exp)
+        (fmt_exp f.exp)
+  | Exp.While (_, c, b) ->
+      Printf.sprintf "while %s do (%s)" (fmt_exp c.exp) (fmt_exp b.exp)
+
+(* Extract variable names referenced in an expression. For Assign, only the
+   RHS is traversed so we follow the data that was written, not the target. *)
+let rec vars_in_exp : Exp.t -> string list = function
+  | Exp.Var x -> [ x ]
+  | Exp.Int _ | Exp.Unit | Exp.Enable | Exp.Disable -> []
+  | Exp.Bop (_, e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
+  | Exp.Deref (e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
+  | Exp.Malloc (e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
+  | Exp.Assign (_, rhs) -> vars_in_exp rhs.exp
+  | Exp.Seq (e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
+  | Exp.If (c, t, f) ->
+      vars_in_exp c.exp @ vars_in_exp t.exp @ vars_in_exp f.exp
+  | Exp.While (_, c, b) -> vars_in_exp c.exp @ vars_in_exp b.exp
+
+(* Build a unified label → lbl_t table across the whole program so we can
+   look up the expression and line for any program point. *)
+let build_lbl_table (pgm : Program.t) :
+    Exp.lbl_t Syntax.Exp.Lbl_map.t =
+  let add_lbl_t tbl (le : Exp.lbl_t) =
+    let rec walk ({ lbl; exp; line } : Exp.lbl_t) acc =
+      let acc =
+        Exp.Lbl_map.add (Either.Left lbl)
+          (({ lbl; exp; line } : Exp.lbl_t))
+          acc
+      in
+      match exp with
+      | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.Enable | Exp.Disable -> acc
+      | Exp.Bop (_, e1, e2)
+      | Exp.Deref (e1, e2)
+      | Exp.Malloc (e1, e2)
+      | Exp.Assign (e1, e2)
+      | Exp.Seq (e1, e2) ->
+          acc |> walk e1 |> walk e2
+      | Exp.If (e1, e2, e3) -> acc |> walk e1 |> walk e2 |> walk e3
+      | Exp.While (glbl, e1, e2) ->
+          Exp.Lbl_map.add (Either.Right glbl)
+            (({ lbl = glbl; exp; line } : Exp.lbl_t))
+            (acc |> walk e1 |> walk e2)
+    in
+    walk le tbl
+  in
+  let tbl = Exp.Lbl_map.empty in
+  let tbl = add_lbl_t tbl pgm.Program.global in
+  let tbl = add_lbl_t tbl pgm.Program.main in
+  List.fold_left
+    (fun acc (h : Handler.t) -> add_lbl_t acc h.body)
+    tbl pgm.Program.handler
+
+let lookup_lbl_t (tbl : Exp.lbl_t Exp.Lbl_map.t) (pp : ProgramPoint.t) :
+    Exp.lbl_t option =
+  match pp with
+  | ProgramPoint.Unit -> None
+  | ProgramPoint.Label lbl ->
+      Exp.Lbl_map.find_opt (Either.Left lbl) tbl
+
+(* ===== Multi-hop provenance tracing ===== *)
+
+let max_depth = 10
+
+let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
+    (tbl : Exp.lbl_t Exp.Lbl_map.t) (visited : PPSet.t) (depth : int) :
+    prov_node list =
+  if depth = 0 then []
+  else
+    PPSet.fold
+      (fun pp acc ->
+        if PPSet.mem pp visited then acc
+        else
+          let snapshot = Abs_Sem.find asem pp in
+          let loc = Abs_Loc.get var_name in
+          let value, _ = Abs_Mem.find snapshot loc in
+          let lbl_t_opt = lookup_lbl_t tbl pp in
+          let line =
+            Option.bind lbl_t_opt (fun lt -> lt.line)
+          in
+          let expr =
+            match lbl_t_opt with
+            | Some lt -> fmt_exp lt.exp
+            | None -> "<unknown>"
+          in
+          let site = { pp; line; expr; value } in
+          let visited' = PPSet.add pp visited in
+          let children =
+            match lbl_t_opt with
+            | None -> []
+            | Some lt ->
+                let rhs_vars = vars_in_exp lt.exp in
+                List.concat_map
+                  (fun v ->
+                    let v_loc = Abs_Loc.get v in
+                    let _, sub_pps = Abs_Mem.find snapshot v_loc in
+                    trace_pps sub_pps v asem tbl visited' (depth - 1))
+                  rhs_vars
+          in
+          { site; children } :: acc)
+      pps []
+
+(* ===== Entry point ===== *)
+
+let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
+    chain list =
+  let tbl = build_lbl_table pgm in
+  ErrorSet.fold
+    (fun (e : Error.t) acc ->
+      let err_lbl_opt = lookup_lbl_t tbl e.at in
+      let err_site =
+        {
+          pp = e.at;
+          line = Option.bind err_lbl_opt (fun lt -> lt.line);
+          expr =
+            (match err_lbl_opt with
+            | Some lt -> fmt_exp lt.exp
+            | None -> "<unknown>");
+          value = Abs_Val.bot;
+        }
+      in
+      (* Determine which variable names to trace for base and offset.
+         We look at the expression at the error site to extract the base
+         variable (LHS of Deref) and offset variable (index of Deref). *)
+      let base_var, offset_var =
+        match err_lbl_opt with
+        | Some { exp = Exp.Deref (base_e, off_e); _ } ->
+            ( (match base_e.exp with Exp.Var x -> x | _ -> "<base>"),
+              match off_e.exp with Exp.Var x -> x | _ -> "<offset>" )
+        | Some { exp = Exp.Assign (lhs, _); _ } -> (
+            match lhs.exp with
+            | Exp.Deref (base_e, off_e) ->
+                ( (match base_e.exp with Exp.Var x -> x | _ -> "<base>"),
+                  match off_e.exp with Exp.Var x -> x | _ -> "<offset>" )
+            | _ -> ("<base>", "<offset>"))
+        | _ -> ("<base>", "<offset>")
+      in
+      let visited0 = PPSet.singleton e.at in
+      let base_prov =
+        trace_pps e.base_pp base_var asem tbl visited0 max_depth
+      in
+      let offset_prov =
+        trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
+      in
+      { error = e; err_site; base_prov; offset_prov } :: acc)
+    errors []
+
+(* ===== Formatters ===== *)
+
+let indent (n : int) : string = String.make (n * 2) ' '
+
+(* Collect all interrupt handler IIDs mentioned anywhere in a prov tree. *)
+let rec handler_iids_in_node (node : prov_node) : int list =
+  let own =
+    match node.site.pp with
+    | ProgramPoint.Label (Exp.Lbl.Handler (iid, _)) -> [ iid ]
+    | _ -> []
+  in
+  own @ List.concat_map handler_iids_in_node node.children
+
+let handler_iids_in_chain (c : chain) : int list =
+  let from_base = List.concat_map handler_iids_in_node c.base_prov in
+  let from_offset = List.concat_map handler_iids_in_node c.offset_prov in
+  List.sort_uniq Int.compare (from_base @ from_offset)
+
+let string_of_site (s : source_site) : string =
+  let loc_str =
+    match s.pp with
+    | ProgramPoint.Label (Exp.Lbl.Handler (iid, _)) -> (
+        match s.line with
+        | Some l -> Printf.sprintf "handler %d, line %d" iid l
+        | None -> Printf.sprintf "handler %d" iid)
+    | _ -> (
+        match s.line with
+        | Some l -> Printf.sprintf "line %d" l
+        | None -> ProgramPoint.string_of_t s.pp)
+  in
+  Printf.sprintf "%s: `%s`  (value: %s)" loc_str s.expr
+    (Abs_Val.string_of_t s.value)
+
+let rec string_of_prov_node (depth : int) (node : prov_node) : string =
+  let arrow = indent depth ^ "← " in
+  let site_str = arrow ^ string_of_site node.site in
+  if node.children = [] then site_str
+  else
+    let children_str =
+      List.map (string_of_prov_node (depth + 1)) node.children
+      |> String.concat "\n"
+    in
+    site_str ^ "\n" ^ children_str
+
+let string_of_chain (c : chain) : string =
+  let at_str =
+    match c.err_site.line with
+    | Some l -> Printf.sprintf "line %d" l
+    | None -> ProgramPoint.string_of_t c.err_site.pp
+  in
+  let access_str = Error.string_of_access c.error.access in
+  let kind_str = string_of_bug_kind (bug_kind_of c.error) in
+  let handler_str =
+    if not c.error.handler_caused then ""
+    else
+      let iids = handler_iids_in_chain c in
+      let iid_str =
+        if iids = [] then "unknown interrupt handler"
+        else
+          List.map (fun i -> Printf.sprintf "handler %d" i) iids
+          |> String.concat ", "
+      in
+      Printf.sprintf "  [caused by interrupt: %s]\n" iid_str
+  in
+  let oob_str =
+    Printf.sprintf "  safe range: %s  |  left OOB: %s  |  right OOB: %s"
+      (Itv.string_of_t c.error.in_itv)
+      (Itv.string_of_t c.error.left_oob)
+      (Itv.string_of_t c.error.right_oob)
+  in
+  let base_str =
+    if c.base_prov = [] then "  (no base provenance found)"
+    else
+      List.map (string_of_prov_node 1) c.base_prov |> String.concat "\n"
+  in
+  let offset_str =
+    if c.offset_prov = [] then "  (no offset provenance found)"
+    else
+      List.map (string_of_prov_node 1) c.offset_prov |> String.concat "\n"
+  in
+  Printf.sprintf
+    "Bug at %s: `%s`\n  %s %s\n%s%s\n  Base pointer provenance:\n%s\n  \
+     Offset provenance:\n%s"
+    at_str c.err_site.expr access_str kind_str handler_str oob_str base_str
+    offset_str
+
+let string_of_report (chains : chain list) : string =
+  if chains = [] then "No bugs found."
+  else
+    let n = List.length chains in
+    let header =
+      Printf.sprintf "=== Provenance Report: %d bug%s found ===\n" n
+        (if n = 1 then "" else "s")
+    in
+    header
+    ^ (List.mapi
+         (fun i c ->
+           Printf.sprintf "--- Bug #%d ---\n%s" (i + 1) (string_of_chain c))
+         chains
+      |> String.concat "\n\n")
