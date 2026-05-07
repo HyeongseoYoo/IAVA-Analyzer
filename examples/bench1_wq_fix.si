@@ -1,0 +1,503 @@
+// Benchmark 1: Write Command Queue Management — FIXED VERSION
+// SSD FW HIL simulation: host write commands dispatched to a flash write queue.
+//
+// handler 0 — CMD_COMPLETE   : marks oldest pending cmd done, advances QueueRp
+// handler 1 — CMD_ERROR      : marks error on current cmd, sets CmdState := CMD_ERROR
+// handler 2 — QUEUE_FLUSH    : emergency queue reset (zeros QueueWp, QueueDepth)
+// handler 3 — CHANNEL_SWITCH : rotates to next flash channel
+
+init {
+  CMD_IDLE    := 0;
+  CMD_PENDING := 1;
+  CMD_ACTIVE  := 2;
+  CMD_DONE    := 3;
+  CMD_ERROR   := 4;
+  CMD_RETRY   := 5;
+  CMD_FLUSH   := 6;
+
+  QUEUE_DEPTH := 16;
+  MAX_RETRY   := 3;
+  MAX_CHANNEL := 4;
+  MAX_DIE     := 2;
+  TOTAL_CMDS  := 12;
+
+  ERR_NONE    := 0;
+  ERR_TIMEOUT := 1;
+  ERR_ECC     := 2;
+  ERR_MEDIA   := 3;
+  ERR_FLUSH   := 4;
+
+  CH_IDLE  := 0;
+  CH_BUSY  := 1;
+  CH_ERROR := 2;
+  CH_RESET := 3;
+
+  MARK_SUBMIT := 10;
+  MARK_DONE   := 20;
+  MARK_RETRY  := 30;
+  MARK_ERR    := 40;
+  MARK_FLUSH  := 50;
+  MARK_CH     := 60;
+
+  QueueWp      := 0;
+  QueueRp      := 0;
+  QueueDepth   := 0;
+  QueueFull    := 0;
+  CmdState     := CMD_IDLE;
+  CmdError     := ERR_NONE;
+  RetryCnt     := 0;
+  ChannelId    := 0;
+  ChannelState := CH_IDLE;
+  DieId        := 0;
+  FlushPending := 0;
+  DoneCount    := 0;
+  SubmitCount  := 0;
+  ErrCount     := 0;
+  RetryTotal   := 0;
+
+  CmdQueue   := malloc(16, 0);
+  CmdStatus  := malloc(16, 0);
+  CmdRetry   := malloc(16, 0);
+  ChannelMap := malloc(4, 0);
+  ErrLog     := malloc(8, 0);
+  TraceLog   := malloc(64, 0);
+  DoneMap    := malloc(16, 0);
+  SubmitLog  := malloc(16, 0);
+  FlushLog   := malloc(8, 0);
+  ResultBuf  := malloc(8, 0);
+
+  handler 0 {
+    *CmdStatus[QueueRp] := CMD_DONE;
+    *DoneMap[QueueRp]   := 1;
+    DoneCount           := DoneCount + 1;
+    QueueRp             := QueueRp + 1;
+    QueueDepth          := QueueDepth - 1;
+    CmdState            := CMD_IDLE;
+    *TraceLog[0]        := MARK_DONE
+  };
+  handler 1 {
+    *CmdStatus[QueueRp] := CMD_ERROR;
+    CmdError            := ERR_MEDIA;
+    CmdState            := CMD_ERROR;
+    ChannelState        := CH_ERROR;
+    ErrCount            := ErrCount + 1;
+    *ErrLog[ErrCount]   := ERR_MEDIA;
+    *TraceLog[1]        := MARK_ERR
+  };
+  handler 2 {
+    QueueWp      := 0;
+    QueueRp      := 0;
+    QueueDepth   := 0;
+    QueueFull    := 0;
+    FlushPending := 1;
+    CmdState     := CMD_FLUSH;
+    *FlushLog[0] := MARK_FLUSH;
+    *TraceLog[2] := MARK_FLUSH
+  };
+  handler 3 {
+    ChannelId              := ChannelId + 1;
+    ChannelState           := CH_IDLE;
+    DieId                  := 0;
+    *ChannelMap[ChannelId] := CH_IDLE;
+    *TraceLog[3]           := MARK_CH
+  }
+}
+
+main {
+  // Phase 1: channel preflight — reset all channel map entries
+  while ChannelId < MAX_CHANNEL do (
+    *ChannelMap[ChannelId] := CH_IDLE;
+    *TraceLog[ChannelId]   := CH_IDLE;
+    ChannelId              := ChannelId + 1
+  );
+  ChannelId    := 0;
+  ChannelState := CH_IDLE;
+  DieId        := 0;
+
+  // Phase 2: queue sanity check and initial state snapshot
+  *TraceLog[4]  := SubmitCount;
+  *TraceLog[5]  := DoneCount;
+  *TraceLog[6]  := QueueWp;
+  *TraceLog[7]  := QueueRp;
+  *TraceLog[8]  := QueueDepth;
+  *TraceLog[9]  := CmdState;
+  *TraceLog[10] := CmdError;
+  *TraceLog[11] := ChannelId;
+  *TraceLog[12] := DieId;
+  *TraceLog[13] := FlushPending;
+
+  if QueueDepth > 0
+  then (
+    *TraceLog[14] := QueueDepth;
+    QueueDepth    := 0;
+    QueueWp       := 0;
+    QueueRp       := 0;
+    QueueFull     := 0;
+    *TraceLog[15] := 0
+  )
+  else (
+    *TraceLog[14] := 0;
+    *TraceLog[15] := QueueWp
+  );
+
+  *ResultBuf[0] := TOTAL_CMDS;
+  *ResultBuf[1] := MAX_RETRY;
+
+  // Phase 3: command submission loop
+  while SubmitCount < TOTAL_CMDS do (
+    *TraceLog[16] := SubmitCount;
+    *TraceLog[17] := QueueDepth;
+    *TraceLog[18] := ChannelId;
+    *TraceLog[19] := DieId;
+
+    if ChannelState = CH_ERROR
+    then (
+      ChannelState := CH_RESET;
+      if ChannelId < MAX_CHANNEL
+      then ChannelId := ChannelId + 1
+      else ChannelId := 0;
+      *ChannelMap[ChannelId] := CH_RESET;
+      *TraceLog[20]          := ChannelId;
+      *TraceLog[21]          := CH_RESET
+    )
+    else (
+      if ChannelState = CH_RESET
+      then (
+        ChannelState           := CH_IDLE;
+        *ChannelMap[ChannelId] := CH_IDLE;
+        *TraceLog[20]          := CH_IDLE;
+        *TraceLog[21]          := ChannelId
+      )
+      else (
+        *TraceLog[20] := ChannelState;
+        *TraceLog[21] := ChannelId
+      )
+    );
+
+    // [FIX-1] Disable interrupts: handler 2 cannot reset QueueWp between
+    // the QueueFull check and the use of QueueWp in the then-branch.
+    disable;
+    (if QueueFull = 0
+    then (
+      *CmdQueue[QueueWp]  := SubmitCount;
+      *CmdStatus[QueueWp] := CMD_PENDING;
+      *CmdRetry[QueueWp]  := 0;
+
+      // [FIX-1 BODY] QueueWp is safe — no interrupt can reset it here
+      *SubmitLog[QueueWp] := SubmitCount;
+      *DoneMap[QueueWp]   := 0;
+      *TraceLog[22]       := QueueWp;
+      enable;
+      *TraceLog[23]       := SubmitCount;
+
+      QueueWp     := QueueWp + 1;
+      QueueDepth  := QueueDepth + 1;
+      SubmitCount := SubmitCount + 1;
+
+      if DieId < MAX_DIE
+      then (
+        DieId         := DieId + 1;
+        *TraceLog[24] := DieId
+      )
+      else (
+        DieId := 0;
+        if ChannelId < MAX_CHANNEL
+        then ChannelId := ChannelId + 1
+        else ChannelId := 0;
+        ChannelState           := CH_BUSY;
+        *ChannelMap[ChannelId] := CH_BUSY;
+        *TraceLog[24]          := ChannelId
+      );
+
+      if QueueDepth = QUEUE_DEPTH
+      then (
+        QueueFull     := 1;
+        *TraceLog[25] := QueueDepth;
+        *TraceLog[26] := QueueFull
+      )
+      else (
+        *TraceLog[25] := QueueDepth;
+        *TraceLog[26] := QueueFull
+      );
+
+      *TraceLog[27] := SubmitCount;
+      *TraceLog[28] := DoneCount;
+      *TraceLog[29] := ErrCount
+    )
+    else (
+      enable;
+      *TraceLog[22] := QueueDepth;
+      *TraceLog[23] := QueueFull;
+      *TraceLog[24] := QueueDepth;
+
+      if DoneCount > 0
+      then (
+        QueueFull     := 0;
+        *TraceLog[25] := DoneCount;
+        *TraceLog[26] := QueueDepth;
+        *TraceLog[27] := QueueFull
+      )
+      else (
+        if FlushPending = 1
+        then (
+          FlushPending  := 0;
+          QueueDepth    := 0;
+          QueueFull     := 0;
+          QueueWp       := 0;
+          QueueRp       := 0;
+          *TraceLog[25] := MARK_FLUSH;
+          *TraceLog[26] := 0;
+          *TraceLog[27] := 0
+        )
+        else (
+          *TraceLog[25] := 0;
+          *TraceLog[26] := QueueFull;
+          *TraceLog[27] := QueueDepth
+        )
+      );
+
+      *TraceLog[28] := SubmitCount;
+      *TraceLog[29] := DoneCount
+    ))
+  );
+
+  *TraceLog[30] := SubmitCount;
+  *TraceLog[31] := DoneCount;
+  *TraceLog[32] := QueueDepth;
+  *TraceLog[33] := ErrCount;
+  *TraceLog[34] := RetryTotal;
+
+  // Phase 4: completion polling loop
+  while DoneCount < TOTAL_CMDS do (
+    *TraceLog[35] := DoneCount;
+    *TraceLog[36] := CmdState;
+    *TraceLog[37] := QueueRp;
+    *TraceLog[38] := RetryCnt;
+    *TraceLog[39] := ErrCount;
+
+    // [FIX-2] Disable interrupts: handler 1 cannot change CmdState between
+    // the condition check and the else-branch re-read of CmdState.
+    disable;
+    (if CmdState = CMD_ERROR
+    then (
+      enable;
+      *ErrLog[RetryCnt] := CmdError;
+      *TraceLog[40]     := CmdError;
+      *TraceLog[41]     := RetryCnt;
+
+      if RetryCnt < MAX_RETRY
+      then (
+        RetryCnt   := RetryCnt + 1;
+        RetryTotal := RetryTotal + 1;
+        CmdState   := CMD_RETRY;
+        *CmdRetry[QueueRp] := RetryCnt;
+        *TraceLog[42]      := RetryCnt;
+
+        if ChannelState = CH_ERROR
+        then (
+          ChannelState := CH_RESET;
+          if ChannelId < MAX_CHANNEL
+          then ChannelId := ChannelId + 1
+          else ChannelId := 0;
+          *ChannelMap[ChannelId] := CH_RESET;
+          *TraceLog[43]          := ChannelId;
+          *TraceLog[44]          := CH_RESET
+        )
+        else (
+          *TraceLog[43] := ChannelState;
+          *TraceLog[44] := ChannelId
+        );
+
+        *TraceLog[45] := CmdState;
+        *TraceLog[46] := RetryTotal
+      )
+      else (
+        CmdState  := CMD_DONE;
+        DoneCount := DoneCount + 1;
+        *CmdStatus[QueueRp] := CMD_ERROR;
+        ErrCount            := ErrCount + 1;
+        *ErrLog[ErrCount]   := CmdError;
+        RetryCnt            := 0;
+        *TraceLog[42]       := CMD_ERROR;
+        *TraceLog[43]       := DoneCount;
+        *TraceLog[44]       := ErrCount;
+        *TraceLog[45]       := QueueRp;
+        *TraceLog[46]       := RetryTotal
+      )
+    )
+    else (
+      // [FIX-2 BODY] CmdState is safe — no interrupt can change it here
+      *TraceLog[40] := CmdState;
+      *TraceLog[41] := DoneCount;
+
+      if CmdState = CMD_IDLE
+      then (
+        *TraceLog[42] := CMD_IDLE;
+        *TraceLog[43] := QueueRp;
+        *TraceLog[44] := DoneCount
+      )
+      else (
+        if CmdState = CMD_RETRY
+        then (
+          *TraceLog[42] := CMD_RETRY;
+          *TraceLog[43] := RetryCnt;
+          *TraceLog[44] := QueueRp
+        )
+        else (
+          *TraceLog[42] := CmdState;
+          *TraceLog[43] := DoneCount;
+          *TraceLog[44] := ErrCount
+        )
+      );
+      enable;
+
+      if ChannelState = CH_ERROR
+      then (
+        ChannelState           := CH_RESET;
+        *ChannelMap[ChannelId] := CH_RESET;
+        *TraceLog[45]          := CH_RESET;
+        *TraceLog[46]          := ChannelId
+      )
+      else (
+        if ChannelState = CH_RESET
+        then (
+          ChannelState           := CH_IDLE;
+          *ChannelMap[ChannelId] := CH_IDLE;
+          *TraceLog[45]          := CH_IDLE;
+          *TraceLog[46]          := ChannelId
+        )
+        else (
+          *ChannelMap[ChannelId] := ChannelState;
+          *TraceLog[45]          := ChannelState;
+          *TraceLog[46]          := ChannelId
+        )
+      )
+    ))
+  );
+
+  *TraceLog[47] := DoneCount;
+  *TraceLog[48] := ErrCount;
+  *TraceLog[49] := RetryTotal;
+  *TraceLog[50] := QueueRp;
+
+  // Phase 5: die-level completion accounting
+  DieId := 0;
+  while DieId < MAX_DIE do (
+    *DoneMap[DieId] := DoneCount;
+    *TraceLog[51]   := DieId;
+
+    if DoneCount > DieId
+    then (
+      *TraceLog[52] := DoneCount;
+      *TraceLog[53] := DieId
+    )
+    else (
+      *TraceLog[52] := 0;
+      *TraceLog[53] := DieId
+    );
+
+    DieId         := DieId + 1;
+    *TraceLog[54] := DieId
+  );
+
+  // Phase 6: channel state cleanup scan
+  ChannelId := 0;
+  while ChannelId < MAX_CHANNEL do (
+    *TraceLog[55] := ChannelId;
+
+    if *ChannelMap[ChannelId] = CH_ERROR
+    then (
+      *ChannelMap[ChannelId] := CH_IDLE;
+      *TraceLog[56]          := CH_IDLE
+    )
+    else (
+      if *ChannelMap[ChannelId] = CH_RESET
+      then (
+        *ChannelMap[ChannelId] := CH_IDLE;
+        *TraceLog[56]          := CH_IDLE
+      )
+      else (
+        if *ChannelMap[ChannelId] = CH_BUSY
+        then (
+          *ChannelMap[ChannelId] := CH_IDLE;
+          *TraceLog[56]          := CH_IDLE
+        )
+        else (
+          *TraceLog[56] := *ChannelMap[ChannelId]
+        )
+      )
+    );
+
+    ChannelId     := ChannelId + 1;
+    *TraceLog[57] := ChannelId
+  );
+
+  // Phase 7: flush handling
+  *TraceLog[58] := FlushPending;
+  *TraceLog[59] := QueueDepth;
+
+  if FlushPending = 1
+  then (
+    *FlushLog[0] := DoneCount;
+    *FlushLog[1] := SubmitCount;
+    *FlushLog[2] := QueueDepth;
+    *FlushLog[3] := ErrCount;
+    *FlushLog[4] := RetryTotal;
+    FlushPending := 0;
+    QueueDepth   := 0;
+    QueueWp      := 0;
+    QueueRp      := 0;
+    QueueFull    := 0;
+    *TraceLog[60] := MARK_FLUSH;
+    *TraceLog[61] := DoneCount
+  )
+  else (
+    *FlushLog[0] := 0;
+    *FlushLog[1] := DoneCount;
+    *TraceLog[60] := MARK_DONE;
+    *TraceLog[61] := DoneCount
+  );
+
+  // Phase 8: error classification and result reporting
+  *TraceLog[62] := CmdError;
+  *TraceLog[63] := ErrCount;
+
+  if ErrCount > 0
+  then (
+    *ResultBuf[2] := ErrCount;
+    *ResultBuf[3] := RetryTotal;
+
+    if CmdError = ERR_MEDIA
+    then (
+      *ResultBuf[4] := ERR_MEDIA;
+      *ResultBuf[5] := 1
+    )
+    else (
+      if CmdError = ERR_TIMEOUT
+      then (
+        *ResultBuf[4] := ERR_TIMEOUT;
+        *ResultBuf[5] := 2
+      )
+      else (
+        if CmdError = ERR_FLUSH
+        then (
+          *ResultBuf[4] := ERR_FLUSH;
+          *ResultBuf[5] := 3
+        )
+        else (
+          *ResultBuf[4] := CmdError;
+          *ResultBuf[5] := 0
+        )
+      )
+    )
+  )
+  else (
+    *ResultBuf[2] := 0;
+    *ResultBuf[3] := 0;
+    *ResultBuf[4] := ERR_NONE;
+    *ResultBuf[5] := 0
+  );
+
+  *ResultBuf[6] := DoneCount;
+  *ResultBuf[7] := SubmitCount
+}

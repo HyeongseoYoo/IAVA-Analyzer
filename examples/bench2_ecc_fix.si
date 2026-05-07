@@ -1,0 +1,378 @@
+// Benchmark 2: ECC Error Recovery — FIXED VERSION
+// SSD FW HIL simulation: LDPC/BCH ECC correction on a read path with retries.
+//
+// handler 0 — ECC_CORRECTION_DONE : sets EccDone := 1, EccStatus := ECC_CORR
+// handler 1 — UNCORRECTABLE_ERR   : sets EccFatal := 1, EccStatus := ECC_UNCORR
+// handler 2 — READ_TIMEOUT        : clears EccArmed, increments TimeoutCnt
+// handler 3 — CHANNEL_RESET       : clears EccArmed, EccDone, EccStatus := ECC_IDLE
+
+init {
+  ECC_IDLE   := 0;
+  ECC_ARMED  := 1;
+  ECC_CORR   := 2;
+  ECC_UNCORR := 3;
+  ECC_BYPASS := 4;
+
+  MAX_CORR_BITS := 72;
+  MAX_RETRY     := 4;
+  MAX_TIMEOUT   := 3;
+  MAX_PLANES    := 4;
+  TOTAL_PAGES   := 8;
+
+  ERR_NONE    := 0;
+  ERR_SOFT    := 1;
+  ERR_HARD    := 2;
+  ERR_UNCORR  := 3;
+  ERR_TIMEOUT := 4;
+
+  CH_READY := 1;
+  CH_BUSY  := 2;
+  CH_FAULT := 3;
+  CH_RESET := 4;
+
+  MARK_ECC_START := 10;
+  MARK_ECC_DONE  := 20;
+  MARK_ECC_RETRY := 30;
+  MARK_ECC_FATAL := 40;
+  MARK_TIMEOUT   := 50;
+  MARK_CH_RESET  := 60;
+
+  EccArmed   := 1;
+  EccDone    := 0;
+  EccFatal   := 0;
+  EccStatus  := ECC_ARMED;
+  CorrBits   := 0;
+  RetryCnt   := 0;
+  TimeoutCnt := 0;
+  PageIdx    := 0;
+  PlaneId    := 0;
+  ChannelRdy := CH_READY;
+  ReadError  := ERR_NONE;
+  DonePages  := 0;
+  TotalRetry := 0;
+  FatalCount := 0;
+
+  CorrLog    := malloc(8, 0);
+  EccTrace   := malloc(64, 0);
+  PageStatus := malloc(8, 0);
+  PlaneMap   := malloc(4, 0);
+  RetryLog   := malloc(8, 0);
+  ErrLog     := malloc(8, 0);
+  ResultBuf  := malloc(8, 0);
+  BitCntLog  := malloc(8, 0);
+
+  handler 0 {
+    EccDone             := 1;
+    EccStatus           := ECC_CORR;
+    CorrBits            := CorrBits + 1;
+    *BitCntLog[PageIdx] := CorrBits;
+    *EccTrace[0]        := MARK_ECC_DONE
+  };
+  handler 1 {
+    EccFatal            := 1;
+    EccStatus           := ECC_UNCORR;
+    ReadError           := ERR_UNCORR;
+    FatalCount          := FatalCount + 1;
+    *ErrLog[FatalCount] := ERR_UNCORR;
+    *EccTrace[1]        := MARK_ECC_FATAL
+  };
+  handler 2 {
+    EccArmed              := 0;
+    TimeoutCnt            := TimeoutCnt + 1;
+    ReadError             := ERR_TIMEOUT;
+    *RetryLog[TimeoutCnt] := ERR_TIMEOUT;
+    *EccTrace[2]          := MARK_TIMEOUT
+  };
+  handler 3 {
+    ChannelRdy   := CH_RESET;
+    EccArmed     := 0;
+    EccDone      := 0;
+    EccStatus    := ECC_IDLE;
+    PlaneId      := 0;
+    *EccTrace[3] := MARK_CH_RESET
+  }
+}
+
+main {
+  // Phase 1: preflight — reset plane map and verify channel is ready
+  while PlaneId < MAX_PLANES do (
+    *PlaneMap[PlaneId] := 0;
+    *EccTrace[PlaneId] := ECC_IDLE;
+    PlaneId            := PlaneId + 1
+  );
+  PlaneId := 0;
+
+  *EccTrace[4]  := EccArmed;
+  *EccTrace[5]  := EccStatus;
+  *EccTrace[6]  := PageIdx;
+  *EccTrace[7]  := ChannelRdy;
+  *EccTrace[8]  := RetryCnt;
+  *EccTrace[9]  := ReadError;
+  *EccTrace[10] := TimeoutCnt;
+  *EccTrace[11] := FatalCount;
+
+  if ChannelRdy = CH_FAULT
+  then (
+    ChannelRdy    := CH_RESET;
+    EccArmed      := 0;
+    *EccTrace[12] := CH_RESET
+  )
+  else (
+    if ChannelRdy = CH_RESET
+    then (
+      ChannelRdy    := CH_READY;
+      *EccTrace[12] := CH_READY
+    )
+    else (
+      *EccTrace[12] := ChannelRdy
+    )
+  );
+
+  *ResultBuf[0] := TOTAL_PAGES;
+  *ResultBuf[1] := MAX_RETRY;
+
+  // Phase 2: per-page ECC correction loop
+  while PageIdx < TOTAL_PAGES do (
+    *EccTrace[13] := PageIdx;
+    *EccTrace[14] := EccArmed;
+    *EccTrace[15] := EccStatus;
+    *EccTrace[16] := CorrBits;
+    *EccTrace[17] := TimeoutCnt;
+
+    if ChannelRdy = CH_FAULT
+    then (
+      ChannelRdy    := CH_RESET;
+      EccArmed      := 0;
+      *EccTrace[18] := CH_RESET;
+      *EccTrace[19] := PageIdx
+    )
+    else (
+      if ChannelRdy = CH_RESET
+      then (
+        ChannelRdy    := CH_READY;
+        EccArmed      := 1;
+        EccStatus     := ECC_ARMED;
+        *EccTrace[18] := CH_READY;
+        *EccTrace[19] := EccArmed
+      )
+      else (
+        *EccTrace[18] := ChannelRdy;
+        *EccTrace[19] := EccArmed
+      )
+    );
+
+    while EccArmed = 1 do (
+      // [FIX-1] Disable interrupts so handler 3 cannot clear EccArmed between
+      // the while-condition check and the EccArmed re-read in the trace below.
+      disable;
+      *EccTrace[20] := PageIdx;
+      *EccTrace[21] := TimeoutCnt;
+
+      // [FIX-1 BODY] EccArmed is safe — no interrupt can clear it here
+      *EccTrace[22] := EccArmed;
+      *EccTrace[23] := EccStatus;
+
+      (if EccDone = 1
+      then (
+        enable;
+        *PageStatus[PageIdx] := ECC_CORR;
+        *CorrLog[PageIdx]    := CorrBits;
+        EccDone              := 0;
+        EccArmed             := 0;
+        *EccTrace[24]        := MARK_ECC_DONE;
+        *EccTrace[25]        := CorrBits
+      )
+      else (
+        if TimeoutCnt > MAX_TIMEOUT
+        then (
+          enable;
+          EccArmed      := 0;
+          ReadError     := ERR_TIMEOUT;
+          *EccTrace[24] := MARK_TIMEOUT;
+          *EccTrace[25] := TimeoutCnt
+        )
+        else (
+          if EccFatal = 1
+          then (
+            enable;
+            EccArmed      := 0;
+            *EccTrace[24] := MARK_ECC_FATAL;
+            *EccTrace[25] := EccStatus
+          )
+          else (
+            *EccTrace[24] := EccArmed;
+            enable;
+            *EccTrace[25] := EccStatus
+          )
+        )
+      ))
+    );
+
+    *EccTrace[26] := EccStatus;
+    *EccTrace[27] := EccDone;
+    *EccTrace[28] := FatalCount;
+    *EccTrace[29] := RetryCnt;
+
+    // [FIX-2] Disable interrupts so handler 1 cannot change EccStatus between
+    // the condition check and the PlaneMap index write in the then-branch.
+    disable;
+    (if EccStatus = ECC_CORR
+    then (
+      *PageStatus[PageIdx] := ECC_CORR;
+
+      // [FIX-2 BODY] EccStatus is safe — guaranteed to still be ECC_CORR (=2)
+      *PlaneMap[EccStatus] := PageIdx;
+      *BitCntLog[PageIdx]  := CorrBits;
+      *EccTrace[30]        := EccStatus;
+      enable;
+      *EccTrace[31]        := CorrBits;
+      *EccTrace[32]        := PageIdx;
+
+      if PlaneId < MAX_PLANES
+      then (
+        PlaneId       := PlaneId + 1;
+        *EccTrace[33] := PlaneId
+      )
+      else (
+        PlaneId       := 0;
+        *EccTrace[33] := PlaneId
+      );
+
+      DonePages := DonePages + 1;
+      RetryCnt  := 0;
+      PageIdx   := PageIdx + 1;
+      EccArmed  := 1;
+      EccStatus := ECC_ARMED;
+      EccFatal  := 0;
+      *EccTrace[34] := DonePages;
+      *EccTrace[35] := PageIdx
+    )
+    else (
+      if EccStatus = ECC_UNCORR
+      then (
+        enable;
+        *PageStatus[PageIdx] := ECC_UNCORR;
+        *EccTrace[30]        := MARK_ECC_FATAL;
+        *EccTrace[31]        := FatalCount;
+        ReadError            := ERR_UNCORR;
+
+        if RetryCnt < MAX_RETRY
+        then (
+          RetryCnt   := RetryCnt + 1;
+          TotalRetry := TotalRetry + 1;
+          EccArmed   := 1;
+          EccStatus  := ECC_ARMED;
+          EccDone    := 0;
+          EccFatal   := 0;
+          *RetryLog[RetryCnt] := PageIdx;
+          *EccTrace[32]       := MARK_ECC_RETRY;
+          *EccTrace[33]       := RetryCnt;
+          *EccTrace[34]       := PageIdx;
+          *EccTrace[35]       := TotalRetry
+        )
+        else (
+          PageIdx   := PageIdx + 1;
+          RetryCnt  := 0;
+          *EccTrace[32] := ERR_UNCORR;
+          *EccTrace[33] := PageIdx;
+          *EccTrace[34] := FatalCount;
+          *EccTrace[35] := TotalRetry
+        )
+      )
+      else (
+        if EccStatus = ECC_IDLE
+        then (
+          enable;
+          EccArmed      := 1;
+          EccStatus     := ECC_ARMED;
+          *EccTrace[30] := ECC_IDLE;
+          *EccTrace[31] := PageIdx;
+          *EccTrace[32] := EccArmed;
+          *EccTrace[33] := 0;
+          *EccTrace[34] := 0;
+          *EccTrace[35] := 0
+        )
+        else (
+          *EccTrace[30] := EccStatus;
+          enable;
+          *EccTrace[31] := PageIdx;
+          *EccTrace[32] := 0;
+          *EccTrace[33] := 0;
+          *EccTrace[34] := 0;
+          *EccTrace[35] := 0
+        )
+      )
+    ))
+  );
+
+  // Phase 3: plane map verification scan
+  PlaneId := 0;
+  while PlaneId < MAX_PLANES do (
+    *EccTrace[36] := PlaneId;
+    *EccTrace[37] := *PlaneMap[PlaneId];
+
+    if *PlaneMap[PlaneId] = 0
+    then (
+      *EccTrace[38] := ECC_IDLE;
+      *EccTrace[39] := PlaneId
+    )
+    else (
+      *EccTrace[38] := ECC_CORR;
+      *EccTrace[39] := *PlaneMap[PlaneId]
+    );
+
+    PlaneId       := PlaneId + 1;
+    *EccTrace[40] := PlaneId
+  );
+
+  // Phase 4: timeout and retry log summary
+  *EccTrace[41] := DonePages;
+  *EccTrace[42] := FatalCount;
+  *EccTrace[43] := TotalRetry;
+  *EccTrace[44] := TimeoutCnt;
+  *EccTrace[45] := CorrBits;
+
+  if TimeoutCnt > 0
+  then (
+    *ResultBuf[2] := TimeoutCnt;
+    *EccTrace[46] := MARK_TIMEOUT
+  )
+  else (
+    *ResultBuf[2] := 0;
+    *EccTrace[46] := 0
+  );
+
+  if ReadError = ERR_NONE
+  then (
+    *ResultBuf[3] := 0;
+    *ResultBuf[4] := DonePages;
+    *ResultBuf[5] := CorrBits;
+    *EccTrace[47] := MARK_ECC_DONE
+  )
+  else (
+    *ResultBuf[3] := 1;
+    *ResultBuf[4] := FatalCount;
+
+    if ReadError = ERR_UNCORR
+    then (
+      *ResultBuf[5] := ERR_UNCORR;
+      *EccTrace[47] := MARK_ECC_FATAL
+    )
+    else (
+      if ReadError = ERR_TIMEOUT
+      then (
+        *ResultBuf[5] := ERR_TIMEOUT;
+        *EccTrace[47] := MARK_TIMEOUT
+      )
+      else (
+        *ResultBuf[5] := ReadError;
+        *EccTrace[47] := ReadError
+      )
+    )
+  );
+
+  *ResultBuf[6] := TotalRetry;
+  *ResultBuf[7] := DonePages;
+  *EccTrace[48] := TotalRetry;
+  *EccTrace[49] := DonePages
+}

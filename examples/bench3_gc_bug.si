@@ -1,0 +1,350 @@
+// Benchmark 3: Garbage Collection Block Selection — BUGGY VERSION
+// SSD FW HIL simulation: GC victim selection, erase, and valid-page copy.
+//
+// handler 0 — ERASE_DONE   : marks victim free, advances GcRp, increments ErasedBlocks
+// handler 1 — WEAR_UPDATE  : increments VictimBlock and WearLevel
+// handler 2 — BAD_BLOCK    : sets VictimState := BLOCK_BAD, clears GcArmed
+// handler 3 — HOST_PREEMPT : clears GcArmed, sets GcState := GC_ABORTED
+
+init {
+  BLOCK_FREE  := 0;
+  BLOCK_VALID := 1;
+  BLOCK_DIRTY := 2;
+  BLOCK_BAD   := 3;
+  BLOCK_ERASE := 4;
+
+  GC_IDLE    := 0;
+  GC_SELECT  := 1;
+  GC_ERASE   := 2;
+  GC_COPY    := 3;
+  GC_DONE    := 4;
+  GC_ABORTED := 5;
+
+  TOTAL_BLOCKS := 16;
+  MAX_VALID_PG := 64;
+  MAX_WEAR_DIFF := 100;
+  MAX_RETRY    := 3;
+  MAX_BAD      := 4;
+
+  ERR_NONE  := 0;
+  ERR_ERASE := 1;
+  ERR_COPY  := 2;
+  ERR_BAD   := 3;
+  ERR_ABORT := 4;
+
+  MARK_GC_START := 10;
+  MARK_GC_DONE  := 20;
+  MARK_GC_RETRY := 30;
+  MARK_GC_BAD   := 40;
+  MARK_GC_ABORT := 50;
+  MARK_WEAR     := 60;
+
+  GcArmed      := 1;
+  GcDone       := 0;
+  GcState      := GC_SELECT;
+  GcWp         := 0;
+  GcRp         := 0;
+  GcDepth      := 0;
+  VictimBlock  := 0;
+  VictimState  := BLOCK_DIRTY;
+  WearLevel    := 0;
+  ValidPages   := 0;
+  BadCount     := 0;
+  RetryCnt     := 0;
+  ErasedBlocks := 0;
+  CopiedPages  := 0;
+  GcError      := ERR_NONE;
+  TotalRetry   := 0;
+
+  BlockMap  := malloc(4, 0);
+  WearLog   := malloc(16, 0);
+  GcTrace   := malloc(64, 0);
+  BadList   := malloc(4, 0);
+  ValidMap  := malloc(16, 0);
+  EraseLog  := malloc(8, 0);
+  RetryLog  := malloc(8, 0);
+  ResultBuf := malloc(8, 0);
+
+  handler 0 {
+    *EraseLog[GcRp] := VictimBlock;
+    GcDone          := 1;
+    GcRp            := GcRp + 1;
+    GcDepth         := GcDepth - 1;
+    ErasedBlocks    := ErasedBlocks + 1;
+    GcState         := GC_COPY;
+    *GcTrace[0]     := MARK_GC_DONE
+  };
+  handler 1 {
+    VictimBlock           := VictimBlock + 1;
+    WearLevel             := WearLevel + 1;
+    *WearLog[VictimBlock] := WearLevel;
+    *GcTrace[1]           := MARK_WEAR
+  };
+  handler 2 {
+    VictimState        := BLOCK_BAD;
+    GcArmed            := 0;
+    GcError            := ERR_BAD;
+    BadCount           := BadCount + 1;
+    *BadList[BadCount] := VictimBlock;
+    *GcTrace[2]        := MARK_GC_BAD
+  };
+  handler 3 {
+    GcArmed     := 0;
+    GcState     := GC_ABORTED;
+    *GcTrace[3] := MARK_GC_ABORT
+  }
+}
+
+main {
+  // Phase 1: wear log preflight — clear all entries before GC pass
+  while WearLevel < TOTAL_BLOCKS do (
+    *WearLog[WearLevel] := 0;
+    *ValidMap[WearLevel] := 0;
+    WearLevel           := WearLevel + 1
+  );
+  WearLevel := 0;
+
+  *GcTrace[4]   := GcArmed;
+  *GcTrace[5]   := VictimBlock;
+  *GcTrace[6]   := VictimState;
+  *GcTrace[7]   := GcState;
+  *GcTrace[8]   := WearLevel;
+  *GcTrace[9]   := ErasedBlocks;
+  *GcTrace[10]  := BadCount;
+  *GcTrace[11]  := GcError;
+  *ResultBuf[0] := TOTAL_BLOCKS;
+  *ResultBuf[1] := MAX_RETRY;
+
+  // Phase 2: per-block GC outer loop
+  while VictimBlock < TOTAL_BLOCKS do (
+    *GcTrace[12] := VictimBlock;
+    *GcTrace[13] := GcState;
+    *GcTrace[14] := GcArmed;
+    *GcTrace[15] := WearLevel;
+
+    if GcState = GC_ABORTED
+    then (
+      GcState     := GC_SELECT;
+      GcArmed     := 1;
+      *GcTrace[16] := GC_SELECT;
+      *GcTrace[17] := GcArmed
+    )
+    else (
+      if GcState = GC_DONE
+      then (
+        GcState      := GC_SELECT;
+        ErasedBlocks := ErasedBlocks + 1;
+        *GcTrace[16] := GC_SELECT;
+        *GcTrace[17] := ErasedBlocks
+      )
+      else (
+        *GcTrace[16] := GcState;
+        *GcTrace[17] := GcArmed
+      )
+    );
+
+    // [TARGET-1] GcArmed checked as while-condition; handler 2 or 3 can clear
+    // it between the check and the loop body where GcArmed is re-read.
+    while GcArmed = 1 do (
+      *GcTrace[18] := VictimBlock;
+      *GcTrace[19] := GcState;
+      *GcTrace[20] := GcError;
+
+      // [TARGET-1 BODY] GcArmed re-read here — handler 2 or 3 may have cleared it
+      *GcTrace[21] := GcArmed;
+      *GcTrace[22] := RetryCnt;
+
+      if GcDone = 1
+      then (
+        GcArmed      := 0;
+        GcDone       := 0;
+        GcState      := GC_COPY;
+        *GcTrace[23] := MARK_GC_DONE;
+        *GcTrace[24] := ErasedBlocks
+      )
+      else (
+        if GcError = ERR_BAD
+        then (
+          GcArmed      := 0;
+          *GcTrace[23] := MARK_GC_BAD;
+          *GcTrace[24] := BadCount
+        )
+        else (
+          if RetryCnt > MAX_RETRY
+          then (
+            GcArmed      := 0;
+            GcState      := GC_ABORTED;
+            *GcTrace[23] := MARK_GC_ABORT;
+            *GcTrace[24] := RetryCnt
+          )
+          else (
+            RetryCnt     := RetryCnt + 1;
+            *GcTrace[23] := GcArmed;
+            *GcTrace[24] := RetryCnt
+          )
+        )
+      )
+    );
+
+    *GcTrace[25] := VictimState;
+    *GcTrace[26] := GcError;
+    *GcTrace[27] := BadCount;
+    *GcTrace[28] := RetryCnt;
+    RetryCnt := 0;
+
+    // [TARGET-2] VictimState checked here; handler 2 can change it to BLOCK_BAD
+    // between this check and the BlockMap index write in the then-branch.
+    if VictimState = BLOCK_DIRTY
+    then (
+      *WearLog[VictimBlock] := WearLevel;
+
+      // [TARGET-2 BODY] VictimState re-read as index — may now be BLOCK_BAD (=3)
+      *BlockMap[VictimState] := VictimBlock;
+      *ValidMap[VictimBlock] := ValidPages;
+      *GcTrace[29]           := VictimState;
+      *GcTrace[30]           := WearLevel;
+      *GcTrace[31]           := ValidPages;
+
+      if WearLevel < MAX_WEAR_DIFF
+      then (
+        WearLevel     := WearLevel + 1;
+        *GcTrace[32]  := WearLevel
+      )
+      else (
+        WearLevel     := 0;
+        *GcTrace[32]  := 0
+      );
+
+      ErasedBlocks := ErasedBlocks + 1;
+      GcDepth      := GcDepth + 1;
+      VictimBlock  := VictimBlock + 1;
+      VictimState  := BLOCK_DIRTY;
+      GcArmed      := 1;
+      GcState      := GC_ERASE;
+      GcError      := ERR_NONE;
+      *GcTrace[33] := ErasedBlocks;
+      *GcTrace[34] := VictimBlock;
+      *GcTrace[35] := GcDepth
+    )
+    else (
+      if VictimState = BLOCK_BAD
+      then (
+        *BadList[BadCount] := VictimBlock;
+        *GcTrace[29]       := MARK_GC_BAD;
+        *GcTrace[30]       := BadCount;
+        GcError            := ERR_BAD;
+
+        if TotalRetry < MAX_RETRY
+        then (
+          TotalRetry  := TotalRetry + 1;
+          GcArmed     := 1;
+          VictimState := BLOCK_DIRTY;
+          GcError     := ERR_NONE;
+          *RetryLog[TotalRetry] := VictimBlock;
+          *GcTrace[31]          := MARK_GC_RETRY;
+          *GcTrace[32]          := TotalRetry;
+          *GcTrace[33]          := VictimBlock;
+          *GcTrace[34]          := GcError;
+          *GcTrace[35]          := GcArmed
+        )
+        else (
+          VictimBlock  := VictimBlock + 1;
+          GcArmed      := 1;
+          *GcTrace[31] := ERR_BAD;
+          *GcTrace[32] := VictimBlock;
+          *GcTrace[33] := TotalRetry;
+          *GcTrace[34] := BadCount;
+          *GcTrace[35] := GcArmed
+        )
+      )
+      else (
+        if VictimState = BLOCK_ERASE
+        then (
+          VictimState  := BLOCK_FREE;
+          GcArmed      := 1;
+          *GcTrace[29] := BLOCK_FREE;
+          *GcTrace[30] := VictimBlock;
+          *GcTrace[31] := GcArmed;
+          *GcTrace[32] := 0;
+          *GcTrace[33] := 0;
+          *GcTrace[34] := 0;
+          *GcTrace[35] := 0
+        )
+        else (
+          VictimBlock  := VictimBlock + 1;
+          GcArmed      := 1;
+          *GcTrace[29] := VictimState;
+          *GcTrace[30] := VictimBlock;
+          *GcTrace[31] := 0;
+          *GcTrace[32] := 0;
+          *GcTrace[33] := 0;
+          *GcTrace[34] := 0;
+          *GcTrace[35] := 0
+        )
+      )
+    )
+  );
+
+  // Phase 3: bad block list scan and consolidation
+  BadCount := 0;
+  while BadCount < MAX_BAD do (
+    *GcTrace[36] := BadCount;
+    *GcTrace[37] := *BadList[BadCount];
+
+    if *BadList[BadCount] > 0
+    then (
+      *GcTrace[38] := MARK_GC_BAD;
+      *GcTrace[39] := *BadList[BadCount]
+    )
+    else (
+      *GcTrace[38] := 0;
+      *GcTrace[39] := BadCount
+    );
+
+    BadCount      := BadCount + 1;
+    *GcTrace[40]  := BadCount
+  );
+
+  // Phase 4: GC result summary
+  *GcTrace[41] := ErasedBlocks;
+  *GcTrace[42] := BadCount;
+  *GcTrace[43] := TotalRetry;
+  *GcTrace[44] := CopiedPages;
+  *GcTrace[45] := GcError;
+  *GcTrace[46] := WearLevel;
+
+  if GcError = ERR_NONE
+  then (
+    *ResultBuf[2] := 0;
+    *ResultBuf[3] := ErasedBlocks;
+    *ResultBuf[4] := CopiedPages;
+    *GcTrace[47]  := MARK_GC_DONE
+  )
+  else (
+    *ResultBuf[2] := 1;
+    *ResultBuf[3] := BadCount;
+
+    if GcError = ERR_BAD
+    then (
+      *ResultBuf[4] := ERR_BAD;
+      *GcTrace[47]  := MARK_GC_BAD
+    )
+    else (
+      if GcError = ERR_ABORT
+      then (
+        *ResultBuf[4] := ERR_ABORT;
+        *GcTrace[47]  := MARK_GC_ABORT
+      )
+      else (
+        *ResultBuf[4] := GcError;
+        *GcTrace[47]  := GcError
+      )
+    )
+  );
+
+  *ResultBuf[5] := TotalRetry;
+  *ResultBuf[6] := ErasedBlocks;
+  *ResultBuf[7] := BadCount;
+  *GcTrace[48]  := TotalRetry;
+  *GcTrace[49]  := ErasedBlocks
+}

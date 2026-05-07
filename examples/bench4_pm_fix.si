@@ -1,0 +1,336 @@
+// Benchmark 4: Power Management and Thermal Throttling — FIXED VERSION
+// SSD FW HIL simulation: thermal-driven throttling and power state transitions.
+//
+// handler 0 — TEMP_ALERT    : increments ThermalLevel, sets ThrottleArmed := 1
+// handler 1 — THROTTLE_REQ  : increments ThrottleLevel
+// handler 2 — CMD_COMPLETE  : decrements ActiveCmds
+// handler 3 — POWER_REQUEST : increments PwrState
+
+init {
+  TEMP_NORMAL := 0;
+  TEMP_WARN   := 1;
+  TEMP_HIGH   := 2;
+  TEMP_CRIT   := 3;
+
+  PS_ACTIVE  := 0;
+  PS_IDLE    := 1;
+  PS_STANDBY := 2;
+  PS_SLEEP   := 3;
+  PS_OFF     := 4;
+
+  TH_NONE    := 0;
+  TH_LIGHT   := 1;
+  TH_MEDIUM  := 2;
+  TH_HEAVY   := 3;
+  TH_SUSPEND := 4;
+
+  ERR_NONE      := 0;
+  ERR_OVERHEAT  := 1;
+  ERR_PWR_FAULT := 2;
+  ERR_THROTTLE  := 3;
+
+  MARK_TEMP_WARN := 10;
+  MARK_TEMP_HIGH := 20;
+  MARK_TEMP_CRIT := 30;
+  MARK_PWR_CHG   := 40;
+  MARK_THROTTLE  := 50;
+  MARK_RESUME    := 60;
+
+  MAX_ACTIVE_CMDS := 32;
+  MAX_THROTTLE    := 4;
+  TOTAL_PHASES    := 8;
+
+  ThermalLevel  := TEMP_NORMAL;
+  ThrottleLevel := TH_NONE;
+  ThrottleArmed := 0;
+  PwrState      := PS_ACTIVE;
+  ActiveCmds    := 0;
+  PwrError      := ERR_NONE;
+  ThermalError  := ERR_NONE;
+  ThrottleCnt   := 0;
+  PwrChangeCnt  := 0;
+  PhaseIdx      := 0;
+  TempPeak      := TEMP_NORMAL;
+  CmdLimitCur   := MAX_ACTIVE_CMDS;
+
+  ThermalLog  := malloc(4, 0);
+  ThrottleMap := malloc(4, 0);
+  PwrLog      := malloc(8, 0);
+  CmdLog      := malloc(8, 0);
+  PmTrace     := malloc(64, 0);
+  ErrLog      := malloc(8, 0);
+  ResultBuf   := malloc(8, 0);
+  PhaseLog    := malloc(8, 0);
+
+  handler 0 {
+    ThermalLevel          := ThermalLevel + 1;
+    ThrottleArmed         := 1;
+    *ThermalLog[ThermalLevel] := ThermalLevel;
+    if ThermalLevel > TEMP_WARN
+    then ThrottleLevel := TH_MEDIUM
+    else ThrottleLevel := TH_LIGHT;
+    *PmTrace[0] := MARK_TEMP_WARN
+  };
+  handler 1 {
+    ThrottleLevel         := ThrottleLevel + 1;
+    ThrottleCnt           := ThrottleCnt + 1;
+    *ThrottleMap[ThrottleLevel] := ThrottleCnt;
+    *PmTrace[1]           := MARK_THROTTLE
+  };
+  handler 2 {
+    ActiveCmds            := ActiveCmds - 1;
+    *CmdLog[ActiveCmds]   := 0;
+    *PmTrace[2]           := ActiveCmds
+  };
+  handler 3 {
+    PwrState              := PwrState + 1;
+    PwrChangeCnt          := PwrChangeCnt + 1;
+    *PwrLog[PwrState]     := PwrChangeCnt;
+    *PmTrace[3]           := MARK_PWR_CHG
+  }
+}
+
+main {
+  // Phase 1: throttle map preflight — clear all entries
+  while ThrottleLevel < MAX_THROTTLE do (
+    *ThrottleMap[ThrottleLevel] := 0;
+    *PmTrace[ThrottleLevel]     := TH_NONE;
+    ThrottleLevel               := ThrottleLevel + 1
+  );
+  ThrottleLevel := TH_NONE;
+
+  *PmTrace[4]   := ThermalLevel;
+  *PmTrace[5]   := ThrottleLevel;
+  *PmTrace[6]   := PwrState;
+  *PmTrace[7]   := ActiveCmds;
+  *PmTrace[8]   := ThrottleCnt;
+  *PmTrace[9]   := PwrChangeCnt;
+  *PmTrace[10]  := TempPeak;
+  *PmTrace[11]  := CmdLimitCur;
+  *ResultBuf[0] := MAX_ACTIVE_CMDS;
+  *ResultBuf[1] := MAX_THROTTLE;
+
+  // Phase 2: per-phase thermal check and throttle management loop
+  while PhaseIdx < TOTAL_PHASES do (
+    *PmTrace[12] := PhaseIdx;
+    *PmTrace[13] := ThermalLevel;
+    *PmTrace[14] := ThrottleArmed;
+    *PmTrace[15] := ActiveCmds;
+
+    if ActiveCmds > CmdLimitCur
+    then (
+      ActiveCmds    := CmdLimitCur;
+      *PmTrace[16]  := CmdLimitCur;
+      *PmTrace[17]  := ActiveCmds
+    )
+    else (
+      *PmTrace[16] := ActiveCmds;
+      *PmTrace[17] := CmdLimitCur
+    );
+
+    // [FIX-1] Disable interrupts so handler 0 cannot change ThermalLevel between
+    // the condition check and the ThermalLog/ThrottleMap index writes.
+    disable;
+    (if ThermalLevel > TEMP_WARN
+    then (
+      // [FIX-1 BODY] ThermalLevel is safe — no interrupt can change it here
+      *ThermalLog[ThermalLevel]  := PhaseIdx;
+      *ThrottleMap[ThermalLevel] := ThrottleLevel;
+      *PmTrace[18]               := ThermalLevel;
+      *PmTrace[19]               := ThrottleLevel;
+
+      if ThermalLevel > TEMP_HIGH
+      then (
+        ThermalError  := ERR_OVERHEAT;
+        ThrottleLevel := TH_HEAVY;
+        CmdLimitCur   := 4;
+        *ErrLog[0]    := ERR_OVERHEAT;
+        *PmTrace[20]  := MARK_TEMP_CRIT;
+        *PmTrace[21]  := ThermalLevel
+      )
+      else (
+        ThrottleLevel := TH_MEDIUM;
+        CmdLimitCur   := 16;
+        *PmTrace[20]  := MARK_TEMP_HIGH;
+        *PmTrace[21]  := ThermalLevel
+      );
+
+      if TempPeak < ThermalLevel
+      then (
+        TempPeak      := ThermalLevel;
+        *PmTrace[22]  := TempPeak
+      )
+      else (
+        *PmTrace[22] := TempPeak
+      );
+      enable;
+
+      ThrottleArmed := 0;
+      ThrottleCnt   := ThrottleCnt + 1;
+      PhaseIdx      := PhaseIdx + 1;
+      *PmTrace[23]  := TempPeak;
+      *PmTrace[24]  := ThrottleCnt;
+      *PmTrace[25]  := PhaseIdx
+    )
+    else (
+      // [FIX-1 ELSE] ThermalLevel is safe — guaranteed to be <= TEMP_WARN
+      *ThermalLog[ThermalLevel] := PhaseIdx;
+      *PmTrace[18]              := ThermalLevel;
+      *PmTrace[19]              := ThrottleLevel;
+      enable;
+
+      ThrottleLevel := TH_NONE;
+      CmdLimitCur   := MAX_ACTIVE_CMDS;
+      ThrottleArmed := 0;
+      PhaseIdx      := PhaseIdx + 1;
+      *PmTrace[20]  := MARK_RESUME;
+      *PmTrace[21]  := ThermalLevel;
+      *PmTrace[22]  := PhaseIdx;
+      *PmTrace[23]  := CmdLimitCur;
+      *PmTrace[24]  := ThrottleLevel;
+      *PmTrace[25]  := TempPeak
+    ))
+  );
+
+  *PmTrace[26] := ThermalLevel;
+  *PmTrace[27] := ThrottleLevel;
+  *PmTrace[28] := TempPeak;
+  *PmTrace[29] := ThrottleCnt;
+
+  // Phase 3: power state monitoring loop
+  *PmTrace[30] := PwrState;
+  *PmTrace[31] := ActiveCmds;
+
+  while PwrState = PS_ACTIVE do (
+    *PmTrace[32] := ActiveCmds;
+    *PmTrace[33] := ThrottleArmed;
+    *PmTrace[34] := CmdLimitCur;
+
+    // [FIX-2] Disable interrupts so handler 3 cannot advance PwrState between
+    // the while-condition check and the PwrLog/PhaseLog writes below.
+    disable;
+    // [FIX-2 BODY] PwrState is safe — guaranteed to still be PS_ACTIVE
+    *PwrLog[PwrState]   := PhaseIdx;
+    *PhaseLog[PhaseIdx] := PwrState;
+    *PmTrace[35]        := PwrState;
+    enable;
+    *PmTrace[36]        := PwrChangeCnt;
+
+    (if ActiveCmds > CmdLimitCur
+    then (
+      ActiveCmds    := CmdLimitCur;
+      *CmdLog[0]    := CmdLimitCur;
+      *PmTrace[37]  := CmdLimitCur;
+      *PmTrace[38]  := ActiveCmds
+    )
+    else (
+      *CmdLog[0]   := ActiveCmds;
+      *PmTrace[37] := ActiveCmds;
+      *PmTrace[38] := CmdLimitCur
+    ));
+
+    (if ThrottleArmed = 1
+    then (
+      if ThrottleLevel < MAX_THROTTLE
+      then ThrottleLevel := ThrottleLevel + 1
+      else ThrottleLevel := TH_NONE;
+      ThrottleArmed := 0;
+      ThrottleCnt   := ThrottleCnt + 1;
+      *PmTrace[39]  := ThrottleLevel;
+      *PmTrace[40]  := ThrottleCnt
+    )
+    else (
+      *PmTrace[39] := ThrottleLevel;
+      *PmTrace[40] := ThrottleCnt
+    ));
+
+    (if ThermalLevel > TEMP_HIGH
+    then (
+      PwrState      := PS_IDLE;
+      *PmTrace[41]  := PS_IDLE;
+      *PmTrace[42]  := ThermalLevel
+    )
+    else (
+      *PmTrace[41] := PwrState;
+      *PmTrace[42] := ThermalLevel
+    ))
+  );
+
+  // Phase 4: standby and sleep state handling
+  *PmTrace[43] := PwrState;
+  *PmTrace[44] := PwrChangeCnt;
+
+  if PwrState = PS_IDLE
+  then (
+    *PwrLog[1]   := PwrChangeCnt;
+    *PmTrace[45] := PS_IDLE;
+    *PmTrace[46] := ActiveCmds;
+
+    if ActiveCmds = 0
+    then (
+      PwrState     := PS_STANDBY;
+      *PwrLog[2]   := PwrChangeCnt;
+      *PmTrace[47] := PS_STANDBY
+    )
+    else (
+      *PmTrace[47] := PS_IDLE
+    )
+  )
+  else (
+    if PwrState = PS_STANDBY
+    then (
+      *PwrLog[2]   := PwrChangeCnt;
+      *PmTrace[45] := PS_STANDBY;
+      *PmTrace[46] := ThrottleLevel;
+      *PmTrace[47] := PwrChangeCnt
+    )
+    else (
+      *PmTrace[45] := PwrState;
+      *PmTrace[46] := PwrChangeCnt;
+      *PmTrace[47] := ThermalLevel
+    )
+  );
+
+  // Phase 5: final result reporting
+  *PmTrace[48] := TempPeak;
+  *PmTrace[49] := ThrottleCnt;
+  *PmTrace[50] := PwrChangeCnt;
+  *PmTrace[51] := PwrState;
+
+  if ThermalError = ERR_NONE
+  then (
+    *ResultBuf[2] := 0;
+    *ResultBuf[3] := TempPeak;
+    *ResultBuf[4] := ThrottleCnt
+  )
+  else (
+    *ResultBuf[2] := 1;
+    *ResultBuf[3] := ThermalError;
+
+    if ThermalError = ERR_OVERHEAT
+    then (
+      *ResultBuf[4] := TempPeak;
+      *PmTrace[52]  := MARK_TEMP_CRIT
+    )
+    else (
+      *ResultBuf[4] := ThrottleLevel;
+      *PmTrace[52]  := MARK_THROTTLE
+    )
+  );
+
+  if PwrError = ERR_NONE
+  then (
+    *ResultBuf[5] := PwrState;
+    *ResultBuf[6] := PwrChangeCnt;
+    *PmTrace[53]  := MARK_PWR_CHG
+  )
+  else (
+    *ResultBuf[5] := ERR_PWR_FAULT;
+    *ResultBuf[6] := PwrChangeCnt;
+    *PmTrace[53]  := ERR_PWR_FAULT
+  );
+
+  *ResultBuf[7] := ActiveCmds;
+  *PmTrace[54]  := ActiveCmds;
+  *PmTrace[55]  := CmdLimitCur
+}

@@ -570,11 +570,6 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let r2, c2 = self c1 e2 in
         match bop with
         | Eq ->
-            print_endline
-              ("[Equal Check] "
-              ^ Abs_Val.string_of_t r1.avalue
-              ^ " vs "
-              ^ Abs_Val.string_of_t r2.avalue);
             ( {
                 avalue = abs_int (equal_check r1.avalue r2.avalue);
                 app = PPSet.empty;
@@ -638,7 +633,6 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     | If (e1, e2, e3) ->
         let r1, c1 = self c e1 in
         let v1 = proj_int r1.avalue in
-        print_endline ("[If Condition] " ^ Itv.string_of_t v1);
         if v1 = Itv.Bool.true_ then
           let r2, c2 = self c1 e2 in
           (r2, c2)
@@ -648,10 +642,6 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         else
           let c1_true = { c1 with amem = refine_amem e1 true c1.amem } in
           let c1_false = { c1 with amem = refine_amem e1 false c1.amem } in
-          print_endline
-            ("[Refined True Branch] " ^ Abs_Mem.string_of_t c1_true.amem);
-          print_endline
-            ("[Refined False Branch] " ^ Abs_Mem.string_of_t c1_false.amem);
           let r2, c2 = self c1_true e2 in
           let r3, c3 = self c1_false e3 in
           join_out (r2, c2) (r3, c3)
@@ -751,11 +741,7 @@ let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
 
 let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let c_init = init_confa pgm in
-  print_endline "=== analyzing... ===";
   let _, c_final = evalA c_init pgm.main in
-  print_endline "=== Error Messages ===";
-  print_endline (ErrorSet.string_of_t c_final.errs);
-  print_endline "=== Final Abstract Memory ===";
   filter_main_sem c_final.asem
 
 let abs_analyze (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
