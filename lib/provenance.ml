@@ -157,11 +157,54 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
           { site; children } :: acc)
       pps []
 
+(* ===== Deduplication ===== *)
+
+(* Two Error.t records are the "same logical bug" when they refer to the same
+   program point, the same access kind, and the same base array/location.
+   Differences in OOB intervals or provenance sets arise from analysing the
+   same expression under slightly different abstract states at different
+   post-step iterations.  We merge such duplicates by taking the union of
+   their OOB intervals and provenance sets. *)
+(* Strip the interval offset from a base location so that errors at the same
+   access site (same label, same array) with different abstract indices merge
+   rather than appearing as separate entries. *)
+let base_alloc_key (b : Abs_Loc.t) : Abs_Loc.t =
+  match b with
+  | Abs_Loc.AHeapLoc { lbl; _ } ->
+      Abs_Loc.AHeapLoc { lbl; offset = Itv.bot }
+  | other -> other
+
+let merge_errors (errors : ErrorSet.t) : ErrorSet.t =
+  let tbl : (ProgramPoint.t * Error.access * Abs_Loc.t, Error.t) Hashtbl.t =
+    Hashtbl.create 16
+  in
+  ErrorSet.iter
+    (fun (e : Error.t) ->
+      let key = (e.at, e.access, base_alloc_key e.base) in
+      match Hashtbl.find_opt tbl key with
+      | None -> Hashtbl.add tbl key e
+      | Some existing ->
+          let merged =
+            {
+              existing with
+              in_itv = Itv.join existing.in_itv e.in_itv;
+              left_oob = Itv.join existing.left_oob e.left_oob;
+              right_oob = Itv.join existing.right_oob e.right_oob;
+              base_pp = PPSet.union existing.base_pp e.base_pp;
+              offset_pp = PPSet.union existing.offset_pp e.offset_pp;
+              handler_caused = existing.handler_caused || e.handler_caused;
+            }
+          in
+          Hashtbl.replace tbl key merged)
+    errors;
+  Hashtbl.fold (fun _ e acc -> ErrorSet.add e acc) tbl ErrorSet.empty
+
 (* ===== Entry point ===== *)
 
 let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
     chain list =
   let tbl = build_lbl_table pgm in
+  let errors = merge_errors errors in
   ErrorSet.fold
     (fun (e : Error.t) acc ->
       let err_lbl_opt = lookup_lbl_t tbl e.at in

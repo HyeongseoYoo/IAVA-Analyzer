@@ -9,6 +9,7 @@ let opt_analyze = ref false
 let opt_analyze_detail = ref false
 let opt_prov = ref false
 let opt_report = ref false
+let opt_summary = ref false
 
 let main () =
   Arg.parse
@@ -33,6 +34,9 @@ let main () =
       ( "-report",
         Arg.Unit (fun _ -> opt_report := true),
         "LLM bug report: provenance analysis + Claude explanation" );
+      ( "-summary",
+        Arg.Unit (fun _ -> opt_summary := true),
+        "print pre-compiled handler summaries" );
     ]
     (fun x -> src := x)
     ("Usage : " ^ Filename.basename Sys.argv.(0) ^ " [-option] [filename] ");
@@ -71,6 +75,9 @@ let main () =
      print_endline)); *)
   (if !opt_analyze_detail then
      Analyzer.(abs_def_intp pgm |> Abs_dom.Abs_Sem.string_of_t |> print_endline));
+  (if !opt_summary then
+     let _ = Analyzer.init_confa pgm in
+     ());
   (if !opt_prov || !opt_report then begin
      let asem, errs = Analyzer.abs_analyze pgm in
      let chains = Provenance.analyze errs asem pgm in
@@ -82,7 +89,7 @@ let main () =
   if
     not
       (!opt_pp || !opt_tab || !opt_tintp || !opt_dintp || !opt_analyze
-     || !opt_analyze_detail || !opt_prov || !opt_report)
+     || !opt_analyze_detail || !opt_prov || !opt_report || !opt_summary)
   then print_endline "Please provide an option! (-pp, -tab, -intp, -analyze, -prov, -report)"
 
 let () = main ()

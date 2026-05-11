@@ -14,12 +14,29 @@ type abs_conf = {
 type result = { value : Value.t; pp : ProgramPoint.t; out : Outcome.t }
 type abs_res = { avalue : Abs_Val.t; app : PPSet.t }
 
+(* A single memory-modifying effect compiled from a handler body *)
+type summary_atom = {
+  lhs : Exp.lbl_t;
+  rhs : Exp.lbl_t;
+  assign_lbl : Exp.Lbl.t;
+}
+
+(* Pre-compiled symbolic summary of a handler body *)
+type handler_summary =
+  | Compiled of summary_atom list
+  | Fallback of Exp.lbl_t
+
 exception Runtime_error of string
 
 let var_tbl : VarTbl.t ref = ref VarTbl.empty
 let iset : IidSet.t ref = ref IidSet.empty
 let handlers : HandlerStore.t ref = ref HandlerStore.empty
 let size_tbl : Itv.t LblMap.t ref = ref LblMap.empty
+let handler_summaries : handler_summary HandlerStore.IidMap.t ref =
+  ref HandlerStore.IidMap.empty
+
+(* Forward reference: will be set to post_steps_summary after it is defined *)
+let post_steps_fn : (abs_conf -> abs_conf) ref = ref (fun c -> c)
 let widen_cnt = 3
 
 let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
@@ -222,6 +239,20 @@ let widen_conf c1 c2 =
 let leq_conf c1 c2 =
   Abs_Sem.leq c1.asem c2.asem
   && Abs_Mem.leq c1.amem c2.amem
+  &&
+  match (c1.aimode, c2.aimode) with
+  | Interrupt.Disabled, Interrupt.Enabled -> true
+  | Interrupt.Disabled, Interrupt.Disabled -> true
+  | Interrupt.Enabled, Interrupt.Enabled -> true
+  | Interrupt.Enabled, Interrupt.Disabled -> false
+
+(* Convergence check for the handler post-step fixpoint.
+   Excludes asem: record_sem inside eval_no_post grows asem on every
+   iteration, so including it would prevent convergence even after amem
+   has stabilised, causing unnecessary extra iterations. *)
+let leq_conf_noasem c1 c2 =
+  Abs_Mem.leq c1.amem c2.amem
+  && ErrorSet.subset c1.errs c2.errs
   &&
   match (c1.aimode, c2.aimode) with
   | Interrupt.Disabled, Interrupt.Enabled -> true
@@ -435,37 +466,6 @@ let add_deref_oob_errors ~(at : ProgramPoint.t) ~(access : Error.access)
         in
         { c with errs = ErrorSet.add err c.errs }
 
-let post_step
-    (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
-    (c : abs_conf) : abs_conf =
-  let input_c = c in
-  let joined =
-    IidSet.fold
-      (fun iid acc ->
-        match HandlerStore.lookup !handlers iid with
-        | None -> acc
-        | Some handler_exp ->
-            let _r, c' =
-              self { input_c with aimode = Interrupt.Disabled } handler_exp
-            in
-            join_conf acc c')
-      !iset input_c
-  in
-  { joined with aimode = c.aimode }
-(* imode should not change in post step *)
-
-let post_steps
-    (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
-    (c0 : abs_conf) : abs_conf =
-  let rec iterate (i : int) (cur : abs_conf) : abs_conf =
-    let stepped = post_step self cur in
-    let joined = join_conf cur stepped in
-    if leq_conf joined cur then cur
-    else
-      let next = if i < widen_cnt then joined else widen_conf cur joined in
-      if leq_conf next cur then cur else iterate (i + 1) next
-  in
-  iterate 0 c0
 
 let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf
@@ -657,7 +657,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
             in
             (* widen condition *)
             let wconf = if i < widen_cnt then next else widen_conf input next in
-            if leq_conf wconf input then input else iterate (i + 1) wconf
+            if leq_conf_noasem wconf input then input else iterate (i + 1) wconf
           end
         in
         let output = iterate 0 c in
@@ -669,13 +669,154 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
       let c_recorded = record_sem pp c_after_eval in
       (res, c_recorded)
   | Enabled ->
-      let c_after_post = post_steps self c_after_eval in
-      let c_recorded = record_sem pp c_after_post in
-      (res, c_recorded)
+      (* Restrict handler post-steps to the expressions where they carry new
+         information, rather than firing at every AST node.
+         - Assign / Malloc : amem actually changes here; most important yield.
+         - Var             : reading a variable models the handler firing and
+                             modifying that variable between a condition check
+                             and the body that re-reads it (TOCTOU pattern).
+         Excluded: Int, Bop, Seq, If, While, Enable, Disable, Deref — for
+         pure expressions amem is unchanged so the handler effect would be
+         identical to the one already recorded at the nearest Var/Assign. *)
+      let is_yield_point =
+        match exp with Assign _ | Malloc _ | Var _ -> true | _ -> false
+      in
+      if is_yield_point then
+        let c_after_post = !post_steps_fn c_after_eval in
+        let c_recorded = record_sem pp c_after_post in
+        (res, c_recorded)
+      else
+        let c_recorded = record_sem pp c_after_eval in
+        (res, c_recorded)
 
 let rec evalA ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
     abs_res * abs_conf =
   evA evalA ~lvalue c lbl_exp
+
+(* Evaluates lbl_exp under c without ever triggering the handler post-step.
+   Forces aimode = Disabled at every recursive level so that the Enabled branch
+   of evA is never reached during summary application. *)
+let rec eval_no_post ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
+    abs_res * abs_conf =
+  evA eval_no_post ~lvalue { c with aimode = Interrupt.Disabled } lbl_exp
+
+(* Apply one atomic effect (a compiled assignment) to the abstract conf.
+   Uses eval_no_post for both the lvalue (write target) and rvalue so that
+   no handler post-step is triggered during summary application. *)
+let apply_atom (atom : summary_atom) (c : abs_conf) : abs_conf =
+  let r1, c1 = eval_no_post ~lvalue:true c atom.lhs in
+  let r2, c2 = eval_no_post c1 atom.rhs in
+  let l = proj_loc r1.avalue in
+  let pp = ProgramPoint.Label atom.assign_lbl in
+  match l with
+  | Abs_Loc.Bot -> c2
+  | _ ->
+      let amem' = Abs_Mem.write c2.amem l r2.avalue pp in
+      { c2 with amem = amem' }
+
+(* Apply a handler summary to c (which must already have aimode = Disabled).
+   Compiled: apply each atom in sequence using eval_no_post.
+   Fallback:  evaluate the handler body directly with eval_no_post — still no
+              recursive post-step, but skips the atom fast-path. *)
+let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf
+    =
+  match summary with
+  | Compiled atoms ->
+      List.fold_left (fun acc_c atom -> apply_atom atom acc_c) c atoms
+  | Fallback body ->
+      let _r, c' = eval_no_post c body in
+      c'
+
+(* One step of the handler fixpoint using precompiled summaries.
+   Each handler is evaluated with asem = bot to avoid record_sem calls inside
+   eval_no_post from inflating the main asem on every invocation.  The handler
+   body's own semantic states (small and bounded) are merged back once at the
+   end so provenance tracing can still reach handler expressions. *)
+let post_step_summary (c : abs_conf) : abs_conf =
+  let input_c = c in
+  (* Strip asem so handler-body record_sem calls don't grow it each iteration *)
+  let input_clean = { input_c with asem = Abs_Sem.bot; aimode = Interrupt.Disabled } in
+  let joined =
+    IidSet.fold
+      (fun iid acc ->
+        match HandlerStore.IidMap.find_opt iid !handler_summaries with
+        | None -> acc
+        | Some summary ->
+            let c' = apply_handler_summary summary input_clean in
+            join_conf acc c')
+      !iset { input_clean with aimode = c.aimode }
+  in
+  (* Restore aimode; merge bounded handler-body asem into the caller's asem *)
+  { joined with aimode = c.aimode; asem = Abs_Sem.join c.asem joined.asem }
+
+(* Iterate post_step_summary to a fixpoint with widening.
+   Uses leq_conf_noasem so that asem growth from record_sem calls inside
+   eval_no_post does not prevent convergence on amem. *)
+let post_steps_summary (c0 : abs_conf) : abs_conf =
+  let rec iterate (i : int) (cur : abs_conf) : abs_conf =
+    let stepped = post_step_summary cur in
+    let joined = join_conf cur stepped in
+    if leq_conf_noasem joined cur then cur
+    else
+      let next = if i < widen_cnt then joined else widen_conf cur joined in
+      if leq_conf_noasem next cur then cur else iterate (i + 1) next
+  in
+  iterate 0 c0
+
+(* Wire up the forward reference now that post_steps_summary is defined. *)
+let () = post_steps_fn := post_steps_summary
+
+let string_of_summary_atom (a : summary_atom) : string =
+  Printf.sprintf "  at [%s]  %s  :=  %s"
+    (Exp.Lbl.string_of_t a.assign_lbl)
+    (Exp.string_of_t a.lhs.exp)
+    (Exp.string_of_t a.rhs.exp)
+
+let string_of_handler_summary (iid : int) (s : handler_summary) : string =
+  match s with
+  | Compiled [] ->
+      Printf.sprintf "handler %d  →  Compiled  (no memory effects)" iid
+  | Compiled atoms ->
+      Printf.sprintf "handler %d  →  Compiled\n%s" iid
+        (String.concat "\n" (List.map string_of_summary_atom atoms))
+  | Fallback body ->
+      Printf.sprintf "handler %d  →  Fallback  (body: %s)" iid
+        (Exp.string_of_t body.exp)
+
+let print_handler_summaries () : unit =
+  print_endline "=== Handler Summaries ===";
+  HandlerStore.IidMap.iter
+    (fun iid s ->
+      print_endline (string_of_handler_summary iid s))
+    !handler_summaries;
+  print_endline "========================="
+
+(* Pre-processing: compile a handler body AST into a symbolic summary.
+   Assign nodes become atoms; sequences and if-branches are flattened.
+   Loops and malloc fall back to full no-post evaluation for soundness. *)
+let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
+  match lbl_exp.exp with
+  | Assign (lhs, rhs) ->
+      let assign_lbl = lbl_exp.lbl in
+      (match lhs.exp with
+      | Var _ | Deref _ -> Compiled [ { lhs; rhs; assign_lbl } ]
+      | _ -> Fallback lbl_exp)
+  | Seq (e1, e2) -> (
+      match (compile_handler e1, compile_handler e2) with
+      | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
+      | _ -> Fallback lbl_exp)
+  | If (_, e_then, e_else) -> (
+      (* Both branches are included as an over-approximation; only one is
+         actually taken but we do not track the condition here. *)
+      match (compile_handler e_then, compile_handler e_else) with
+      | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
+      | _ -> Fallback lbl_exp)
+  | Enable | Disable | Unit | Int _ | Var _ | Bop _ | Deref _ ->
+      (* No memory-modifying effect *)
+      Compiled []
+  | While _ | Malloc _ ->
+      (* Conservative: cannot represent loop or allocation symbolically *)
+      Fallback lbl_exp
 
 let init_conf (pgm : Program.t) : conf =
   let c0 = { env = Env.empty; mem = Mem.empty; imode = Interrupt.Enabled } in
@@ -722,6 +863,14 @@ let init_confa (pgm : Program.t) : abs_conf =
   in
   iset := iset';
   handlers := hs';
+  let summaries =
+    List.fold_left
+      (fun acc (d : Handler.t) ->
+        HandlerStore.IidMap.add d.iid (compile_handler d.body) acc)
+      HandlerStore.IidMap.empty pgm.handler
+  in
+  handler_summaries := summaries;
+  print_handler_summaries ();
   {
     asem = c_globals.asem;
     amem = c_globals.amem;

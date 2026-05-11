@@ -41,6 +41,7 @@ rule read =
   | blank     { read lexbuf }
   | newline   { new_line lexbuf; read lexbuf }
   | "//"      { line_comment lexbuf }
+  | "(*"      { block_comment 1 lexbuf }
   | int as n  { INT (int_of_string n) }
   | id as s   { match Hashtbl.find_opt keywords s with Some s -> s | None -> ID s }
   | '='       { EQ }
@@ -71,4 +72,12 @@ and line_comment =
   | newline { new_line lexbuf; read lexbuf }
   | eof     { EOF }
   | _       { line_comment lexbuf }
+
+and block_comment depth =
+  parse
+  | "(*"    { block_comment (depth + 1) lexbuf }
+  | "*)"    { if depth = 1 then read lexbuf else block_comment (depth - 1) lexbuf }
+  | newline { new_line lexbuf; block_comment depth lexbuf }
+  | eof     { raise (SyntaxError "Unterminated block comment") }
+  | _       { block_comment depth lexbuf }
 
