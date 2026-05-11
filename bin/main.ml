@@ -79,8 +79,13 @@ let main () =
      let _ = Analyzer.init_confa pgm in
      ());
   (if !opt_prov || !opt_report then begin
+     let t0 = Unix.gettimeofday () in
      let asem, errs = Analyzer.abs_analyze pgm in
+     let t1 = Unix.gettimeofday () in
      let chains = Provenance.analyze errs asem pgm in
+     let t2 = Unix.gettimeofday () in
+     Printf.eprintf "[time] abs_analyze : %.3fs\n" (t1 -. t0);
+     Printf.eprintf "[time] prov_analyze : %.3fs\n" (t2 -. t1);
      if !opt_prov then
        print_endline (Provenance.string_of_report chains);
      if !opt_report then
