@@ -26,6 +26,30 @@ type handler_summary =
   | Compiled of summary_atom list
   | Fallback of Exp.lbl_t
 
+(* ===== Pre-compiled fixpoint types ===== *)
+
+(* Fixpoint effect of all handlers combined on a single scalar location *)
+type fp_scalar =
+  | FPS_Unchanged           (* no handler writes here *)
+  | FPS_Inc                 (* x := x + c (c>0): fixpoint sets upper → +∞ *)
+  | FPS_Dec                 (* x := x - c (c>0): fixpoint sets lower → -∞ *)
+  | FPS_JoinConsts of Itv.t (* x := constant: join current value with this itv *)
+  | FPS_Top                 (* complex write: widen to top *)
+
+(* A single heap-array write effect extracted from handler bodies *)
+type fp_array_write = {
+  fpa_lbl       : Exp.Lbl.t;                              (* heap alloc label *)
+  fpa_idx       : [ `Const of Itv.t | `Var of Abs_Loc.t ]; (* index: constant or var *)
+  fpa_rhs       : [ `Const of Abs_Val.t | `Var of Abs_Loc.t ]; (* value: const or var *)
+  fpa_at        : ProgramPoint.t;
+  fpa_offset_pp : PPSet.t;
+}
+
+type compiled_fixpoint = {
+  fp_scalars : (Abs_Loc.t * fp_scalar) list;
+  fp_arrays  : fp_array_write list;
+}
+
 exception Runtime_error of string
 
 let var_tbl : VarTbl.t ref = ref VarTbl.empty
@@ -34,8 +58,11 @@ let handlers : HandlerStore.t ref = ref HandlerStore.empty
 let size_tbl : Itv.t LblMap.t ref = ref LblMap.empty
 let handler_summaries : handler_summary HandlerStore.IidMap.t ref =
   ref HandlerStore.IidMap.empty
+let compiled_fp : compiled_fixpoint ref =
+  ref { fp_scalars = []; fp_arrays = [] }
+let use_compiled_fp : bool ref = ref false
 
-(* Forward reference: will be set to post_steps_summary after it is defined *)
+(* Forward reference: will be set to apply_fixpoint_to_conf after it is defined *)
 let post_steps_fn : (abs_conf -> abs_conf) ref = ref (fun c -> c)
 let widen_cnt = 3
 
@@ -763,8 +790,194 @@ let post_steps_summary (c0 : abs_conf) : abs_conf =
   in
   iterate 0 c0
 
-(* Wire up the forward reference now that post_steps_summary is defined. *)
-let () = post_steps_fn := post_steps_summary
+(* ===== Pre-compiled fixpoint: classification helpers ===== *)
+
+let combine_fp_scalar (a : fp_scalar) (b : fp_scalar) : fp_scalar =
+  match (a, b) with
+  | FPS_Top, _ | _, FPS_Top -> FPS_Top
+  | FPS_Unchanged, x | x, FPS_Unchanged -> x
+  | FPS_Inc, FPS_Inc -> FPS_Inc
+  | FPS_Dec, FPS_Dec -> FPS_Dec
+  | FPS_Inc, FPS_Dec | FPS_Dec, FPS_Inc -> FPS_Top
+  | FPS_Inc, FPS_JoinConsts _ | FPS_JoinConsts _, FPS_Inc -> FPS_Inc
+  | FPS_Dec, FPS_JoinConsts _ | FPS_JoinConsts _, FPS_Dec -> FPS_Dec
+  | FPS_JoinConsts c1, FPS_JoinConsts c2 -> FPS_JoinConsts (Itv.join c1 c2)
+
+(* Apply a pre-compiled scalar fixpoint effect to an abstract value *)
+let apply_fp_scalar (fps : fp_scalar) ((itv, u, l) : Abs_Val.t) : Abs_Val.t =
+  let new_itv =
+    match fps with
+    | FPS_Unchanged -> itv
+    | FPS_Inc -> (
+        match itv with
+        | Itv.Bot -> Itv.Bot
+        | Itv.Itv (lo, _) -> Itv.Itv (lo, Itv.Bound.P_inf))
+    | FPS_Dec -> (
+        match itv with
+        | Itv.Bot -> Itv.Bot
+        | Itv.Itv (_, hi) -> Itv.Itv (Itv.Bound.N_inf, hi))
+    | FPS_JoinConsts c -> Itv.join itv c
+    | FPS_Top -> Itv.top
+  in
+  (new_itv, u, l)
+
+(* Classify one summary_atom into scalar and array-write effects.
+   init_amem is used to resolve which heap block an array pointer refers to. *)
+let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
+    (scalar_tbl : (Abs_Loc.t, fp_scalar) Hashtbl.t)
+    (array_writes : fp_array_write list ref) : unit =
+  match atom.lhs.exp with
+  | Var x ->
+      let loc = Abs_Loc.get x in
+      let fps =
+        match atom.rhs.exp with
+        | Int n -> FPS_JoinConsts (Itv.alpha n)
+        | Bop (Plus, { exp = Var y; _ }, { exp = Int n; _ })
+          when String.equal x y ->
+            if n > 0 then FPS_Inc else if n < 0 then FPS_Dec else FPS_Unchanged
+        | Bop (Plus, { exp = Int n; _ }, { exp = Var y; _ })
+          when String.equal x y ->
+            if n > 0 then FPS_Inc else if n < 0 then FPS_Dec else FPS_Unchanged
+        | Bop (Minus, { exp = Var y; _ }, { exp = Int n; _ })
+          when String.equal x y ->
+            if n > 0 then FPS_Dec else if n < 0 then FPS_Inc else FPS_Unchanged
+        | _ -> FPS_Top
+      in
+      let old =
+        match Hashtbl.find_opt scalar_tbl loc with
+        | None -> FPS_Unchanged
+        | Some f -> f
+      in
+      Hashtbl.replace scalar_tbl loc (combine_fp_scalar old fps)
+  | Deref ({ exp = Var arr_name; _ }, idx_e) ->
+      (* Array write: *arr_name[idx] := rhs.
+         Look up which heap block arr_name points to in init_amem. *)
+      let arr_var_loc = Abs_Loc.get arr_name in
+      (match Abs_Mem.LocMap.find_opt arr_var_loc init_amem with
+      | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) ->
+          let fpa_idx =
+            match idx_e.exp with
+            | Int n -> `Const (Itv.alpha n)
+            | Var idx_name -> `Var (Abs_Loc.get idx_name)
+            | _ -> `Const Itv.top
+          in
+          let fpa_rhs =
+            match atom.rhs.exp with
+            | Int n -> `Const (abs_int (Itv.alpha n))
+            | Var v -> `Var (Abs_Loc.get v)
+            | _ -> `Const Abs_Val.top
+          in
+          let fpa_at = ProgramPoint.Label atom.assign_lbl in
+          array_writes :=
+            { fpa_lbl = lbl; fpa_idx; fpa_rhs; fpa_at;
+              fpa_offset_pp = PPSet.singleton fpa_at }
+            :: !array_writes
+      | _ -> ())
+  | _ -> ()
+
+(* Scan all Compiled handler summaries and build a compiled_fixpoint.
+   Fallback handlers are left to the iterative fallback path. *)
+let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
+  let scalar_tbl : (Abs_Loc.t, fp_scalar) Hashtbl.t = Hashtbl.create 16 in
+  let array_writes : fp_array_write list ref = ref [] in
+  HandlerStore.IidMap.iter
+    (fun _iid summary ->
+      match summary with
+      | Compiled atoms ->
+          List.iter
+            (fun atom -> classify_atom atom init_amem scalar_tbl array_writes)
+            atoms
+      | Fallback _ -> ())
+    !handler_summaries;
+  let fp_scalars =
+    Hashtbl.fold (fun loc fps acc -> (loc, fps) :: acc) scalar_tbl []
+  in
+  compiled_fp := { fp_scalars; fp_arrays = !array_writes };
+  let has_fallback =
+    HandlerStore.IidMap.exists
+      (fun _iid s -> match s with Fallback _ -> true | _ -> false)
+      !handler_summaries
+  in
+  use_compiled_fp := not has_fallback
+
+(* Apply the pre-compiled fixpoint to an abstract conf in two passes:
+   1. Scalar pass: update each scalar loc's interval according to its fp_scalar.
+      - FPS_Inc  →  upper bound → +∞  (models unbounded increments at fixpoint)
+      - FPS_Dec  →  lower bound → -∞  (models unbounded decrements at fixpoint)
+      - FPS_JoinConsts c  →  join current itv with c
+      - FPS_Top  →  set to top
+   2. Array pass: for each fp_array_write, resolve the index and value
+      from the post-scalar amem (so that widened scalar values propagate
+      into array index expressions), perform a weak write, and check OOB. *)
+let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
+  (* Pass 1: scalar effects *)
+  let amem1 =
+    List.fold_left
+      (fun amem (loc, fps) ->
+        match fps with
+        | FPS_Unchanged -> amem
+        | _ -> (
+            match Abs_Mem.LocMap.find_opt loc amem with
+            | None -> amem
+            | Some (v, pp) ->
+                let v' = apply_fp_scalar fps v in
+                Abs_Mem.LocMap.add loc (v', pp) amem))
+      c.amem fp.fp_scalars
+  in
+  (* Pass 2: array write effects using post-scalar amem for index/value lookup *)
+  let amem2, errs2 =
+    List.fold_left
+      (fun (amem, errs) (fpa : fp_array_write) ->
+        let offset_itv =
+          match fpa.fpa_idx with
+          | `Const itv -> itv
+          | `Var idx_loc -> (
+              match Abs_Mem.LocMap.find_opt idx_loc amem with
+              | Some ((itv, _, _), _) -> itv
+              | None -> Itv.bot)
+        in
+        let write_loc =
+          Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = offset_itv }
+        in
+        let in_itv, left_oob, right_oob = itv_overlap write_loc in
+        let errs' =
+          if left_oob = Itv.bot && right_oob = Itv.bot then errs
+          else
+            let err =
+              Error.make ~at:fpa.fpa_at ~access:Error.Write ~base:write_loc
+                ~in_itv ~left_oob ~right_oob ~base_pp:PPSet.empty
+                ~offset_pp:fpa.fpa_offset_pp ~handler_caused:true
+            in
+            ErrorSet.add err errs
+        in
+        let rhs_val =
+          match fpa.fpa_rhs with
+          | `Const v -> v
+          | `Var val_loc -> (
+              match Abs_Mem.LocMap.find_opt val_loc amem with
+              | Some (v, _) -> v
+              | None -> Abs_Val.bot)
+        in
+        let amem' =
+          if in_itv = Itv.bot then amem
+          else Abs_Mem.write amem write_loc rhs_val fpa.fpa_at
+        in
+        (amem', errs'))
+      (amem1, c.errs) fp.fp_arrays
+  in
+  { c with amem = amem2; errs = errs2 }
+
+(* apply_fixpoint_to_conf: the new post_steps_fn.
+   For programs where all handlers compiled successfully, apply the pre-compiled
+   fixpoint in O(|scalars| + |arrays|) — no iteration needed.
+   For programs with Fallback handlers (loops / malloc in handler body), fall
+   back to the iterative post_steps_summary for soundness. *)
+let apply_fixpoint_to_conf (c : abs_conf) : abs_conf =
+  if !use_compiled_fp then apply_compiled_fixpoint !compiled_fp c
+  else post_steps_summary c
+
+(* Wire up the forward reference now that apply_fixpoint_to_conf is defined. *)
+let () = post_steps_fn := apply_fixpoint_to_conf
 
 let string_of_summary_atom (a : summary_atom) : string =
   Printf.sprintf "  at [%s]  %s  :=  %s"
@@ -870,6 +1083,7 @@ let init_confa (pgm : Program.t) : abs_conf =
       HandlerStore.IidMap.empty pgm.handler
   in
   handler_summaries := summaries;
+  compile_fixpoint c_globals.amem;
   print_handler_summaries ();
   {
     asem = c_globals.asem;

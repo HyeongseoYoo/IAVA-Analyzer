@@ -1,0 +1,316 @@
+// Benchmark 5 variant: NVMe Namespace Management — FALLBACK VERSION
+// Identical to bench5_ns_bug except handler 3 (RESET_EVT) contains a while
+// loop that clears the ProvLog on each reset.  The while loop makes
+// compile_handler return Fallback for handler 3, so apply_fixpoint_to_conf
+// falls back to the iterative post_steps_summary for the whole program.
+//
+// handler 0 — HOST_CMD   : sets NsActive := 1, increments NsId
+// handler 1 — ADMIN_CMD  : sets NsActive := 0, decrements NsCapacity
+// handler 2 — ERROR_EVT  : sets NsActive := 0, sets NsError := 1
+// handler 3 — RESET_EVT  : sets NsActive := 0, resets ProvIdx := 0,
+//                          then loops to clear ProvLog entries (Fallback)
+
+init {
+  NS_INACTIVE := 0;
+  NS_ACTIVE   := 1;
+  NS_PENDING  := 2;
+  NS_ERROR    := 3;
+  NS_DETACHED := 4;
+
+  MAP_INVALID := 0;
+  MAP_VALID   := 1;
+  MAP_PARTIAL := 2;
+  MAP_DIRTY   := 3;
+
+  ERR_NONE      := 0;
+  ERR_NS_FULL   := 1;
+  ERR_NS_DETACH := 2;
+  ERR_NS_RESET  := 3;
+  ERR_MAP_FAIL  := 4;
+
+  MAX_NS       := 8;
+  MAX_MAP_SLOT := 8;
+  MAX_CAPACITY := 16;
+  TOTAL_PROV   := 6;
+
+  MARK_NS_ATTACH  := 10;
+  MARK_NS_DETACH  := 20;
+  MARK_NS_RESET   := 30;
+  MARK_MAP_UPDATE := 40;
+  MARK_ADMIN      := 50;
+  MARK_ERR        := 60;
+
+  NsActive    := 1;
+  NsId        := 0;
+  NsCapacity  := 0;
+  NsError     := 0;
+  MapPtr      := 0;
+  MapState    := MAP_INVALID;
+  ProvIdx     := 0;
+  AttachCount := 0;
+  DetachCount := 0;
+  ResetCount  := 0;
+  ErrCount    := 0;
+  NsError2    := ERR_NONE;
+  AdminFlag   := 0;
+  HostFlag    := 0;
+
+  NsLog     := malloc(8, 0);
+  MapTable  := malloc(8, 0);
+  NsTrace   := malloc(64, 0);
+  CapLog    := malloc(8, 0);
+  AttachLog := malloc(8, 0);
+  ErrLog    := malloc(8, 0);
+  ResultBuf := malloc(8, 0);
+  ProvLog   := malloc(8, 0);
+
+  handler 0 {
+    NsActive              := 1;
+    NsId                  := NsId + 1;
+    AttachCount           := AttachCount + 1;
+    *AttachLog[AttachCount] := NsId;
+    HostFlag              := 1;
+    *NsTrace[0]           := MARK_NS_ATTACH
+  };
+  handler 1 {
+    NsActive    := 0;
+    NsCapacity  := NsCapacity - 1;
+    AdminFlag   := 1;
+    *NsTrace[1] := MARK_ADMIN
+  };
+  handler 2 {
+    NsActive              := 0;
+    NsError               := 1;
+    NsError2              := ERR_NS_DETACH;
+    DetachCount           := DetachCount + 1;
+    ErrCount              := ErrCount + 1;
+    *ErrLog[ErrCount]     := ERR_NS_DETACH;
+    *NsTrace[2]           := MARK_NS_DETACH
+  };
+  handler 3 {
+    NsActive    := 0;
+    ProvIdx     := 0;
+    ResetCount  := ResetCount + 1;
+    *NsTrace[3] := MARK_NS_RESET;
+    while ProvIdx < TOTAL_PROV do (
+      *ProvLog[ProvIdx] := 0;
+      ProvIdx           := ProvIdx + 1
+    )
+  }
+}
+
+main {
+  // Phase 1: map table preflight — invalidate all slots
+  while MapPtr < MAX_MAP_SLOT do (
+    *MapTable[MapPtr] := MAP_INVALID;
+    *NsLog[MapPtr]    := NS_INACTIVE;
+    MapPtr            := MapPtr + 1
+  );
+  MapPtr := 0;
+
+  *NsTrace[4]   := NsActive;
+  *NsTrace[5]   := NsId;
+  *NsTrace[6]   := ProvIdx;
+  *NsTrace[7]   := MapState;
+  *NsTrace[8]   := NsCapacity;
+  *NsTrace[9]   := AttachCount;
+  *NsTrace[10]  := DetachCount;
+  *NsTrace[11]  := ErrCount;
+  *ResultBuf[0] := MAX_NS;
+  *ResultBuf[1] := TOTAL_PROV;
+
+  // Phase 2: namespace provisioning — scan NsId range and update mapping
+  while NsId < MAX_NS do (
+    *NsTrace[12] := NsId;
+    *NsTrace[13] := NsActive;
+    *NsTrace[14] := NsCapacity;
+    *NsTrace[15] := AdminFlag;
+
+    if AdminFlag = 1
+    then (
+      AdminFlag    := 0;
+      *NsTrace[16] := MARK_ADMIN;
+      *NsTrace[17] := NsId
+    )
+    else (
+      *NsTrace[16] := 0;
+      *NsTrace[17] := NsId
+    );
+
+    if NsError = 1
+    then (
+      *ErrLog[ErrCount] := NsError2;
+      *NsTrace[18]      := MARK_ERR;
+      *NsTrace[19]      := NsError2;
+      NsError           := 0;
+      NsError2          := ERR_NONE
+    )
+    else (
+      *NsTrace[18] := 0;
+      *NsTrace[19] := NsId
+    );
+
+    // [TARGET-1] NsActive checked here; handler 1 or 2 can clear it between
+    // this check and the then-branch where NsActive is re-read as data and index.
+    if NsActive = 1
+    then (
+      *NsLog[NsId] := NS_ACTIVE;
+
+      // [TARGET-1 BODY] NsActive re-read as index — may now be 0 (NS_INACTIVE)
+      *MapTable[NsActive] := NsId;
+      *CapLog[NsId]       := NsCapacity;
+      *NsTrace[20]        := NsActive;
+      *NsTrace[21]        := NsId;
+      *NsTrace[22]        := NsCapacity;
+
+      NsCapacity  := NsCapacity + 1;
+      MapPtr      := MapPtr + 1;
+      MapState    := MAP_VALID;
+      AttachCount := AttachCount + 1;
+
+      if AttachCount < MAX_NS
+      then *AttachLog[AttachCount] := NsId
+      else *AttachLog[0]           := NsId;
+
+      HostFlag := 0;
+      NsId     := NsId + 1;
+      *NsTrace[23] := NsCapacity;
+      *NsTrace[24] := MapPtr;
+      *NsTrace[25] := AttachCount;
+      *NsTrace[26] := MARK_NS_ATTACH
+    )
+    else (
+      // [TARGET-1 ELSE] NsActive re-read here — may have changed
+      *NsLog[NsId] := NS_INACTIVE;
+      *NsTrace[20] := NsActive;
+      *NsTrace[21] := NsId;
+      *NsTrace[22] := DetachCount;
+
+      DetachCount := DetachCount + 1;
+      MapState    := MAP_INVALID;
+      NsId        := NsId + 1;
+      *NsTrace[23] := DetachCount;
+      *NsTrace[24] := MapPtr;
+      *NsTrace[25] := NsCapacity;
+      *NsTrace[26] := MARK_NS_DETACH
+    )
+  );
+
+  *NsTrace[27] := NsCapacity;
+  *NsTrace[28] := MapPtr;
+  *NsTrace[29] := AttachCount;
+  *NsTrace[30] := DetachCount;
+
+  // Phase 3: provisioning index scan loop
+  // [TARGET-2] ProvIdx used in while-condition; handler 3 can reset it to 0
+  // between the check and the MapTable/CapLog writes in the body.
+  while ProvIdx < TOTAL_PROV do (
+    *NsTrace[31] := ProvIdx;
+    *NsTrace[32] := NsActive;
+    *NsTrace[33] := NsCapacity;
+
+    // [TARGET-2 BODY] ProvIdx re-read here — handler 3 may have reset it to 0
+    *MapTable[ProvIdx] := NsId;
+    *ProvLog[ProvIdx]  := NsCapacity;
+    *NsTrace[34]       := ProvIdx;
+    *NsTrace[35]       := NsId;
+
+    if NsActive = 1
+    then (
+      *CapLog[ProvIdx] := NsCapacity;
+      *NsTrace[36]     := NsCapacity;
+      *NsTrace[37]     := ProvIdx
+    )
+    else (
+      *CapLog[ProvIdx] := 0;
+      *NsTrace[36]     := 0;
+      *NsTrace[37]     := ProvIdx
+    );
+
+    if AdminFlag = 1
+    then (
+      AdminFlag    := 0;
+      *NsTrace[38] := MARK_ADMIN;
+      *NsTrace[39] := ProvIdx
+    )
+    else (
+      *NsTrace[38] := 0;
+      *NsTrace[39] := ProvIdx
+    );
+
+    if ResetCount > 0
+    then (
+      *NsTrace[40] := ResetCount;
+      *NsTrace[41] := MARK_NS_RESET
+    )
+    else (
+      *NsTrace[40] := 0;
+      *NsTrace[41] := ProvIdx
+    );
+
+    ProvIdx       := ProvIdx + 1;
+    *NsTrace[42]  := ProvIdx
+  );
+
+  // Phase 4: capacity verification scan
+  MapPtr := 0;
+  while MapPtr < MAX_MAP_SLOT do (
+    *NsTrace[43] := MapPtr;
+    *NsTrace[44] := *MapTable[MapPtr];
+
+    if *MapTable[MapPtr] = MAP_INVALID
+    then (
+      *NsTrace[45] := NS_INACTIVE;
+      *NsTrace[46] := MapPtr
+    )
+    else (
+      *NsTrace[45] := NS_ACTIVE;
+      *NsTrace[46] := *MapTable[MapPtr]
+    );
+
+    MapPtr        := MapPtr + 1;
+    *NsTrace[47]  := MapPtr
+  );
+
+  // Phase 5: final namespace summary
+  *NsTrace[48] := AttachCount;
+  *NsTrace[49] := DetachCount;
+  *NsTrace[50] := ResetCount;
+  *NsTrace[51] := NsCapacity;
+  *NsTrace[52] := MapPtr;
+
+  if NsError2 = ERR_NONE
+  then (
+    *ResultBuf[2] := 0;
+    *ResultBuf[3] := AttachCount;
+    *ResultBuf[4] := NsCapacity;
+    *NsTrace[53]  := MARK_NS_ATTACH
+  )
+  else (
+    *ResultBuf[2] := 1;
+    *ResultBuf[3] := DetachCount;
+
+    if NsError2 = ERR_NS_DETACH
+    then (
+      *ResultBuf[4] := ERR_NS_DETACH;
+      *NsTrace[53]  := MARK_NS_DETACH
+    )
+    else (
+      if NsError2 = ERR_NS_RESET
+      then (
+        *ResultBuf[4] := ERR_NS_RESET;
+        *NsTrace[53]  := MARK_NS_RESET
+      )
+      else (
+        *ResultBuf[4] := NsError2;
+        *NsTrace[53]  := MARK_ERR
+      )
+    )
+  );
+
+  *ResultBuf[5] := ResetCount;
+  *ResultBuf[6] := ErrCount;
+  *ResultBuf[7] := MapPtr;
+  *NsTrace[54]  := ErrCount;
+  *NsTrace[55]  := ProvIdx
+}
