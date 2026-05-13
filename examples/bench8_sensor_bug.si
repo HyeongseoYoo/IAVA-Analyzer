@@ -1,0 +1,311 @@
+// Benchmark 8: Multi-Sensor Fusion Hub — BUGGY VERSION
+//
+// Pattern 1 — Index-variable corruption:
+//   SensorIdx is used as an index into CalTable[16] (calibration look-up)
+//   and SampleBuf[16] (raw sample ring buffer).
+//   Handler 0 (SENSOR_FAULT_EVT) sets SensorIdx := INVALID_SENSOR (= 180),
+//   which far exceeds the array bounds.  Between the while-condition check
+//   (SensorIdx < MAX_SENSORS) and the CalTable/SampleBuf accesses in the
+//   body, the handler can fire and corrupt SensorIdx.
+//
+// Pattern 2 — Object-based hidden shared state:
+//   SensorObj is assigned the same heap block as SensorRegs (the sensor
+//   controller register bank).  This mirrors a C++ embedded driver where a
+//   SensorController object and a FaultHandler object both hold the address
+//   of the same statically allocated SensorBlock; the ISR calls
+//   setReadPtr(INVALID_SENSOR) through the FaultHandler, while main reads
+//   the read-pointer through SensorController::getReadPtr() — they are the
+//   same field.
+//   Handler 1 (READPTR_EVT) writes INVALID_SENSOR into
+//   SensorRegs[REG_READPTR].  Main reads the read pointer through SensorObj
+//   and uses it as an index into ReadBuf[16] — OOB when the value is 180.
+//
+// handler 0 — SENSOR_FAULT_EVT : sets SensorIdx := INVALID_SENSOR (Pattern 1 bug)
+// handler 1 — READPTR_EVT      : sets SensorRegs[REG_READPTR] := INVALID_SENSOR (Pattern 2)
+// handler 2 — OVERRANGE_EVT    : sets SensorRegs[REG_RAW] := INVALID_SENSOR (Pattern 2)
+// handler 3 — CAL_UPDATE_EVT   : increments CalVersion, logs calibration event
+
+init {
+  // === Array sizes ===
+  MAX_SENSORS   := 16;
+  READ_BUF_SZ   := 16;
+  CAL_TABLE_SZ  := 16;
+  SAMPLE_BUF_SZ := 16;
+  FUSE_BUF_SZ   := 8;
+  EVENT_LOG_SZ  := 32;
+  DIAG_BUF_SZ   := 8;
+  SENSOR_REG_SZ := 16;
+
+  // === Sentinel / error values (large, intentionally OOB) ===
+  INVALID_SENSOR := 180;
+  SENSOR_OK      := 0;
+  SENSOR_FAULT   := 1;
+  SENSOR_TIMEOUT := 2;
+  SENSOR_OVERRANGE:= 3;
+  SENSOR_NODATA  := 4;
+  SENSOR_CAL_ERR := 5;
+  SENSOR_OFFLINE := 6;
+  SENSOR_STALE   := 7;
+
+  // === Sensor states ===
+  SENS_IDLE     := 0;
+  SENS_ACTIVE   := 1;
+  SENS_FAULT    := 2;
+  SENS_CAL      := 3;
+  SENS_WARMUP   := 4;
+
+  // === SensorRegs field indices ===
+  REG_STATUS    := 0;
+  REG_READPTR   := 1;
+  REG_RAW       := 2;
+  REG_FILTERED  := 3;
+  REG_TEMP      := 4;
+  REG_CAL_VER   := 5;
+  REG_FAULTCODE := 6;
+  REG_SAMPLECNT := 7;
+  REG_FUSECNT   := 8;
+  REG_LASTIDX   := 9;
+
+  // === Fusion algorithm IDs ===
+  FUSE_NONE     := 0;
+  FUSE_AVG      := 1;
+  FUSE_KALMAN   := 2;
+  FUSE_MEDIAN   := 3;
+
+  // === Trace markers ===
+  MARK_SAMPLE   := 10;
+  MARK_FUSE     := 20;
+  MARK_FAULT    := 30;
+  MARK_CAL      := 40;
+  MARK_RESET    := 50;
+  MARK_OVERRANGE:= 60;
+  MARK_TIMEOUT  := 70;
+  MARK_READY    := 80;
+
+  // === State variables ===
+  SensorIdx     := 0;
+  SensorState   := SENS_IDLE;
+  FaultCode     := SENSOR_OK;
+  FaultCount    := 0;
+  SampleCount   := 0;
+  FuseCount     := 0;
+  CalVersion    := 0;
+  ReadPtr       := 0;
+  RawValue      := 0;
+  FilteredValue := 0;
+  EventHead     := 0;
+  EventCount    := 0;
+  OverrangeCount:= 0;
+  TimeoutCount  := 0;
+  ResetCount    := 0;
+  FuseMode      := FUSE_AVG;
+  SafeReadPtr   := 0;
+  SafeRaw       := 0;
+  DiagIdx       := 0;
+
+  // === Arrays ===
+  CalTable   := malloc(16, 0);
+  SampleBuf  := malloc(16, 0);
+  ReadBuf    := malloc(16, 0);
+  FuseBuf    := malloc(8, 0);
+  EventLog   := malloc(32, 0);
+  DiagBuf    := malloc(8, 0);
+  SensorRegs := malloc(16, 0);
+
+  // Initialize SensorRegs
+  *SensorRegs[REG_STATUS]   := SENS_IDLE;
+  *SensorRegs[REG_READPTR]  := 0;
+  *SensorRegs[REG_RAW]      := 0;
+  *SensorRegs[REG_FILTERED] := 0;
+  *SensorRegs[REG_TEMP]     := 0;
+  *SensorRegs[REG_CAL_VER]  := 0;
+  *SensorRegs[REG_FAULTCODE]:= SENSOR_OK;
+  *SensorRegs[REG_SAMPLECNT]:= 0;
+  *SensorRegs[REG_FUSECNT]  := 0;
+  *SensorRegs[REG_LASTIDX]  := 0;
+
+  // Initialize calibration table and sample buffer
+  *CalTable[0]  := 100;
+  *CalTable[1]  := 101;
+  *CalTable[2]  := 102;
+  *CalTable[3]  := 103;
+  *CalTable[4]  := 104;
+  *CalTable[5]  := 105;
+  *CalTable[6]  := 106;
+  *CalTable[7]  := 107;
+  *SampleBuf[0] := 0;
+  *SampleBuf[1] := 0;
+  *SampleBuf[2] := 0;
+  *SampleBuf[3] := 0;
+
+  handler 0 {
+    // SENSOR_FAULT_EVT — Pattern 1 bug: overwrites SensorIdx with INVALID_SENSOR (180)
+    SensorState   := SENS_FAULT;
+    FaultCode     := SENSOR_FAULT;
+    FaultCount    := FaultCount + 1;
+    SensorIdx     := INVALID_SENSOR;
+    *SensorRegs[REG_STATUS]   := SENS_FAULT;
+    *SensorRegs[REG_FAULTCODE]:= SENSOR_FAULT;
+    *EventLog[EventHead]      := MARK_FAULT;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    // READPTR_EVT — Pattern 2 bug: writes INVALID_SENSOR into REG_READPTR
+    ReadPtr       := ReadPtr + 1;
+    *SensorRegs[REG_READPTR]  := INVALID_SENSOR;
+    *SensorRegs[REG_SAMPLECNT]:= SampleCount;
+    *EventLog[EventHead]      := MARK_SAMPLE;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    // OVERRANGE_EVT — Pattern 2 bug: writes INVALID_SENSOR into REG_RAW
+    OverrangeCount:= OverrangeCount + 1;
+    FaultCount    := FaultCount + 1;
+    *SensorRegs[REG_RAW]      := INVALID_SENSOR;
+    *SensorRegs[REG_STATUS]   := SENS_FAULT;
+    *SensorRegs[REG_FAULTCODE]:= SENSOR_OVERRANGE;
+    *EventLog[EventHead]      := MARK_OVERRANGE;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 3 {
+    // CAL_UPDATE_EVT — no index corruption, just bookkeeping
+    CalVersion    := CalVersion + 1;
+    *SensorRegs[REG_CAL_VER]  := CalVersion;
+    *EventLog[EventHead]      := MARK_CAL;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: SensorObj aliases SensorRegs (defined here to reflect separate-file ownership)
+  SensorObj := SensorRegs;
+
+  // Phase 1: initialise calibration table and clear sample buffer
+  SensorIdx := 0;
+  while SensorIdx < MAX_SENSORS do (
+    *CalTable[SensorIdx]  := SensorIdx + 100;
+    *SampleBuf[SensorIdx] := 0;
+    *ReadBuf[SensorIdx]   := 0;
+    SensorIdx             := SensorIdx + 1
+  );
+  SensorIdx := 0;
+
+  *EventLog[0] := MARK_READY;
+  *EventLog[1] := SENS_IDLE;
+  EventHead    := 2;
+  *DiagBuf[0]  := SensorIdx;
+  *DiagBuf[1]  := CalVersion;
+
+  // Phase 2: warm-up sweep — mark all sensors active
+  while SensorIdx < MAX_SENSORS do (
+    *SampleBuf[SensorIdx] := SENS_ACTIVE;
+    SensorIdx             := SensorIdx + 1
+  );
+  SensorIdx := 0;
+
+  // Phase 3: main sensor acquisition and fusion loop
+  // [TARGET-1, Pattern 1] SensorIdx is checked in the while condition;
+  // handler 0 can fire after the check and set SensorIdx := 180, so the
+  // accesses CalTable[SensorIdx] and SampleBuf[SensorIdx] become OOB.
+  while SensorIdx < MAX_SENSORS do (
+    *DiagBuf[2] := SensorIdx;
+    *DiagBuf[3] := SensorState;
+
+    // [BUG-1] Handler 0 may have set SensorIdx := 180 before this access
+    RawValue := *CalTable[SensorIdx];
+    *SampleBuf[SensorIdx] := RawValue;
+
+    if SensorState = SENS_FAULT
+    then (
+      *EventLog[EventHead] := MARK_FAULT;
+      EventHead := EventHead + 1;
+      *SampleBuf[SensorIdx] := SENSOR_FAULT
+    )
+    else (
+      *EventLog[EventHead] := MARK_SAMPLE;
+      EventHead := EventHead + 1;
+      SampleCount := SampleCount + 1;
+      *SensorRegs[REG_SAMPLECNT] := SampleCount
+    );
+
+    // [TARGET-2, Pattern 2] Read read-pointer and raw value through SensorObj.
+    // Handler 1 may have set SensorRegs[REG_READPTR] := 180 before this read.
+    // Handler 2 may have set SensorRegs[REG_RAW]     := 180 before this read.
+
+    // [BUG-2a] ReadPtr could be 180; ReadBuf has only 16 entries
+    ReadPtr := *SensorObj[REG_READPTR];
+    *ReadBuf[ReadPtr] := RawValue;
+
+    // [BUG-2b] RawValue could be 180 from handler 2; FuseBuf has only 8 entries
+    RawValue := *SensorObj[REG_RAW];
+    if RawValue < FUSE_BUF_SZ
+    then *FuseBuf[RawValue] := SensorIdx
+    else *FuseBuf[0] := SensorIdx;
+
+    *DiagBuf[4] := ReadPtr;
+    *DiagBuf[5] := RawValue;
+    *DiagBuf[6] := FaultCount;
+    *DiagBuf[7] := SampleCount;
+
+    SensorIdx := SensorIdx + 1;
+    *SensorRegs[REG_LASTIDX] := SensorIdx
+  );
+
+  // Phase 4: fusion pass — compute weighted average of all samples
+  FuseCount := 0;
+  SensorIdx := 0;
+  while SensorIdx < MAX_SENSORS do (
+    FilteredValue := *SampleBuf[SensorIdx];
+    if FilteredValue = SENSOR_FAULT
+    then (
+      *EventLog[EventHead] := MARK_FAULT;
+      EventHead := EventHead + 1
+    )
+    else (
+      FuseCount := FuseCount + 1;
+      *FuseBuf[0] := FilteredValue;
+      *EventLog[EventHead] := MARK_FUSE;
+      EventHead := EventHead + 1
+    );
+    SensorIdx := SensorIdx + 1
+  );
+
+  *SensorRegs[REG_FUSECNT]   := FuseCount;
+  *SensorRegs[REG_FILTERED]  := FilteredValue;
+  *SensorRegs[REG_STATUS]    := SENS_IDLE;
+  *SensorRegs[REG_SAMPLECNT] := SampleCount;
+
+  // Phase 5: diagnostic summary
+  *DiagBuf[0] := FaultCount;
+  *DiagBuf[1] := SampleCount;
+  *DiagBuf[2] := FuseCount;
+  *DiagBuf[3] := CalVersion;
+  *DiagBuf[4] := OverrangeCount;
+  *DiagBuf[5] := TimeoutCount;
+  *DiagBuf[6] := EventCount;
+  *DiagBuf[7] := ResetCount;
+
+  // Phase 6: final sensor-state snapshot
+  *EventLog[EventHead] := MARK_RESET;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := SensorState;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := FaultCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := SampleCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := FuseCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := CalVersion;
+  EventHead := EventHead + 1;
+  *SensorRegs[REG_STATUS]    := SENS_IDLE;
+  *SensorRegs[REG_SAMPLECNT] := SampleCount;
+  *SensorRegs[REG_FUSECNT]   := FuseCount;
+  *SensorRegs[REG_LASTIDX]   := SensorIdx
+}

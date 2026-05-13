@@ -1,0 +1,329 @@
+// Benchmark 7: Automotive CAN Bus Message Processor — FIXED VERSION
+//
+// Fix strategy:
+//   FIX-1 (Pattern 1): Wrap the MsgSlot read, TxQueue write, and RxBuf write
+//     inside a disable/enable critical section.  Handler 0 cannot overwrite
+//     MsgSlot to 255 between the while-condition and the array accesses.
+//
+//   FIX-2 (Pattern 2): Wrap the BusHandle[BUS_ERRPTR] read and the ErrLog
+//     write inside a disable/enable critical section with an explicit bounds
+//     guard.  Handler 1 cannot corrupt BUS_ERRPTR during this window.
+//
+// handler 0 — BUS_ERR_EVT    : sets MsgSlot := ERR_FRAME_ID (Pattern 1 source)
+// handler 1 — ERR_COUNT_EVT  : sets BusRegs[BUS_ERRPTR] := ERR_FRAME_ID (Pattern 2 source)
+// handler 2 — TX_DONE_EVT    : advances TxHead, clears slot state
+// handler 3 — RX_FULL_EVT    : sets RxFull flag, logs overflow
+
+init {
+  // === Array sizes ===
+  MAX_MSG_SLOTS := 16;
+  ERR_LOG_SZ    := 16;
+  STAT_LOG_SZ   := 8;
+  EVENT_LOG_SZ  := 32;
+  TX_QUEUE_SZ   := 16;
+  RX_BUF_SZ     := 16;
+  BUS_REG_SZ    := 16;
+  DIAG_BUF_SZ   := 8;
+
+  // === CAN-specific error values ===
+  ERR_FRAME_ID  := 255;
+  ERR_NONE      := 0;
+  ERR_BUS_OFF   := 1;
+  ERR_PASSIVE   := 2;
+  ERR_WARNING   := 3;
+  ERR_OVERFLOW  := 4;
+  ERR_TIMEOUT   := 5;
+  ERR_STUFF     := 6;
+  ERR_CRC       := 7;
+
+  // === Message states ===
+  MSG_EMPTY     := 0;
+  MSG_PENDING   := 1;
+  MSG_SENT      := 2;
+  MSG_ACK       := 3;
+  MSG_ERR       := 4;
+  MSG_RETRY     := 5;
+
+  // === Bus states ===
+  BUS_IDLE      := 0;
+  BUS_ACTIVE    := 1;
+  BUS_ERR       := 2;
+  BUS_OFF       := 3;
+  BUS_PASSIVE   := 4;
+
+  // === BusRegs field indices ===
+  BUS_STATUS    := 0;
+  BUS_ERRPTR    := 1;
+  BUS_TXHEAD    := 2;
+  BUS_RXHEAD    := 3;
+  BUS_ERRCNT    := 4;
+  BUS_TXCNT     := 5;
+  BUS_RXCNT     := 6;
+  BUS_FLAGS     := 7;
+  BUS_RETRIES   := 8;
+  BUS_LASTID    := 9;
+
+  // === Trace markers ===
+  MARK_TX       := 10;
+  MARK_RX       := 20;
+  MARK_ERR      := 30;
+  MARK_BUSOFF   := 40;
+  MARK_RECOVER  := 50;
+  MARK_FLUSH    := 60;
+  MARK_RESET    := 70;
+  MARK_OVERFLOW := 80;
+
+  // === State variables ===
+  MsgSlot       := 0;
+  BusState      := BUS_IDLE;
+  ErrCode       := ERR_NONE;
+  ErrCount      := 0;
+  TxHead        := 0;
+  TxTail        := 0;
+  TxPending     := 0;
+  RxHead        := 0;
+  RxTail        := 0;
+  RxFull        := 0;
+  RetryCount    := 0;
+  TxDoneCount   := 0;
+  EventHead     := 0;
+  EventCount    := 0;
+  ResetCount    := 0;
+  BusOffCount   := 0;
+  OverflowCount := 0;
+  LastErrPtr    := 0;
+  SafeErrPtr    := 0;
+  DiagIdx       := 0;
+
+  // === Arrays ===
+  TxQueue  := malloc(16, MSG_EMPTY);
+  RxBuf    := malloc(16, 0);
+  ErrLog   := malloc(16, ERR_NONE);
+  StatLog  := malloc(8, 0);
+  EventLog := malloc(32, 0);
+  DiagBuf  := malloc(8, 0);
+  BusRegs  := malloc(16, 0);
+
+  // Initialize BusRegs
+  *BusRegs[BUS_STATUS]  := BUS_IDLE;
+  *BusRegs[BUS_ERRPTR]  := 0;
+  *BusRegs[BUS_TXHEAD]  := 0;
+  *BusRegs[BUS_RXHEAD]  := 0;
+  *BusRegs[BUS_ERRCNT]  := 0;
+  *BusRegs[BUS_TXCNT]   := 0;
+  *BusRegs[BUS_RXCNT]   := 0;
+  *BusRegs[BUS_FLAGS]   := 0;
+  *BusRegs[BUS_RETRIES] := 0;
+  *BusRegs[BUS_LASTID]  := 0;
+
+  // Initialise TX queue
+  *TxQueue[0] := MSG_EMPTY;
+  *TxQueue[1] := MSG_EMPTY;
+  *TxQueue[2] := MSG_EMPTY;
+  *TxQueue[3] := MSG_EMPTY;
+
+  handler 0 {
+    BusState      := BUS_ERR;
+    ErrCode       := ERR_BUS_OFF;
+    ErrCount      := ErrCount + 1;
+    BusOffCount   := BusOffCount + 1;
+    MsgSlot       := ERR_FRAME_ID;
+    *BusRegs[BUS_STATUS]  := BUS_ERR;
+    *BusRegs[BUS_ERRCNT]  := ErrCount;
+    *BusRegs[BUS_FLAGS]   := ERR_BUS_OFF;
+    *EventLog[EventHead]  := MARK_ERR;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    ErrCount      := ErrCount + 1;
+    LastErrPtr    := ErrCount;
+    *BusRegs[BUS_ERRCNT]  := ErrCount;
+    *BusRegs[BUS_ERRPTR]  := ERR_FRAME_ID;
+    *BusRegs[BUS_FLAGS]   := ERR_PASSIVE;
+    *EventLog[EventHead]  := MARK_ERR;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    TxDoneCount   := TxDoneCount + 1;
+    TxHead        := TxHead + 1;
+    TxPending     := TxPending + 1;
+    *BusRegs[BUS_TXHEAD] := TxHead;
+    *BusRegs[BUS_TXCNT]  := TxDoneCount;
+    *EventLog[EventHead] := MARK_TX;
+    EventHead     := EventHead + 1
+  };
+
+  handler 3 {
+    RxFull        := 1;
+    OverflowCount := OverflowCount + 1;
+    *BusRegs[BUS_FLAGS]  := ERR_OVERFLOW;
+    *EventLog[EventHead] := MARK_OVERFLOW;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: BusHandle aliases BusRegs (defined here to reflect separate-file ownership)
+  BusHandle := BusRegs;
+
+  // Phase 1: flush and reset all TX/RX queues
+  MsgSlot := 0;
+  while MsgSlot < MAX_MSG_SLOTS do (
+    *TxQueue[MsgSlot] := MSG_EMPTY;
+    *RxBuf[MsgSlot]   := 0;
+    *ErrLog[MsgSlot]  := ERR_NONE;
+    MsgSlot           := MsgSlot + 1
+  );
+  MsgSlot := 0;
+
+  *EventLog[0] := MARK_RECOVER;
+  *EventLog[1] := BUS_IDLE;
+  EventHead    := 2;
+
+  // Phase 2: pre-load TX queue
+  while MsgSlot < MAX_MSG_SLOTS do (
+    *TxQueue[MsgSlot] := MSG_PENDING;
+    MsgSlot           := MsgSlot + 1
+  );
+  MsgSlot := 0;
+
+  // Phase 3: main message processing loop
+  while MsgSlot < MAX_MSG_SLOTS do (
+    *DiagBuf[0] := MsgSlot;
+    *DiagBuf[1] := BusState;
+
+    // [FIX-1] Disable interrupts, then re-check MsgSlot bounds.
+    // Handler 0 may corrupt MsgSlot to ERR_FRAME_ID=255 before the disable.
+    // FPS_Top widening means MsgSlot abstract value is [-inf,+inf] here, so
+    // a two-level bounds guard is needed: >= 0 first (eliminates left OOB),
+    // then < MAX_MSG_SLOTS (eliminates right OOB).
+    disable;
+    if MsgSlot >= 0
+    then (
+      if MsgSlot < MAX_MSG_SLOTS
+      then (
+        *TxQueue[MsgSlot] := MSG_SENT;
+        *RxBuf[MsgSlot]   := BusState;
+        enable
+      )
+      else (
+        enable
+      )
+    )
+    else (
+      enable
+    );
+
+    if BusState = BUS_ERR
+    then (
+      *EventLog[EventHead] := MARK_ERR;
+      EventHead := EventHead + 1;
+      RetryCount := RetryCount + 1
+    )
+    else (
+      *EventLog[EventHead] := MARK_TX;
+      EventHead := EventHead + 1
+    );
+
+    // [FIX-2] Disable interrupts while reading BUS_ERRPTR through BusHandle
+    // and writing into ErrLog.  Handler 1 cannot corrupt BUS_ERRPTR here.
+    // FPS_Top widening means SafeErrPtr abstract value is [-inf,+inf] after
+    // the read, so a two-level bounds guard is needed.
+    disable;
+    SafeErrPtr := *BusHandle[BUS_ERRPTR];
+    if SafeErrPtr >= 0
+    then (
+      if SafeErrPtr < ERR_LOG_SZ
+      then (
+        *ErrLog[SafeErrPtr] := ErrCode;
+        enable
+      )
+      else (
+        *ErrLog[0] := ErrCode;
+        enable
+      )
+    )
+    else (
+      *ErrLog[0] := ErrCode;
+      enable
+    );
+    LastErrPtr := SafeErrPtr;
+
+    *DiagBuf[2] := LastErrPtr;
+    *DiagBuf[3] := ErrCount;
+    *DiagBuf[4] := TxDoneCount;
+    *DiagBuf[5] := RetryCount;
+
+    MsgSlot := MsgSlot + 1;
+    *BusRegs[BUS_LASTID] := MsgSlot
+  );
+
+  // Phase 4: TX drain loop
+  TxTail := 0;
+  while TxTail < MAX_MSG_SLOTS do (
+    *DiagBuf[6] := TxTail;
+    if *TxQueue[TxTail] = MSG_PENDING
+    then (
+      *TxQueue[TxTail] := MSG_SENT;
+      *EventLog[EventHead] := MARK_TX;
+      EventHead := EventHead + 1
+    )
+    else (
+      *TxQueue[TxTail] := MSG_ACK
+    );
+    TxTail := TxTail + 1
+  );
+
+  // Phase 5: error log scan and statistics
+  MsgSlot := 0;
+  while MsgSlot < ERR_LOG_SZ do (
+    if *ErrLog[MsgSlot] = ERR_NONE
+    then (
+      *StatLog[0] := MsgSlot
+    )
+    else (
+      *StatLog[1] := *ErrLog[MsgSlot];
+      ErrCount := ErrCount + 1
+    );
+    MsgSlot := MsgSlot + 1
+  );
+
+  *BusRegs[BUS_ERRCNT]  := ErrCount;
+  *BusRegs[BUS_TXCNT]   := TxDoneCount;
+  *BusRegs[BUS_STATUS]  := BUS_IDLE;
+
+  *StatLog[2] := ErrCount;
+  *StatLog[3] := TxDoneCount;
+  *StatLog[4] := OverflowCount;
+  *StatLog[5] := BusOffCount;
+  *StatLog[6] := RetryCount;
+  *StatLog[7] := EventCount;
+
+  *DiagBuf[0] := ErrCount;
+  *DiagBuf[1] := TxDoneCount;
+  *DiagBuf[2] := BusOffCount;
+  *DiagBuf[3] := OverflowCount;
+  *DiagBuf[4] := RetryCount;
+  *DiagBuf[5] := EventCount;
+  *DiagBuf[6] := ResetCount;
+  *DiagBuf[7] := LastErrPtr;
+
+  // Phase 6: final bus-state snapshot into EventLog
+  *EventLog[EventHead] := MARK_RESET;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := BusState;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := TxDoneCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := OverflowCount;
+  EventHead := EventHead + 1;
+  *BusRegs[BUS_TXCNT]  := TxDoneCount;
+  *BusRegs[BUS_ERRCNT] := ErrCount;
+  *BusRegs[BUS_LASTID] := MsgSlot
+}

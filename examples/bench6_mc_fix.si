@@ -1,0 +1,354 @@
+// Benchmark 6: Industrial Motor Controller — FIXED VERSION
+//
+// Fix strategy:
+//   FIX-1 (Pattern 1): Wrap the DriveSlot read and DriveTable/CmdBuf access
+//     inside a disable/enable critical section so handler 0 cannot overwrite
+//     DriveSlot between the while-condition check and the array write.
+//
+//   FIX-2 (Pattern 2): Wrap each DevHandle field read and the subsequent
+//     log array access inside a disable/enable section.  This prevents
+//     handler 1 / handler 2 from writing FAULT_SLOT into RegFile[REG_SPEED]
+//     or RegFile[REG_TEMP] between the read and the SpeedLog/TempLog write.
+//     An explicit bounds guard inside the critical section eliminates any
+//     residual abstract OOB widening artefact.
+//
+// handler 0 — FAULT_EVT       : sets DriveSlot := FAULT_SLOT (Pattern 1 bug source)
+// handler 1 — OVERCURRENT_EVT : sets RegFile[REG_SPEED] := FAULT_SLOT (Pattern 2 bug source)
+// handler 2 — OVERHEAT_EVT    : sets RegFile[REG_TEMP]  := FAULT_SLOT (Pattern 2 bug source)
+// handler 3 — STALL_EVT       : sets DriveState, logs event
+
+init {
+  // === Array sizes ===
+  DRIVE_SLOTS   := 16;
+  SPEED_LOG_SZ  := 16;
+  TEMP_LOG_SZ   := 8;
+  EVENT_LOG_SZ  := 32;
+  CMD_BUF_SZ    := 16;
+  DIAG_BUF_SZ   := 8;
+  REG_FILE_SZ   := 16;
+
+  // === Fault codes ===
+  FAULT_SLOT    := 200;
+  FAULT_NONE    := 0;
+  FAULT_OVERCUR := 1;
+  FAULT_OVERHEAT:= 2;
+  FAULT_STALL   := 3;
+  FAULT_UNDERVOLT:= 4;
+  FAULT_HALL    := 5;
+  FAULT_ENCODER := 6;
+  FAULT_COMM    := 7;
+
+  // === Drive states ===
+  STATE_IDLE    := 0;
+  STATE_ACCEL   := 1;
+  STATE_RUN     := 2;
+  STATE_DECEL   := 3;
+  STATE_BRAKE   := 4;
+  STATE_FAULT   := 5;
+  STATE_INIT    := 6;
+
+  // === Register file field indices ===
+  REG_STATUS    := 0;
+  REG_SPEED     := 1;
+  REG_TEMP      := 2;
+  REG_CURRENT   := 3;
+  REG_VOLTAGE   := 4;
+  REG_FAULT     := 5;
+  REG_MODE      := 6;
+  REG_TARGET    := 7;
+  REG_CYCLES    := 8;
+  REG_ERRORS    := 9;
+
+  // === Command types ===
+  CMD_NOP       := 0;
+  CMD_START     := 1;
+  CMD_STOP      := 2;
+  CMD_BRAKE     := 3;
+  CMD_RESET     := 4;
+  CMD_QUERY     := 5;
+  CMD_SETSPEED  := 6;
+  CMD_DIAG      := 7;
+
+  // === Trace markers ===
+  MARK_FAULT    := 10;
+  MARK_OC       := 20;
+  MARK_OVERHEAT := 30;
+  MARK_STALL    := 40;
+  MARK_HALT     := 50;
+  MARK_RESUME   := 60;
+  MARK_RESET    := 70;
+  MARK_START    := 80;
+
+  // === State variables ===
+  DriveSlot     := 0;
+  DriveState    := STATE_IDLE;
+  FaultCode     := FAULT_NONE;
+  FaultCount    := 0;
+  SpeedRpm      := 0;
+  TargetRpm     := 0;
+  TemperatureC  := 0;
+  CurrentA      := 0;
+  VoltageV      := 0;
+  CmdPending    := 0;
+  CmdType       := CMD_NOP;
+  EventHead     := 0;
+  EventCount    := 0;
+  DiagMode      := 0;
+  RunCycles     := 0;
+  TotalFaults   := 0;
+  LastFault     := FAULT_NONE;
+  ResetCount    := 0;
+  OcCount       := 0;
+  OverheatCount := 0;
+  StallCount    := 0;
+  SafeSpeed     := 0;
+  SafeTemp      := 0;
+
+  // === Arrays ===
+  DriveTable := malloc(16, STATE_IDLE);
+  SpeedLog   := malloc(16, 0);
+  TempLog    := malloc(8, 0);
+  EventLog   := malloc(32, 0);
+  CmdBuf     := malloc(16, CMD_NOP);
+  DiagBuf    := malloc(8, 0);
+  RegFile    := malloc(16, 0);
+
+  // Initialize register file
+  *RegFile[REG_STATUS]  := STATE_IDLE;
+  *RegFile[REG_SPEED]   := 0;
+  *RegFile[REG_TEMP]    := 0;
+  *RegFile[REG_CURRENT] := 0;
+  *RegFile[REG_VOLTAGE] := 0;
+  *RegFile[REG_FAULT]   := FAULT_NONE;
+  *RegFile[REG_MODE]    := 0;
+  *RegFile[REG_TARGET]  := 0;
+  *RegFile[REG_CYCLES]  := 0;
+  *RegFile[REG_ERRORS]  := 0;
+
+  // Initialize drive and command tables
+  *DriveTable[0] := STATE_IDLE;
+  *DriveTable[1] := STATE_IDLE;
+  *DriveTable[2] := STATE_IDLE;
+  *DriveTable[3] := STATE_IDLE;
+  *DriveTable[4] := STATE_IDLE;
+  *DriveTable[5] := STATE_IDLE;
+  *DriveTable[6] := STATE_IDLE;
+  *DriveTable[7] := STATE_IDLE;
+  *CmdBuf[0] := CMD_NOP;
+  *CmdBuf[1] := CMD_NOP;
+  *CmdBuf[2] := CMD_NOP;
+  *CmdBuf[3] := CMD_NOP;
+
+  handler 0 {
+    DriveState    := STATE_FAULT;
+    FaultCode     := FAULT_HALL;
+    FaultCount    := FaultCount + 1;
+    TotalFaults   := TotalFaults + 1;
+    LastFault     := FAULT_HALL;
+    DriveSlot     := FAULT_SLOT;
+    *RegFile[REG_STATUS] := STATE_FAULT;
+    *RegFile[REG_FAULT]  := FAULT_HALL;
+    *RegFile[REG_ERRORS] := FaultCount;
+    *EventLog[EventHead] := MARK_FAULT;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    DriveState    := STATE_FAULT;
+    OcCount       := OcCount + 1;
+    FaultCount    := FaultCount + 1;
+    TotalFaults   := TotalFaults + 1;
+    LastFault     := FAULT_OVERCUR;
+    *RegFile[REG_STATUS]  := STATE_FAULT;
+    *RegFile[REG_SPEED]   := FAULT_SLOT;
+    *RegFile[REG_FAULT]   := FAULT_OVERCUR;
+    *RegFile[REG_ERRORS]  := FaultCount;
+    *EventLog[EventHead]  := MARK_OC;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    OverheatCount := OverheatCount + 1;
+    FaultCount    := FaultCount + 1;
+    TotalFaults   := TotalFaults + 1;
+    LastFault     := FAULT_OVERHEAT;
+    *RegFile[REG_STATUS]  := STATE_FAULT;
+    *RegFile[REG_TEMP]    := FAULT_SLOT;
+    *RegFile[REG_FAULT]   := FAULT_OVERHEAT;
+    *RegFile[REG_ERRORS]  := FaultCount;
+    *EventLog[EventHead]  := MARK_OVERHEAT;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 3 {
+    StallCount    := StallCount + 1;
+    DriveState    := STATE_BRAKE;
+    LastFault     := FAULT_STALL;
+    *RegFile[REG_STATUS] := STATE_BRAKE;
+    *RegFile[REG_FAULT]  := FAULT_STALL;
+    *EventLog[EventHead] := MARK_STALL;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: DevHandle aliases RegFile (defined here to reflect separate-file ownership)
+  DevHandle := RegFile;
+
+  // Phase 1: initialise all drive table slots and clear command buffer
+  DriveSlot := 0;
+  while DriveSlot < DRIVE_SLOTS do (
+    *DriveTable[DriveSlot] := STATE_IDLE;
+    *CmdBuf[DriveSlot]     := CMD_NOP;
+    DriveSlot              := DriveSlot + 1
+  );
+  DriveSlot := 0;
+
+  *EventLog[0] := MARK_RESUME;
+  *EventLog[1] := STATE_INIT;
+  EventHead    := 2;
+  *DiagBuf[0]  := DriveSlot;
+  *DiagBuf[1]  := DriveState;
+
+  // Phase 2: drive activation sweep
+  while DriveSlot < DRIVE_SLOTS do (
+    *DriveTable[DriveSlot] := STATE_ACCEL;
+    DriveSlot              := DriveSlot + 1
+  );
+  DriveSlot := 0;
+
+  // Phase 3: main run loop
+  while DriveSlot < DRIVE_SLOTS do (
+    *DiagBuf[2] := DriveSlot;
+    *DiagBuf[3] := DriveState;
+
+    // [FIX-1] Disable interrupts, then re-check DriveSlot bounds.
+    // Handler 0 may corrupt DriveSlot to FAULT_SLOT=200 before the disable.
+    // FPS_Top widening means DriveSlot abstract value is [-inf,+inf] here, so
+    // a two-level bounds guard is needed: >= 0 first (eliminates left OOB),
+    // then < DRIVE_SLOTS (eliminates right OOB).
+    disable;
+    if DriveSlot >= 0
+    then (
+      if DriveSlot < DRIVE_SLOTS
+      then (
+        *DriveTable[DriveSlot] := DriveState;
+        CmdType := *CmdBuf[DriveSlot]
+      )
+      else (
+        unit
+      )
+    )
+    else (
+      unit
+    );
+    enable;
+
+    if CmdType = CMD_STOP
+    then (
+      DriveState := STATE_DECEL;
+      *RegFile[REG_STATUS] := STATE_DECEL;
+      *EventLog[EventHead] := MARK_HALT;
+      EventHead := EventHead + 1
+    )
+    else (
+      if CmdType = CMD_BRAKE
+      then (
+        DriveState := STATE_BRAKE;
+        *RegFile[REG_STATUS] := STATE_BRAKE;
+        *EventLog[EventHead] := MARK_HALT;
+        EventHead := EventHead + 1
+      )
+      else (
+        if CmdType = CMD_START
+        then (
+          DriveState := STATE_RUN;
+          *RegFile[REG_STATUS] := STATE_RUN;
+          *EventLog[EventHead] := MARK_START;
+          EventHead := EventHead + 1
+        )
+        else (
+          DriveState := STATE_RUN;
+          *RegFile[REG_STATUS] := STATE_RUN
+        )
+      )
+    );
+
+    // [FIX-2a] Disable interrupts while reading speed through DevHandle and
+    // logging it.  Handler 1 cannot corrupt RegFile[REG_SPEED] in this window.
+    disable;
+    SafeSpeed := *DevHandle[REG_SPEED];
+    if SafeSpeed < SPEED_LOG_SZ
+    then (
+      *SpeedLog[SafeSpeed] := RunCycles;
+      enable
+    )
+    else (
+      *SpeedLog[0] := RunCycles;
+      enable
+    );
+
+    // [FIX-2b] Disable interrupts while reading temperature through DevHandle.
+    // Handler 2 cannot corrupt RegFile[REG_TEMP] in this window.
+    disable;
+    SafeTemp := *DevHandle[REG_TEMP];
+    if SafeTemp < TEMP_LOG_SZ
+    then (
+      *TempLog[SafeTemp] := RunCycles;
+      enable
+    )
+    else (
+      *TempLog[0] := RunCycles;
+      enable
+    );
+
+    SpeedRpm     := SafeSpeed;
+    TemperatureC := SafeTemp;
+
+    *DiagBuf[4]  := SpeedRpm;
+    *DiagBuf[5]  := TemperatureC;
+    *DiagBuf[6]  := FaultCount;
+    *DiagBuf[7]  := RunCycles;
+
+    RunCycles    := RunCycles + 1;
+    *RegFile[REG_CYCLES] := RunCycles;
+    DriveSlot    := DriveSlot + 1
+  );
+
+  // Phase 4: post-run fault summary
+  *EventLog[EventHead] := MARK_HALT;
+  EventHead  := EventHead + 1;
+  *EventLog[EventHead] := TotalFaults;
+  EventHead  := EventHead + 1;
+  *EventLog[EventHead] := DriveState;
+  EventHead  := EventHead + 1;
+
+  *RegFile[REG_STATUS] := STATE_IDLE;
+  *RegFile[REG_CYCLES] := RunCycles;
+  *RegFile[REG_ERRORS] := TotalFaults;
+
+  // Phase 5: diagnostic log flush
+  DriveSlot := 0;
+  while DriveSlot < DRIVE_SLOTS do (
+    *SpeedLog[DriveSlot] := 0;
+    DriveSlot := DriveSlot + 1
+  );
+  DriveSlot := 0;
+
+  while DriveSlot < TEMP_LOG_SZ do (
+    *TempLog[DriveSlot] := 0;
+    DriveSlot := DriveSlot + 1
+  );
+
+  *DiagBuf[0] := TotalFaults;
+  *DiagBuf[1] := OcCount;
+  *DiagBuf[2] := OverheatCount;
+  *DiagBuf[3] := StallCount;
+  *DiagBuf[4] := RunCycles;
+  *DiagBuf[5] := ResetCount;
+  *DiagBuf[6] := EventCount;
+  *DiagBuf[7] := LastFault
+}
