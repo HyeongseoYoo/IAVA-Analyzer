@@ -792,6 +792,34 @@ let post_steps_summary (c0 : abs_conf) : abs_conf =
 
 (* ===== Pre-compiled fixpoint: classification helpers ===== *)
 
+(* A variable whose name is all-uppercase (letters, digits, underscores) is
+   treated as a compile-time constant.  Its value is resolved to a concrete
+   integer from init_amem so that assignments like [x := FAULT_SLOT] are
+   classified as FPS_JoinConsts [200] rather than FPS_Top. *)
+let is_const_name (s : string) : bool =
+  String.length s > 0
+  && String.for_all
+       (fun c -> (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_')
+       s
+
+(* Build a name→int map for every all-uppercase scalar variable in init_amem
+   whose abstract value is a singleton interval [n, n]. *)
+let build_const_map (init_amem : Abs_Mem.t) : (string, int) Hashtbl.t =
+  let tbl = Hashtbl.create 64 in
+  Abs_Mem.fold
+    (fun loc (v, _) () ->
+      match loc with
+      | Abs_Loc.AVarLoc { id = x; offset = Itv.Itv (Itv.Bound.Z 0, Itv.Bound.Z 0) }
+        when is_const_name x ->
+          let (itv, _, _) = v in
+          (match itv with
+          | Itv.Itv (Itv.Bound.Z n, Itv.Bound.Z m) when n = m ->
+              Hashtbl.replace tbl x n
+          | _ -> ())
+      | _ -> ())
+    init_amem ();
+  tbl
+
 let combine_fp_scalar (a : fp_scalar) (b : fp_scalar) : fp_scalar =
   match (a, b) with
   | FPS_Top, _ | _, FPS_Top -> FPS_Top
@@ -824,6 +852,7 @@ let apply_fp_scalar (fps : fp_scalar) ((itv, u, l) : Abs_Val.t) : Abs_Val.t =
 (* Classify one summary_atom into scalar and array-write effects.
    init_amem is used to resolve which heap block an array pointer refers to. *)
 let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
+    (const_map : (string, int) Hashtbl.t)
     (scalar_tbl : (Abs_Loc.t, fp_scalar) Hashtbl.t)
     (array_writes : fp_array_write list ref) : unit =
   match atom.lhs.exp with
@@ -841,6 +870,10 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
         | Bop (Minus, { exp = Var y; _ }, { exp = Int n; _ })
           when String.equal x y ->
             if n > 0 then FPS_Dec else if n < 0 then FPS_Inc else FPS_Unchanged
+        | Var y when is_const_name y ->
+            (match Hashtbl.find_opt const_map y with
+            | Some n -> FPS_JoinConsts (Itv.alpha n)
+            | None -> FPS_Top)
         | _ -> FPS_Top
       in
       let old =
@@ -878,6 +911,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
 (* Scan all Compiled handler summaries and build a compiled_fixpoint.
    Fallback handlers are left to the iterative fallback path. *)
 let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
+  let const_map = build_const_map init_amem in
   let scalar_tbl : (Abs_Loc.t, fp_scalar) Hashtbl.t = Hashtbl.create 16 in
   let array_writes : fp_array_write list ref = ref [] in
   HandlerStore.IidMap.iter
@@ -885,7 +919,8 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
       match summary with
       | Compiled atoms ->
           List.iter
-            (fun atom -> classify_atom atom init_amem scalar_tbl array_writes)
+            (fun atom ->
+              classify_atom atom init_amem const_map scalar_tbl array_writes)
             atoms
       | Fallback _ -> ())
     !handler_summaries;

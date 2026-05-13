@@ -236,13 +236,11 @@ main {
     *DiagBuf[3] := DriveState;
 
     // [BUG-1] Handler 0 may have set DriveSlot := 200 before this access
-    disable;
     if DriveSlot < DRIVE_SLOTS
     then (
     *DriveTable[DriveSlot] := DriveState;
     CmdType := *CmdBuf[DriveSlot])
     else unit;
-    enable;
 
     if CmdType = CMD_STOP
     then (
