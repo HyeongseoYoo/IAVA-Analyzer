@@ -11,6 +11,7 @@ type source_site = {
   line : int option;
   expr : string;
   value : Abs_Val.t;
+  pps : PPSet.t;
 }
 
 type prov_node = { site : source_site; children : prov_node list }
@@ -124,13 +125,16 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
     prov_node list =
   if depth = 0 then []
   else
+    (* Add all PPs at this level to visited before recursing so that no
+       sibling PP can reappear as a child of another sibling. *)
+    let visited_with_siblings = PPSet.union visited pps in
     PPSet.fold
       (fun pp acc ->
         if PPSet.mem pp visited then acc
         else
           let snapshot = Abs_Sem.find asem pp in
           let loc = Abs_Loc.get var_name in
-          let value, _ = Abs_Mem.find snapshot loc in
+          let value, pps_stored = Abs_Mem.find snapshot loc in
           let lbl_t_opt = lookup_lbl_t tbl pp in
           let line =
             Option.bind lbl_t_opt (fun lt -> lt.line)
@@ -140,8 +144,7 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
             | Some lt -> fmt_exp lt.exp
             | None -> "<unknown>"
           in
-          let site = { pp; line; expr; value } in
-          let visited' = PPSet.add pp visited in
+          let site = { pp; line; expr; value; pps = pps_stored } in
           let children =
             match lbl_t_opt with
             | None -> []
@@ -151,7 +154,7 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
                   (fun v ->
                     let v_loc = Abs_Loc.get v in
                     let _, sub_pps = Abs_Mem.find snapshot v_loc in
-                    trace_pps sub_pps v asem tbl visited' (depth - 1))
+                    trace_pps sub_pps v asem tbl visited_with_siblings (depth - 1))
                   rhs_vars
           in
           { site; children } :: acc)
@@ -217,6 +220,7 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
             | Some lt -> fmt_exp lt.exp
             | None -> "<unknown>");
           value = Abs_Val.bot;
+          pps = PPSet.empty;
         }
       in
       (* Determine which variable names to trace for base and offset.
@@ -263,6 +267,14 @@ let handler_iids_in_chain (c : chain) : int list =
   let from_offset = List.concat_map handler_iids_in_node c.offset_prov in
   List.sort_uniq Int.compare (from_base @ from_offset)
 
+let string_of_ppset (pps : PPSet.t) : string =
+  if PPSet.is_empty pps then "{}"
+  else
+    let elems =
+      PPSet.elements pps |> List.map ProgramPoint.string_of_t
+    in
+    "{" ^ String.concat ", " elems ^ "}"
+
 let string_of_site (s : source_site) : string =
   let loc_str =
     match s.pp with
@@ -275,8 +287,9 @@ let string_of_site (s : source_site) : string =
         | Some l -> Printf.sprintf "line %d" l
         | None -> ProgramPoint.string_of_t s.pp)
   in
-  Printf.sprintf "%s: `%s`  (value: %s)" loc_str s.expr
+  Printf.sprintf "%s: `%s`  (value: %s, pps: %s)" loc_str s.expr
     (Abs_Val.string_of_t s.value)
+    (string_of_ppset s.pps)
 
 let rec string_of_prov_node (depth : int) (node : prov_node) : string =
   let arrow = indent depth ^ "← " in

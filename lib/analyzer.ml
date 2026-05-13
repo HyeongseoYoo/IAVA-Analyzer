@@ -46,7 +46,7 @@ type fp_array_write = {
 }
 
 type compiled_fixpoint = {
-  fp_scalars : (Abs_Loc.t * fp_scalar) list;
+  fp_scalars : (Abs_Loc.t * fp_scalar * PPSet.t) list;
   fp_arrays  : fp_array_write list;
 }
 
@@ -853,7 +853,7 @@ let apply_fp_scalar (fps : fp_scalar) ((itv, u, l) : Abs_Val.t) : Abs_Val.t =
    init_amem is used to resolve which heap block an array pointer refers to. *)
 let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
     (const_map : (string, int) Hashtbl.t)
-    (scalar_tbl : (Abs_Loc.t, fp_scalar) Hashtbl.t)
+    (scalar_tbl : (Abs_Loc.t, fp_scalar * PPSet.t) Hashtbl.t)
     (array_writes : fp_array_write list ref) : unit =
   match atom.lhs.exp with
   | Var x ->
@@ -876,12 +876,14 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
             | None -> FPS_Top)
         | _ -> FPS_Top
       in
-      let old =
+      let handler_pp = ProgramPoint.Label atom.assign_lbl in
+      let old_fps, old_pps =
         match Hashtbl.find_opt scalar_tbl loc with
-        | None -> FPS_Unchanged
-        | Some f -> f
+        | None -> (FPS_Unchanged, PPSet.empty)
+        | Some (f, pps) -> (f, pps)
       in
-      Hashtbl.replace scalar_tbl loc (combine_fp_scalar old fps)
+      Hashtbl.replace scalar_tbl loc
+        (combine_fp_scalar old_fps fps, PPSet.add handler_pp old_pps)
   | Deref ({ exp = Var arr_name; _ }, idx_e) ->
       (* Array write: *arr_name[idx] := rhs.
          Look up which heap block arr_name points to in init_amem. *)
@@ -912,7 +914,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
    Fallback handlers are left to the iterative fallback path. *)
 let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
   let const_map = build_const_map init_amem in
-  let scalar_tbl : (Abs_Loc.t, fp_scalar) Hashtbl.t = Hashtbl.create 16 in
+  let scalar_tbl : (Abs_Loc.t, fp_scalar * PPSet.t) Hashtbl.t = Hashtbl.create 16 in
   let array_writes : fp_array_write list ref = ref [] in
   HandlerStore.IidMap.iter
     (fun _iid summary ->
@@ -925,7 +927,7 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
       | Fallback _ -> ())
     !handler_summaries;
   let fp_scalars =
-    Hashtbl.fold (fun loc fps acc -> (loc, fps) :: acc) scalar_tbl []
+    Hashtbl.fold (fun loc (fps, pps) acc -> (loc, fps, pps) :: acc) scalar_tbl []
   in
   compiled_fp := { fp_scalars; fp_arrays = !array_writes };
   let has_fallback =
@@ -948,15 +950,16 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   (* Pass 1: scalar effects *)
   let amem1 =
     List.fold_left
-      (fun amem (loc, fps) ->
+      (fun amem (loc, fps, handler_pps) ->
         match fps with
         | FPS_Unchanged -> amem
         | _ -> (
             match Abs_Mem.LocMap.find_opt loc amem with
             | None -> amem
-            | Some (v, pp) ->
+            | Some (v, existing_pps) ->
                 let v' = apply_fp_scalar fps v in
-                Abs_Mem.LocMap.add loc (v', pp) amem))
+                let new_pps = PPSet.union existing_pps handler_pps in
+                Abs_Mem.LocMap.add loc (v', new_pps) amem))
       c.amem fp.fp_scalars
   in
   (* Pass 2: array write effects using post-scalar amem for index/value lookup *)
