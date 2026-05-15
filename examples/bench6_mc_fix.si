@@ -149,7 +149,9 @@ init {
     *RegFile[REG_STATUS] := STATE_FAULT;
     *RegFile[REG_FAULT]  := FAULT_HALL;
     *RegFile[REG_ERRORS] := FaultCount;
-    *EventLog[EventHead] := MARK_FAULT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_FAULT
+    else unit;
     EventHead     := EventHead + 1;
     EventCount    := EventCount + 1
   };
@@ -164,7 +166,9 @@ init {
     *RegFile[REG_SPEED]   := FAULT_SLOT;
     *RegFile[REG_FAULT]   := FAULT_OVERCUR;
     *RegFile[REG_ERRORS]  := FaultCount;
-    *EventLog[EventHead]  := MARK_OC;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead]  := MARK_OC
+    else unit;
     EventHead     := EventHead + 1;
     EventCount    := EventCount + 1
   };
@@ -178,7 +182,9 @@ init {
     *RegFile[REG_TEMP]    := FAULT_SLOT;
     *RegFile[REG_FAULT]   := FAULT_OVERHEAT;
     *RegFile[REG_ERRORS]  := FaultCount;
-    *EventLog[EventHead]  := MARK_OVERHEAT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead]  := MARK_OVERHEAT
+    else unit;
     EventHead     := EventHead + 1;
     EventCount    := EventCount + 1
   };
@@ -189,7 +195,9 @@ init {
     LastFault     := FAULT_STALL;
     *RegFile[REG_STATUS] := STATE_BRAKE;
     *RegFile[REG_FAULT]  := FAULT_STALL;
-    *EventLog[EventHead] := MARK_STALL;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_STALL
+    else unit;
     EventHead     := EventHead + 1
   }
 }
@@ -281,28 +289,26 @@ main {
     // logging it.  Handler 1 cannot corrupt RegFile[REG_SPEED] in this window.
     disable;
     SafeSpeed := *DevHandle[REG_SPEED];
+    enable;
     if SafeSpeed < SPEED_LOG_SZ
     then (
       *SpeedLog[SafeSpeed] := RunCycles;
-      enable
     )
     else (
       *SpeedLog[0] := RunCycles;
-      enable
     );
 
     // [FIX-2b] Disable interrupts while reading temperature through DevHandle.
     // Handler 2 cannot corrupt RegFile[REG_TEMP] in this window.
     disable;
     SafeTemp := *DevHandle[REG_TEMP];
+    enable;
     if SafeTemp < TEMP_LOG_SZ
     then (
       *TempLog[SafeTemp] := RunCycles;
-      enable
     )
     else (
       *TempLog[0] := RunCycles;
-      enable
     );
 
     SpeedRpm     := SafeSpeed;

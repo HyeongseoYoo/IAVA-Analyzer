@@ -19,6 +19,11 @@ type summary_atom = {
   lhs : Exp.lbl_t;
   rhs : Exp.lbl_t;
   assign_lbl : Exp.Lbl.t;
+  guard : (Exp.bop * Exp.lbl_t) option;
+  (* Some(bop, cond) ↔ atom lives inside a guarded if-branch.
+     bop is the effective operator for the branch:
+       then-branch of "Var < N"  →  (Lt, cond)  → narrow idx to Var < N
+       else-branch of "Var < N"  →  (Ge, cond)  → narrow idx to Var >= N *)
 }
 
 (* Pre-compiled symbolic summary of a handler body *)
@@ -43,6 +48,7 @@ type fp_array_write = {
   fpa_rhs       : [ `Const of Abs_Val.t | `Var of Abs_Loc.t ]; (* value: const or var *)
   fpa_at        : ProgramPoint.t;
   fpa_offset_pp : PPSet.t;
+  fpa_guard     : (Exp.bop * Exp.lbl_t) option; (* same as summary_atom.guard: narrowed before index lookup *)
 }
 
 type compiled_fixpoint = {
@@ -366,6 +372,20 @@ let narrow_var_in_amem (x : string) (bop : Exp.bop) (other_itv : Itv.t)
       let narrowed = narrow_left bop curr_itv other_itv in
       Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem
 
+(* Apply a single guard constraint to abstract memory.
+   guard = Some(bop, cond_e) where cond_e is a Bop(_, Var x, rhs_e):
+   narrows x in amem by [bop rhs_e]. *)
+let refine_amem_by_guard (guard : (Exp.bop * Exp.lbl_t) option)
+    (amem : Abs_Mem.t) : Abs_Mem.t =
+  match guard with
+  | None -> amem
+  | Some (eff_bop, cond_e) -> (
+      match cond_e.exp with
+      | Bop (_, { exp = Var guard_var; _ }, rhs_e) ->
+          let bound_itv = get_itv_from_exp rhs_e.exp amem in
+          narrow_var_in_amem guard_var eff_bop bound_itv amem
+      | _ -> amem)
+
 (* Refine abstract memory for a branch of an if-expression. [branch=true]
    assumes [cond_exp] is truthy (≠ 0). [branch=false] assumes [cond_exp] is
    falsy (= 0). *)
@@ -375,12 +395,7 @@ let refine_amem (cond_exp : Exp.lbl_t) (branch : bool) (amem : Abs_Mem.t) :
   | Bop (bop, lhs_e, rhs_e) -> (
       let actual_bop = if branch then bop else negate_bop bop in
       let v_lhs = get_itv_from_exp lhs_e.exp amem in
-      let v_rhs = get_itv_from_exp rhs_e.exp amem in
-      let amem1 =
-        match lhs_e.exp with
-        | Var x -> narrow_var_in_amem x actual_bop v_rhs amem
-        | _ -> amem
-      in
+      let amem1 = refine_amem_by_guard (Some (actual_bop, cond_exp)) amem in
       match rhs_e.exp with
       | Var x -> narrow_var_in_amem x (flip_bop actual_bop) v_lhs amem1
       | _ -> amem1)
@@ -660,15 +675,15 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     | If (e1, e2, e3) ->
         let r1, c1 = self c e1 in
         let v1 = proj_int r1.avalue in
+        let c1_true  = { c1 with amem = refine_amem e1 true  c1.amem } in
+        let c1_false = { c1 with amem = refine_amem e1 false c1.amem } in
         if v1 = Itv.Bool.true_ then
-          let r2, c2 = self c1 e2 in
+          let r2, c2 = self c1_true e2 in
           (r2, c2)
         else if v1 = Itv.Bool.false_ then
-          let r3, c3 = self c1 e3 in
+          let r3, c3 = self c1_false e3 in
           (r3, c3)
         else
-          let c1_true = { c1 with amem = refine_amem e1 true c1.amem } in
-          let c1_false = { c1 with amem = refine_amem e1 false c1.amem } in
           let r2, c2 = self c1_true e2 in
           let r3, c3 = self c1_false e3 in
           join_out (r2, c2) (r3, c3)
@@ -903,9 +918,10 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
             | _ -> `Const Abs_Val.top
           in
           let fpa_at = ProgramPoint.Label atom.assign_lbl in
+          let fpa_guard = atom.guard in
           array_writes :=
             { fpa_lbl = lbl; fpa_idx; fpa_rhs; fpa_at;
-              fpa_offset_pp = PPSet.singleton fpa_at }
+              fpa_offset_pp = PPSet.singleton fpa_at; fpa_guard }
             :: !array_writes
       | _ -> ())
   | _ -> ()
@@ -966,11 +982,12 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   let amem2, errs2 =
     List.fold_left
       (fun (amem, errs) (fpa : fp_array_write) ->
+        let amem_for_idx = refine_amem_by_guard fpa.fpa_guard amem in
         let offset_itv =
           match fpa.fpa_idx with
           | `Const itv -> itv
-          | `Var idx_loc -> (
-              match Abs_Mem.LocMap.find_opt idx_loc amem with
+          | `Var idx_loc ->
+              (match Abs_Mem.LocMap.find_opt idx_loc amem_for_idx with
               | Some ((itv, _, _), _) -> itv
               | None -> Itv.bot)
         in
@@ -1003,7 +1020,35 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
         (amem', errs'))
       (amem1, c.errs) fp.fp_arrays
   in
-  { c with amem = amem2; errs = errs2 }
+  (* Pass 3: synthesize Abs_Sem snapshots for handler PPs so provenance
+     tracing can show meaningful values for handler assignment nodes.
+     For each scalar entry with a non-trivial effect, write a minimal
+     snapshot containing just that variable's contributed value at each
+     handler PP that caused it. *)
+  let asem3 =
+    List.fold_left
+      (fun asem (loc, fps, handler_pps) ->
+        match fps with
+        | FPS_Unchanged -> asem
+        | _ ->
+            let contributed_itv =
+              match fps with
+              | FPS_JoinConsts c -> c
+              | _ -> Itv.top
+            in
+            let contributed_val =
+              (contributed_itv, Abs_Unit.bot, Abs_Loc.bot)
+            in
+            PPSet.fold
+              (fun pp asem' ->
+                let snapshot =
+                  Abs_Mem.write Abs_Mem.bot loc contributed_val pp
+                in
+                Abs_Sem.weak_write asem' pp snapshot)
+              handler_pps asem)
+      c.asem fp.fp_scalars
+  in
+  { c with amem = amem2; errs = errs2; asem = asem3 }
 
 (* apply_fixpoint_to_conf: the new post_steps_fn.
    For programs where all handlers compiled successfully, apply the pre-compiled
@@ -1045,28 +1090,42 @@ let print_handler_summaries () : unit =
 (* Pre-processing: compile a handler body AST into a symbolic summary.
    Assign nodes become atoms; sequences and if-branches are flattened.
    Loops and malloc fall back to full no-post evaluation for soundness. *)
+(* For "Var < rhs" conditions, return (then_guard, else_guard) where
+   then_guard uses Lt (Var < rhs) and else_guard uses Ge (Var >= rhs). *)
+let extract_branch_guards (cond_e : Exp.lbl_t)
+    : (Exp.bop * Exp.lbl_t) option * (Exp.bop * Exp.lbl_t) option =
+  match cond_e.exp with
+  | Bop (Lt, { exp = Var _; _ }, _) ->
+      (Some (Lt, cond_e), Some (Ge, cond_e))
+  | _ -> (None, None)
+
+let attach_guard (g : (Exp.bop * Exp.lbl_t) option) (s : handler_summary)
+    : handler_summary =
+  match s with
+  | Compiled atoms -> Compiled (List.map (fun a -> { a with guard = g }) atoms)
+  | Fallback _ -> s
+
 let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
   match lbl_exp.exp with
   | Assign (lhs, rhs) ->
       let assign_lbl = lbl_exp.lbl in
       (match lhs.exp with
-      | Var _ | Deref _ -> Compiled [ { lhs; rhs; assign_lbl } ]
+      | Var _ | Deref _ -> Compiled [ { lhs; rhs; assign_lbl; guard = None } ]
       | _ -> Fallback lbl_exp)
   | Seq (e1, e2) -> (
       match (compile_handler e1, compile_handler e2) with
       | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
       | _ -> Fallback lbl_exp)
-  | If (_, e_then, e_else) -> (
-      (* Both branches are included as an over-approximation; only one is
-         actually taken but we do not track the condition here. *)
-      match (compile_handler e_then, compile_handler e_else) with
+  | If (cond_e, e_then, e_else) ->
+      let then_guard, else_guard = extract_branch_guards cond_e in
+      let then_summary = attach_guard then_guard (compile_handler e_then) in
+      let else_summary = attach_guard else_guard (compile_handler e_else) in
+      (match (then_summary, else_summary) with
       | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
       | _ -> Fallback lbl_exp)
   | Enable | Disable | Unit | Int _ | Var _ | Bop _ | Deref _ ->
-      (* No memory-modifying effect *)
       Compiled []
   | While _ | Malloc _ ->
-      (* Conservative: cannot represent loop or allocation symbolically *)
       Fallback lbl_exp
 
 let init_conf (pgm : Program.t) : conf =

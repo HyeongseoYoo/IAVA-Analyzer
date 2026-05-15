@@ -19,6 +19,7 @@ type prov_node = { site : source_site; children : prov_node list }
 type chain = {
   error : Error.t;
   err_site : source_site;
+  index_var : string;
   base_prov : prov_node list;
   offset_prov : prov_node list;
 }
@@ -239,6 +240,20 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
             | _ -> ("<base>", "<offset>"))
         | _ -> ("<base>", "<offset>")
       in
+      (* Look up the combined value and PPSet of the index variable at the
+         error site by joining across all directly contributing PPs. *)
+      let index_val, index_pps =
+        if offset_var = "<offset>" then (Abs_Val.bot, PPSet.empty)
+        else
+          let loc = Abs_Loc.get offset_var in
+          PPSet.fold
+            (fun pp (v_acc, pps_acc) ->
+              let snapshot = Abs_Sem.find asem pp in
+              let v, _ = Abs_Mem.find snapshot loc in
+              (Abs_Val.join v_acc v, PPSet.add pp pps_acc))
+            e.offset_pp (Abs_Val.bot, PPSet.empty)
+      in
+      let err_site = { err_site with value = index_val; pps = index_pps } in
       let visited0 = PPSet.singleton e.at in
       let base_prov =
         trace_pps e.base_pp base_var asem tbl visited0 max_depth
@@ -246,7 +261,8 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
       let offset_prov =
         trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
       in
-      { error = e; err_site; base_prov; offset_prov } :: acc)
+      { error = e; err_site; index_var = offset_var; base_prov; offset_prov }
+      :: acc)
     errors []
 
 (* ===== Formatters ===== *)
@@ -328,6 +344,13 @@ let string_of_chain (c : chain) : string =
       (Itv.string_of_t c.error.left_oob)
       (Itv.string_of_t c.error.right_oob)
   in
+  let index_str =
+    if c.index_var = "<offset>" || c.err_site.value = Abs_Val.bot then ""
+    else
+      Printf.sprintf "\n  index (%s): %s  pps: %s" c.index_var
+        (Abs_Val.string_of_t c.err_site.value)
+        (string_of_ppset c.err_site.pps)
+  in
   let base_str =
     if c.base_prov = [] then "  (no base provenance found)"
     else
@@ -339,10 +362,10 @@ let string_of_chain (c : chain) : string =
       List.map (string_of_prov_node 1) c.offset_prov |> String.concat "\n"
   in
   Printf.sprintf
-    "Bug at %s: `%s`\n  %s %s\n%s%s\n  Base pointer provenance:\n%s\n  \
+    "Bug at %s: `%s`\n  %s %s\n%s%s%s\n  Base pointer provenance:\n%s\n  \
      Offset provenance:\n%s"
-    at_str c.err_site.expr access_str kind_str handler_str oob_str base_str
-    offset_str
+    at_str c.err_site.expr access_str kind_str handler_str oob_str index_str
+    base_str offset_str
 
 let string_of_report (chains : chain list) : string =
   if chains = [] then "No bugs found."

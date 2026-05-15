@@ -152,7 +152,9 @@ init {
     *RegFile[REG_STATUS] := STATE_FAULT;
     *RegFile[REG_FAULT]  := FAULT_HALL;
     *RegFile[REG_ERRORS] := FaultCount;
-    *EventLog[EventHead] := MARK_FAULT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_FAULT
+    else unit;
     EventHead     := EventHead + 1;
     EventCount    := EventCount + 1
   };
@@ -168,7 +170,9 @@ init {
     *RegFile[REG_SPEED]   := FAULT_SLOT;
     *RegFile[REG_FAULT]   := FAULT_OVERCUR;
     *RegFile[REG_ERRORS]  := FaultCount;
-    *EventLog[EventHead]  := MARK_OC;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead]  := MARK_OC
+    else unit;
     EventHead     := EventHead + 1;
     EventCount    := EventCount + 1
   };
@@ -183,7 +187,9 @@ init {
     *RegFile[REG_TEMP]    := FAULT_SLOT;
     *RegFile[REG_FAULT]   := FAULT_OVERHEAT;
     *RegFile[REG_ERRORS]  := FaultCount;
-    *EventLog[EventHead]  := MARK_OVERHEAT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead]  := MARK_OVERHEAT
+    else unit;
     EventHead     := EventHead + 1;
     EventCount    := EventCount + 1
   };
@@ -195,7 +201,9 @@ init {
     LastFault     := FAULT_STALL;
     *RegFile[REG_STATUS] := STATE_BRAKE;
     *RegFile[REG_FAULT]  := FAULT_STALL;
-    *EventLog[EventHead] := MARK_STALL;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_STALL
+    else unit;
     EventHead     := EventHead + 1
   }
 }
@@ -277,6 +285,7 @@ main {
     // Handler 2 may have set RegFile[REG_TEMP]  := 200 before this read.
 
     // [BUG-2a] SpeedRpm could be 200; SpeedLog has only 16 entries
+    // if DevHandle->Check() then *SpeedLog[DevHandle->getSpeed()] := RunCycles
     SpeedRpm     := *DevHandle[REG_SPEED];
     *SpeedLog[SpeedRpm] := RunCycles;
 
