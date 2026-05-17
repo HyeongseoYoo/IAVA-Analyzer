@@ -76,6 +76,47 @@ let rec vars_in_exp : Exp.t -> string list = function
       vars_in_exp c.exp @ vars_in_exp t.exp @ vars_in_exp f.exp
   | Exp.While (_, c, b) -> vars_in_exp c.exp @ vars_in_exp b.exp
 
+(* Resolve a Deref(base_e, idx_e) expression against a snapshot to find the
+   heap cell's (joined_value, joined_ppset).  Returns None when the base
+   expression does not resolve to a heap pointer in the snapshot.
+   Scans all cells in the snapshot whose lbl matches the base pointer and
+   whose offset interval overlaps the resolved index interval. *)
+let resolve_deref_cell (snapshot : Abs_Mem.t) (base_e : Exp.lbl_t)
+    (idx_e : Exp.lbl_t) : (Abs_Val.t * PPSet.t) option =
+  let base_lbl_opt =
+    match base_e.exp with
+    | Exp.Var base_name ->
+        let (_, _, ptr_loc), _ = Abs_Mem.find snapshot (Abs_Loc.get base_name) in
+        (match ptr_loc with
+        | Abs_Loc.AHeapLoc { lbl; _ } -> Some lbl
+        | _ -> None)
+    | _ -> None
+  in
+  match base_lbl_opt with
+  | None -> None
+  | Some target_lbl ->
+      let idx_itv =
+        match idx_e.exp with
+        | Exp.Int n -> Itv.alpha n
+        | Exp.Var idx_name ->
+            let (itv, _, _), _ = Abs_Mem.find snapshot (Abs_Loc.get idx_name) in
+            itv
+        | _ -> Itv.top
+      in
+      let cell_val, cell_pps =
+        Abs_Mem.fold
+          (fun k (v, pps) (acc_v, acc_pps) ->
+            match k with
+            | Abs_Loc.AHeapLoc { lbl; offset }
+              when Exp.Lbl.compare lbl target_lbl = 0
+                   && Itv.is_overlap idx_itv offset ->
+                (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
+            | _ -> (acc_v, acc_pps))
+          snapshot (Abs_Val.bot, PPSet.empty)
+      in
+      if PPSet.is_empty cell_pps then None
+      else Some (cell_val, cell_pps)
+
 (* Build a unified label → lbl_t table across the whole program so we can
    look up the expression and line for any program point. *)
 let build_lbl_table (pgm : Program.t) :
@@ -121,13 +162,15 @@ let lookup_lbl_t (tbl : Exp.lbl_t Exp.Lbl_map.t) (pp : ProgramPoint.t) :
 
 let max_depth = 10
 
+(* trace_pps and trace_heap_pps are mutually recursive.
+   trace_pps:      follows named scalar variables backward through asem snapshots.
+   trace_heap_pps: follows handler-PP sets that wrote to a heap cell; used when
+                   the expression being traced reads from a heap cell via Deref. *)
 let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
     (tbl : Exp.lbl_t Exp.Lbl_map.t) (visited : PPSet.t) (depth : int) :
     prov_node list =
   if depth = 0 then []
   else
-    (* Add all PPs at this level to visited before recursing so that no
-       sibling PP can reappear as a child of another sibling. *)
     let visited_with_siblings = PPSet.union visited pps in
     PPSet.fold
       (fun pp acc ->
@@ -137,9 +180,7 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
           let loc = Abs_Loc.get var_name in
           let value, pps_stored = Abs_Mem.find snapshot loc in
           let lbl_t_opt = lookup_lbl_t tbl pp in
-          let line =
-            Option.bind lbl_t_opt (fun lt -> lt.line)
-          in
+          let line = Option.bind lbl_t_opt (fun lt -> lt.line) in
           let expr =
             match lbl_t_opt with
             | Some lt -> fmt_exp lt.exp
@@ -151,6 +192,75 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
             | None -> []
             | Some lt ->
                 let rhs_vars = vars_in_exp lt.exp in
+                let scalar_children =
+                  List.concat_map
+                    (fun v ->
+                      let v_loc = Abs_Loc.get v in
+                      let _, sub_pps = Abs_Mem.find snapshot v_loc in
+                      trace_pps sub_pps v asem tbl visited_with_siblings (depth - 1))
+                    rhs_vars
+                in
+                (* When RHS is a heap read (Deref), resolve the cell in the
+                   snapshot and trace handler PPs that wrote to it. *)
+                let heap_children =
+                  let deref_opt =
+                    match lt.exp with
+                    | Exp.Assign (_, { exp = Exp.Deref (base_e, idx_e); _ }) ->
+                        Some (base_e, idx_e)
+                    | _ -> None
+                  in
+                  match deref_opt with
+                  | None -> []
+                  | Some (base_e, idx_e) -> (
+                      match resolve_deref_cell snapshot base_e idx_e with
+                      | None -> []
+                      | Some (cell_val, cell_pps) ->
+                          let handler_pps =
+                            PPSet.filter
+                              (fun p ->
+                                match p with
+                                | ProgramPoint.Label (Exp.Lbl.Handler _) -> true
+                                | _ -> false)
+                              cell_pps
+                          in
+                          if PPSet.is_empty handler_pps then []
+                          else
+                            trace_heap_pps handler_pps cell_val asem tbl
+                              visited_with_siblings (depth - 1))
+                in
+                scalar_children @ heap_children
+          in
+          { site; children } :: acc)
+      pps []
+
+(* Trace provenance for a set of handler PPs that wrote to a heap cell.
+   cell_val is the joined value stored in the cell (shown in the prov_node).
+   For each handler PP, shows the write statement and traces its RHS variables
+   one level deeper via trace_pps. *)
+and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
+    (asem : Abs_Sem.t) (tbl : Exp.lbl_t Exp.Lbl_map.t) (visited : PPSet.t)
+    (depth : int) : prov_node list =
+  if depth = 0 then []
+  else
+    let visited_with_siblings = PPSet.union visited cell_pps in
+    PPSet.fold
+      (fun pp acc ->
+        if PPSet.mem pp visited then acc
+        else
+          let lbl_t_opt = lookup_lbl_t tbl pp in
+          let line = Option.bind lbl_t_opt (fun lt -> lt.line) in
+          let expr =
+            match lbl_t_opt with
+            | Some lt -> fmt_exp lt.exp
+            | None -> "<unknown>"
+          in
+          let site = { pp; line; expr; value = cell_val; pps = PPSet.singleton pp } in
+          let children =
+            match lbl_t_opt with
+            | None -> []
+            | Some lt ->
+                let snapshot = Abs_Sem.find asem pp in
+                let rhs_vars = vars_in_exp lt.exp in
                 List.concat_map
                   (fun v ->
                     let v_loc = Abs_Loc.get v in
@@ -159,7 +269,7 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
                   rhs_vars
           in
           { site; children } :: acc)
-      pps []
+      cell_pps []
 
 (* ===== Deduplication ===== *)
 
@@ -327,9 +437,9 @@ let string_of_chain (c : chain) : string =
   let access_str = Error.string_of_access c.error.access in
   let kind_str = string_of_bug_kind (bug_kind_of c.error) in
   let handler_str =
-    if not c.error.handler_caused then ""
+    let iids = handler_iids_in_chain c in
+    if iids = [] && not c.error.handler_caused then ""
     else
-      let iids = handler_iids_in_chain c in
       let iid_str =
         if iids = [] then "unknown interrupt handler"
         else

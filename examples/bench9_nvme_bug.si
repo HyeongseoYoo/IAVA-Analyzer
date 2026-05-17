@@ -1,0 +1,304 @@
+// Benchmark 9: NVMe Command Queue Manager (SSD HIL) — BUGGY VERSION
+//
+// Pattern 1 — Index-variable corruption:
+//   CmdSlot is used as an index into SqBuf[16] (Submission Queue entries) and
+//   CqBuf[16] (Completion Queue entries).  Handler 0 (NVME_ERR_EVT) sets
+//   CmdSlot := INVALID_CID (= 255) on an NVMe protocol error.  Between the
+//   while-condition check (CmdSlot < MAX_CMDS) and the SqBuf/CqBuf accesses
+//   in the body, the handler can fire and overwrite CmdSlot with 255, which is
+//   far beyond the 16-entry arrays.
+//
+// Pattern 2 — Object-based hidden shared state:
+//   NvmeCtrl is assigned the same heap block as NvmeRegs (the NVMe controller
+//   BAR0 register file).  This mirrors a C++ embedded driver where a
+//   NvmeController object and a TimeoutHandler object both hold the address of
+//   the same statically-allocated ControlBlock; the ISR calls
+//   setAbortPtr(INVALID_CID) through the TimeoutHandler, while main reads the
+//   PRP pointer through NvmeController::getPrpPtr() — they refer to the same
+//   register field (REG_PRPPTR).
+//   Handler 1 (TIMEOUT_EVT) writes INVALID_CID into NvmeRegs[REG_PRPPTR].
+//   Main reads the PRP pointer through NvmeCtrl and uses it as an index into
+//   PrpList[16] — OOB when the handler has stored 255.
+//
+// handler 0 — NVME_ERR_EVT  : sets CmdSlot := INVALID_CID (Pattern 1 bug)
+// handler 1 — TIMEOUT_EVT   : sets NvmeRegs[REG_PRPPTR] := INVALID_CID (Pattern 2 bug)
+// handler 2 — CQ_FULL_EVT   : advances CQ head, increments completion count
+// handler 3 — DOORBELL_EVT  : increments SQ tail, logs doorbell event
+
+init {
+  // === Array sizes ===
+  MAX_CMDS      := 16;
+  PRP_LIST_SZ   := 16;
+  CQ_BUF_SZ     := 16;
+  SQ_BUF_SZ     := 16;
+  ERR_LOG_SZ    := 16;
+  EVENT_LOG_SZ  := 32;
+  DIAG_BUF_SZ   := 8;
+  NVME_REG_SZ   := 16;
+
+  // === Error / abort sentinel (intentionally OOB) ===
+  INVALID_CID   := 255;
+  ERR_NONE      := 0;
+  ERR_INVAL_CMD := 1;
+  ERR_TIMEOUT   := 2;
+  ERR_ABORT     := 3;
+  ERR_MEDIA     := 4;
+  ERR_INTERNAL  := 5;
+  ERR_DATA      := 6;
+  ERR_POWER     := 7;
+
+  // === Command states ===
+  CMD_FREE      := 0;
+  CMD_PENDING   := 1;
+  CMD_ACTIVE    := 2;
+  CMD_COMPLETE  := 3;
+  CMD_ABORT     := 4;
+  CMD_ERROR     := 5;
+
+  // === NvmeRegs field indices ===
+  REG_STATUS    := 0;
+  REG_PRPPTR    := 1;
+  REG_SQTAIL    := 2;
+  REG_CQHEAD    := 3;
+  REG_ERRCNT    := 4;
+  REG_CMDCNT    := 5;
+  REG_ABORTCNT  := 6;
+  REG_FLAGS     := 7;
+  REG_TIMEOUT   := 8;
+  REG_LASTCID   := 9;
+
+  // === Trace markers ===
+  MARK_SUBMIT   := 10;
+  MARK_COMPLETE := 20;
+  MARK_ERROR    := 30;
+  MARK_ABORT    := 40;
+  MARK_TIMEOUT  := 50;
+  MARK_DOORBELL := 60;
+  MARK_FLUSH    := 70;
+  MARK_RESET    := 80;
+
+  // === State variables ===
+  CmdSlot       := 0;
+  CqHead        := 0;
+  SqTail        := 0;
+  CmdPending    := 0;
+  CmdDone       := 0;
+  ErrCode       := ERR_NONE;
+  ErrCount      := 0;
+  AbortCount    := 0;
+  TimeoutCount  := 0;
+  DoorbellCount := 0;
+  EventHead     := 0;
+  EventCount    := 0;
+  LastPrpPtr    := 0;
+  DiagIdx       := 0;
+
+  // === Arrays ===
+  SqBuf    := malloc(16, CMD_FREE);
+  CqBuf    := malloc(16, 0);
+  PrpList  := malloc(16, 0);
+  ErrLog   := malloc(16, ERR_NONE);
+  EventLog := malloc(32, 0);
+  DiagBuf  := malloc(8, 0);
+  NvmeRegs := malloc(16, 0);
+
+  // Initialize NvmeRegs
+  *NvmeRegs[REG_STATUS]   := ERR_NONE;
+  *NvmeRegs[REG_PRPPTR]   := 0;
+  *NvmeRegs[REG_SQTAIL]   := 0;
+  *NvmeRegs[REG_CQHEAD]   := 0;
+  *NvmeRegs[REG_ERRCNT]   := 0;
+  *NvmeRegs[REG_CMDCNT]   := 0;
+  *NvmeRegs[REG_ABORTCNT] := 0;
+  *NvmeRegs[REG_FLAGS]    := 0;
+  *NvmeRegs[REG_TIMEOUT]  := 0;
+  *NvmeRegs[REG_LASTCID]  := 0;
+
+  // Initialize SQ entries
+  *SqBuf[0] := CMD_FREE;
+  *SqBuf[1] := CMD_FREE;
+  *SqBuf[2] := CMD_FREE;
+  *SqBuf[3] := CMD_FREE;
+
+  handler 0 {
+    // NVME_ERR_EVT — Pattern 1 bug: overwrites CmdSlot with INVALID_CID (255)
+    ErrCode       := ERR_INVAL_CMD;
+    ErrCount      := ErrCount + 1;
+    AbortCount    := AbortCount + 1;
+    CmdSlot       := INVALID_CID;
+    *NvmeRegs[REG_STATUS]   := ERR_INVAL_CMD;
+    *NvmeRegs[REG_ERRCNT]   := ErrCount;
+    *NvmeRegs[REG_ABORTCNT] := AbortCount;
+    *NvmeRegs[REG_FLAGS]    := ERR_INVAL_CMD;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_ERROR
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    // TIMEOUT_EVT — Pattern 2 bug: writes INVALID_CID into REG_PRPPTR
+    TimeoutCount  := TimeoutCount + 1;
+    ErrCount      := ErrCount + 1;
+    *NvmeRegs[REG_PRPPTR]  := INVALID_CID;
+    *NvmeRegs[REG_ERRCNT]  := ErrCount;
+    *NvmeRegs[REG_TIMEOUT] := TimeoutCount;
+    *NvmeRegs[REG_FLAGS]   := ERR_TIMEOUT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_TIMEOUT
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    // CQ_FULL_EVT — advances CQ head, increments completion count
+    CmdDone       := CmdDone + 1;
+    CqHead        := CqHead + 1;
+    *NvmeRegs[REG_CQHEAD] := CqHead;
+    *NvmeRegs[REG_CMDCNT] := CmdDone;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_COMPLETE
+    else unit;
+    EventHead     := EventHead + 1
+  };
+
+  handler 3 {
+    // DOORBELL_EVT — host rings doorbell, advances SQ tail
+    DoorbellCount := DoorbellCount + 1;
+    SqTail        := SqTail + 1;
+    *NvmeRegs[REG_SQTAIL] := SqTail;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_DOORBELL
+    else unit;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: NvmeCtrl aliases NvmeRegs (same BAR0 register block)
+  NvmeCtrl := NvmeRegs;
+
+  // Phase 1: flush SQ, CQ, and error log
+  CmdSlot := 0;
+  while CmdSlot < MAX_CMDS do (
+    *SqBuf[CmdSlot]  := CMD_FREE;
+    *CqBuf[CmdSlot]  := 0;
+    *ErrLog[CmdSlot] := ERR_NONE;
+    CmdSlot          := CmdSlot + 1
+  );
+  CmdSlot := 0;
+
+  *EventLog[0] := MARK_RESET;
+  *EventLog[1] := ERR_NONE;
+  EventHead    := 2;
+  *DiagBuf[0]  := CmdSlot;
+  *DiagBuf[1]  := ErrCode;
+
+  // Phase 2: pre-load SQ with pending commands
+  while CmdSlot < MAX_CMDS do (
+    *SqBuf[CmdSlot] := CMD_PENDING;
+    CmdSlot         := CmdSlot + 1
+  );
+  CmdSlot := 0;
+
+  // Phase 3: main command dispatch loop
+  // [TARGET-1, Pattern 1] CmdSlot is checked in the while condition;
+  // handler 0 can fire after the check and set CmdSlot := 255, so the
+  // subsequent SqBuf and CqBuf accesses become out-of-bounds.
+  while CmdSlot < MAX_CMDS do (
+    *DiagBuf[0] := CmdSlot;
+    *DiagBuf[1] := ErrCode;
+
+    // [BUG-1] Handler 0 may have set CmdSlot := 255 before this access
+    *SqBuf[CmdSlot] := CMD_ACTIVE;
+    *CqBuf[CmdSlot] := ErrCode;
+
+    if ErrCode = ERR_NONE
+    then (
+      *SqBuf[CmdSlot] := CMD_COMPLETE;
+      *EventLog[EventHead] := MARK_COMPLETE;
+      EventHead := EventHead + 1;
+      CmdDone := CmdDone + 1
+    )
+    else (
+      *SqBuf[CmdSlot] := CMD_ERROR;
+      *EventLog[EventHead] := MARK_ERROR;
+      EventHead := EventHead + 1;
+      ErrCount := ErrCount + 1
+    );
+
+    // [TARGET-2, Pattern 2] Read PRP pointer through NvmeCtrl (aliases NvmeRegs).
+    // Handler 1 may have set NvmeRegs[REG_PRPPTR] := 255 before this read.
+
+    // [BUG-2] LastPrpPtr could be 255; PrpList has only 16 entries
+    LastPrpPtr := *NvmeCtrl[REG_PRPPTR];
+    *PrpList[LastPrpPtr] := CmdSlot;
+
+    *DiagBuf[2] := LastPrpPtr;
+    *DiagBuf[3] := ErrCount;
+    *DiagBuf[4] := CmdDone;
+    *DiagBuf[5] := AbortCount;
+
+    CmdSlot := CmdSlot + 1;
+    *NvmeRegs[REG_LASTCID] := CmdSlot
+  );
+
+  // Phase 4: CQ drain loop
+  CqHead := 0;
+  while CqHead < MAX_CMDS do (
+    *DiagBuf[6] := CqHead;
+    if *CqBuf[CqHead] = CMD_PENDING
+    then (
+      *CqBuf[CqHead] := CMD_COMPLETE;
+      *EventLog[EventHead] := MARK_COMPLETE;
+      EventHead := EventHead + 1
+    )
+    else (
+      *CqBuf[CqHead] := 0
+    );
+    CqHead := CqHead + 1
+  );
+
+  // Phase 5: error log scan and statistics
+  CmdSlot := 0;
+  while CmdSlot < ERR_LOG_SZ do (
+    if *ErrLog[CmdSlot] = ERR_NONE
+    then ( *DiagBuf[0] := CmdSlot )
+    else (
+      *DiagBuf[1] := *ErrLog[CmdSlot];
+      ErrCount := ErrCount + 1
+    );
+    CmdSlot := CmdSlot + 1
+  );
+
+  *NvmeRegs[REG_ERRCNT] := ErrCount;
+  *NvmeRegs[REG_CMDCNT] := CmdDone;
+  *NvmeRegs[REG_STATUS] := ERR_NONE;
+
+  *DiagBuf[0] := ErrCount;
+  *DiagBuf[1] := CmdDone;
+  *DiagBuf[2] := AbortCount;
+  *DiagBuf[3] := TimeoutCount;
+  *DiagBuf[4] := DoorbellCount;
+  *DiagBuf[5] := EventCount;
+  *DiagBuf[6] := LastPrpPtr;
+  *DiagBuf[7] := ErrCode;
+
+  // Phase 6: final NVMe state snapshot
+  *EventLog[EventHead] := MARK_FLUSH;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := CmdDone;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := AbortCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := TimeoutCount;
+  EventHead := EventHead + 1;
+  *NvmeRegs[REG_STATUS] := ERR_NONE;
+  *NvmeRegs[REG_CMDCNT] := CmdDone;
+  *NvmeRegs[REG_ERRCNT] := ErrCount;
+  *NvmeRegs[REG_LASTCID] := CmdSlot
+}

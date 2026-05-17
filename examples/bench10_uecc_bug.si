@@ -1,0 +1,323 @@
+// Benchmark 10: Media Error / UECC Handler (SSD HIL) — BUGGY VERSION
+//
+// Pattern 1 — Index-variable corruption:
+//   ErrSlot is used as an index into ErrTable[16] (error descriptor table) and
+//   RetryBuf[16] (retry command buffer).  Handler 0 (UECC_EVT) sets
+//   ErrSlot := FATAL_SLOT (= 200) on an uncorrectable ECC error.  Between the
+//   while-condition check (ErrSlot < MAX_ERR_SLOTS) and the ErrTable/RetryBuf
+//   accesses in the body, the handler can fire and overwrite ErrSlot with 200,
+//   far beyond the 16-entry arrays.
+//
+// Pattern 2 — Object-based hidden shared state:
+//   ErrCtrl is assigned the same heap block as ErrRegs (the error handling
+//   register bank).  This mirrors a C++ embedded driver where an
+//   ErrorController object and a TimeoutHandler object both hold the address of
+//   the same statically-allocated ErrorBlock; the ISR calls
+//   setErrPtr(FATAL_SLOT) through the TimeoutHandler, while main reads the
+//   error pointer through ErrorController::getErrPtr() — they refer to the
+//   same register field (REG_ERRPTR).
+//   Handler 1 (TIMEOUT_EVT) writes FATAL_SLOT into ErrRegs[REG_ERRPTR].
+//   Main reads the error pointer through ErrCtrl and uses it as an index into
+//   ErrLog[16] — OOB when the handler has stored 200.
+//
+// handler 0 — UECC_EVT      : sets ErrSlot := FATAL_SLOT (Pattern 1 bug)
+// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 bug)
+// handler 2 — RETRY_EVT     : increments retry count, updates retry state
+// handler 3 — RECOVERY_EVT  : increments recovery count, clears error state
+
+init {
+  // === Array sizes ===
+  MAX_ERR_SLOTS := 16;
+  ERR_LOG_SZ    := 16;
+  RETRY_BUF_SZ  := 16;
+  STAT_LOG_SZ   := 8;
+  EVENT_LOG_SZ  := 32;
+  DIAG_BUF_SZ   := 8;
+  ERR_REG_SZ    := 16;
+
+  // === Error sentinel (intentionally OOB) ===
+  FATAL_SLOT    := 200;
+  ERR_NONE      := 0;
+  ERR_UECC      := 1;
+  ERR_MEDIA     := 2;
+  ERR_TIMEOUT   := 3;
+  ERR_OVERTEMP  := 4;
+  ERR_WEAR      := 5;
+  ERR_BAD_BLOCK := 6;
+  ERR_ECC_LIMIT := 7;
+
+  // === Error states ===
+  ERR_STATE_OK    := 0;
+  ERR_STATE_WARN  := 1;
+  ERR_STATE_CRIT  := 2;
+  ERR_STATE_FATAL := 3;
+  ERR_STATE_RETRY := 4;
+  ERR_STATE_RECOV := 5;
+
+  // === ErrRegs field indices ===
+  REG_STATUS    := 0;
+  REG_ERRPTR    := 1;
+  REG_ERRTYPE   := 2;
+  REG_RETRYCNT  := 3;
+  REG_ERRCNT    := 4;
+  REG_BADBLK    := 5;
+  REG_TEMP      := 6;
+  REG_WEAR      := 7;
+  REG_FLAGS     := 8;
+  REG_LASTSLOT  := 9;
+
+  // === Trace markers ===
+  MARK_UECC     := 10;
+  MARK_MEDIA    := 20;
+  MARK_RETRY    := 30;
+  MARK_RECOV    := 40;
+  MARK_TIMEOUT  := 50;
+  MARK_WARN     := 60;
+  MARK_FATAL    := 70;
+  MARK_RESET    := 80;
+
+  // === State variables ===
+  ErrSlot       := 0;
+  ErrState      := ERR_STATE_OK;
+  ErrCode       := ERR_NONE;
+  ErrCount      := 0;
+  RetryCount    := 0;
+  RecovCount    := 0;
+  UeccCount     := 0;
+  MediaErrCount := 0;
+  TimeoutCount  := 0;
+  BadBlkCount   := 0;
+  EventHead     := 0;
+  EventCount    := 0;
+  LastErrPtr    := 0;
+  DiagIdx       := 0;
+
+  // === Arrays ===
+  ErrTable := malloc(16, ERR_STATE_OK);
+  RetryBuf := malloc(16, 0);
+  ErrLog   := malloc(16, ERR_NONE);
+  StatLog  := malloc(8, 0);
+  EventLog := malloc(32, 0);
+  DiagBuf  := malloc(8, 0);
+  ErrRegs  := malloc(16, 0);
+
+  // Initialize ErrRegs
+  *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
+  *ErrRegs[REG_ERRPTR]   := 0;
+  *ErrRegs[REG_ERRTYPE]  := ERR_NONE;
+  *ErrRegs[REG_RETRYCNT] := 0;
+  *ErrRegs[REG_ERRCNT]   := 0;
+  *ErrRegs[REG_BADBLK]   := 0;
+  *ErrRegs[REG_TEMP]     := 0;
+  *ErrRegs[REG_WEAR]     := 0;
+  *ErrRegs[REG_FLAGS]    := 0;
+  *ErrRegs[REG_LASTSLOT] := 0;
+
+  // Initialize error table and retry buffer
+  *ErrTable[0] := ERR_STATE_OK;
+  *ErrTable[1] := ERR_STATE_OK;
+  *ErrTable[2] := ERR_STATE_OK;
+  *ErrTable[3] := ERR_STATE_OK;
+  *RetryBuf[0] := 0;
+  *RetryBuf[1] := 0;
+  *RetryBuf[2] := 0;
+  *RetryBuf[3] := 0;
+
+  handler 0 {
+    // UECC_EVT — Pattern 1 bug: overwrites ErrSlot with FATAL_SLOT (200)
+    ErrState      := ERR_STATE_FATAL;
+    ErrCode       := ERR_UECC;
+    ErrCount      := ErrCount + 1;
+    UeccCount     := UeccCount + 1;
+    ErrSlot       := FATAL_SLOT;
+    *ErrRegs[REG_STATUS]  := ERR_STATE_FATAL;
+    *ErrRegs[REG_ERRTYPE] := ERR_UECC;
+    *ErrRegs[REG_ERRCNT]  := ErrCount;
+    *ErrRegs[REG_FLAGS]   := ERR_UECC;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_UECC
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    // TIMEOUT_EVT — Pattern 2 bug: writes FATAL_SLOT into REG_ERRPTR
+    TimeoutCount  := TimeoutCount + 1;
+    ErrCount      := ErrCount + 1;
+    *ErrRegs[REG_ERRPTR]  := FATAL_SLOT;
+    *ErrRegs[REG_ERRCNT]  := ErrCount;
+    *ErrRegs[REG_FLAGS]   := ERR_TIMEOUT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_TIMEOUT
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    // RETRY_EVT — no corruption, increments retry count and logs
+    RetryCount    := RetryCount + 1;
+    *ErrRegs[REG_RETRYCNT] := RetryCount;
+    *ErrRegs[REG_STATUS]   := ERR_STATE_RETRY;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_RETRY
+    else unit;
+    EventHead     := EventHead + 1
+  };
+
+  handler 3 {
+    // RECOVERY_EVT — clears error state and logs recovery
+    RecovCount    := RecovCount + 1;
+    ErrState      := ERR_STATE_OK;
+    *ErrRegs[REG_STATUS] := ERR_STATE_RECOV;
+    *ErrRegs[REG_FLAGS]  := ERR_NONE;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_RECOV
+    else unit;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: ErrCtrl aliases ErrRegs (same error register bank)
+  ErrCtrl := ErrRegs;
+
+  // Phase 1: initialise error table, retry buffer, and error log
+  ErrSlot := 0;
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *ErrTable[ErrSlot] := ERR_STATE_OK;
+    *RetryBuf[ErrSlot] := 0;
+    *ErrLog[ErrSlot]   := ERR_NONE;
+    ErrSlot            := ErrSlot + 1
+  );
+  ErrSlot := 0;
+
+  *EventLog[0] := MARK_RESET;
+  *EventLog[1] := ERR_STATE_OK;
+  EventHead    := 2;
+  *DiagBuf[0]  := ErrSlot;
+  *DiagBuf[1]  := ErrState;
+
+  // Phase 2: pre-fill error table with warning states
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *ErrTable[ErrSlot] := ERR_STATE_WARN;
+    ErrSlot            := ErrSlot + 1
+  );
+  ErrSlot := 0;
+
+  // Phase 3: main error processing loop
+  // [TARGET-1, Pattern 1] ErrSlot is checked in the while condition;
+  // handler 0 can fire after the check and set ErrSlot := 200, so the
+  // subsequent ErrTable and RetryBuf accesses become out-of-bounds.
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *DiagBuf[2] := ErrSlot;
+    *DiagBuf[3] := ErrState;
+
+    // [BUG-1] Handler 0 may have set ErrSlot := 200 before this access
+    *ErrTable[ErrSlot] := ErrState;
+    *RetryBuf[ErrSlot] := ErrCount;
+
+    if ErrState = ERR_STATE_FATAL
+    then (
+      *EventLog[EventHead] := MARK_FATAL;
+      EventHead := EventHead + 1;
+      *ErrTable[ErrSlot] := ERR_STATE_FATAL
+    )
+    else (
+      if ErrState = ERR_STATE_CRIT
+      then (
+        *EventLog[EventHead] := MARK_WARN;
+        EventHead := EventHead + 1;
+        *ErrTable[ErrSlot] := ERR_STATE_CRIT
+      )
+      else (
+        *EventLog[EventHead] := MARK_MEDIA;
+        EventHead := EventHead + 1;
+        MediaErrCount := MediaErrCount + 1;
+        *ErrRegs[REG_STATUS] := ERR_STATE_WARN
+      )
+    );
+
+    // [TARGET-2, Pattern 2] Read error pointer through ErrCtrl (aliases ErrRegs).
+    // Handler 1 may have set ErrRegs[REG_ERRPTR] := 200 before this read.
+
+    // [BUG-2] LastErrPtr could be 200; ErrLog has only 16 entries
+    LastErrPtr := *ErrCtrl[REG_ERRPTR];
+    *ErrLog[LastErrPtr] := ErrCode;
+
+    *DiagBuf[4] := LastErrPtr;
+    *DiagBuf[5] := ErrCount;
+    *DiagBuf[6] := RetryCount;
+    *DiagBuf[7] := UeccCount;
+
+    ErrSlot := ErrSlot + 1;
+    *ErrRegs[REG_LASTSLOT] := ErrSlot
+  );
+
+  // Phase 4: retry drain loop
+  ErrSlot := 0;
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *DiagBuf[0] := ErrSlot;
+    if *RetryBuf[ErrSlot] = ERR_STATE_FATAL
+    then (
+      *RetryBuf[ErrSlot] := ERR_STATE_RECOV;
+      *EventLog[EventHead] := MARK_RECOV;
+      EventHead := EventHead + 1
+    )
+    else (
+      *RetryBuf[ErrSlot] := ERR_NONE
+    );
+    ErrSlot := ErrSlot + 1
+  );
+
+  // Phase 5: error statistics
+  ErrSlot := 0;
+  while ErrSlot < ERR_LOG_SZ do (
+    if *ErrLog[ErrSlot] = ERR_NONE
+    then ( *StatLog[0] := ErrSlot )
+    else (
+      *StatLog[1] := *ErrLog[ErrSlot];
+      ErrCount := ErrCount + 1
+    );
+    ErrSlot := ErrSlot + 1
+  );
+
+  *ErrRegs[REG_ERRCNT]   := ErrCount;
+  *ErrRegs[REG_RETRYCNT] := RetryCount;
+  *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
+
+  *StatLog[2] := ErrCount;
+  *StatLog[3] := RetryCount;
+  *StatLog[4] := UeccCount;
+  *StatLog[5] := MediaErrCount;
+  *StatLog[6] := RecovCount;
+  *StatLog[7] := EventCount;
+
+  *DiagBuf[0] := ErrCount;
+  *DiagBuf[1] := RetryCount;
+  *DiagBuf[2] := UeccCount;
+  *DiagBuf[3] := MediaErrCount;
+  *DiagBuf[4] := RecovCount;
+  *DiagBuf[5] := TimeoutCount;
+  *DiagBuf[6] := EventCount;
+  *DiagBuf[7] := LastErrPtr;
+
+  // Phase 6: final error-state snapshot
+  *EventLog[EventHead] := MARK_RESET;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrState;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := RetryCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := UeccCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := RecovCount;
+  EventHead := EventHead + 1;
+  *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
+  *ErrRegs[REG_ERRCNT]   := ErrCount;
+  *ErrRegs[REG_RETRYCNT] := RetryCount;
+  *ErrRegs[REG_LASTSLOT] := ErrSlot
+}

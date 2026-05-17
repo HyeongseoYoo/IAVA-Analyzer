@@ -1,0 +1,324 @@
+// Benchmark 10: Media Error / UECC Handler (SSD HIL) — FIXED VERSION
+//
+// Fix strategy:
+//   FIX-1 (Pattern 1): Wrap the ErrSlot read and ErrTable/RetryBuf accesses
+//     inside a disable/enable critical section so handler 0 cannot overwrite
+//     ErrSlot between the while-condition check and the array writes.
+//     A two-level bounds guard (>= 0, then < MAX_ERR_SLOTS) eliminates both
+//     left and right OOB.
+//
+//   FIX-2 (Pattern 2): Wrap the ErrCtrl[REG_ERRPTR] read inside a
+//     disable/enable section.  This prevents handler 1 from writing FATAL_SLOT
+//     into ErrRegs[REG_ERRPTR] between the read and the ErrLog write.
+//     An explicit bounds guard on SafeErrPtr eliminates residual OOB widening.
+//
+// handler 0 — UECC_EVT      : sets ErrSlot := FATAL_SLOT (Pattern 1 bug source)
+// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 bug source)
+// handler 2 — RETRY_EVT     : increments retry count, updates retry state
+// handler 3 — RECOVERY_EVT  : increments recovery count, clears error state
+
+init {
+  // === Array sizes ===
+  MAX_ERR_SLOTS := 16;
+  ERR_LOG_SZ    := 16;
+  RETRY_BUF_SZ  := 16;
+  STAT_LOG_SZ   := 8;
+  EVENT_LOG_SZ  := 32;
+  DIAG_BUF_SZ   := 8;
+  ERR_REG_SZ    := 16;
+
+  // === Error sentinel ===
+  FATAL_SLOT    := 200;
+  ERR_NONE      := 0;
+  ERR_UECC      := 1;
+  ERR_MEDIA     := 2;
+  ERR_TIMEOUT   := 3;
+  ERR_OVERTEMP  := 4;
+  ERR_WEAR      := 5;
+  ERR_BAD_BLOCK := 6;
+  ERR_ECC_LIMIT := 7;
+
+  // === Error states ===
+  ERR_STATE_OK    := 0;
+  ERR_STATE_WARN  := 1;
+  ERR_STATE_CRIT  := 2;
+  ERR_STATE_FATAL := 3;
+  ERR_STATE_RETRY := 4;
+  ERR_STATE_RECOV := 5;
+
+  // === ErrRegs field indices ===
+  REG_STATUS    := 0;
+  REG_ERRPTR    := 1;
+  REG_ERRTYPE   := 2;
+  REG_RETRYCNT  := 3;
+  REG_ERRCNT    := 4;
+  REG_BADBLK    := 5;
+  REG_TEMP      := 6;
+  REG_WEAR      := 7;
+  REG_FLAGS     := 8;
+  REG_LASTSLOT  := 9;
+
+  // === Trace markers ===
+  MARK_UECC     := 10;
+  MARK_MEDIA    := 20;
+  MARK_RETRY    := 30;
+  MARK_RECOV    := 40;
+  MARK_TIMEOUT  := 50;
+  MARK_WARN     := 60;
+  MARK_FATAL    := 70;
+  MARK_RESET    := 80;
+
+  // === State variables ===
+  ErrSlot       := 0;
+  ErrState      := ERR_STATE_OK;
+  ErrCode       := ERR_NONE;
+  ErrCount      := 0;
+  RetryCount    := 0;
+  RecovCount    := 0;
+  UeccCount     := 0;
+  MediaErrCount := 0;
+  TimeoutCount  := 0;
+  BadBlkCount   := 0;
+  EventHead     := 0;
+  EventCount    := 0;
+  LastErrPtr    := 0;
+  SafeErrPtr    := 0;
+  DiagIdx       := 0;
+
+  // === Arrays ===
+  ErrTable := malloc(16, ERR_STATE_OK);
+  RetryBuf := malloc(16, 0);
+  ErrLog   := malloc(16, ERR_NONE);
+  StatLog  := malloc(8, 0);
+  EventLog := malloc(32, 0);
+  DiagBuf  := malloc(8, 0);
+  ErrRegs  := malloc(16, 0);
+
+  // Initialize ErrRegs
+  *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
+  *ErrRegs[REG_ERRPTR]   := 0;
+  *ErrRegs[REG_ERRTYPE]  := ERR_NONE;
+  *ErrRegs[REG_RETRYCNT] := 0;
+  *ErrRegs[REG_ERRCNT]   := 0;
+  *ErrRegs[REG_BADBLK]   := 0;
+  *ErrRegs[REG_TEMP]     := 0;
+  *ErrRegs[REG_WEAR]     := 0;
+  *ErrRegs[REG_FLAGS]    := 0;
+  *ErrRegs[REG_LASTSLOT] := 0;
+
+  // Initialize error table and retry buffer
+  *ErrTable[0] := ERR_STATE_OK;
+  *ErrTable[1] := ERR_STATE_OK;
+  *ErrTable[2] := ERR_STATE_OK;
+  *ErrTable[3] := ERR_STATE_OK;
+  *RetryBuf[0] := 0;
+  *RetryBuf[1] := 0;
+  *RetryBuf[2] := 0;
+  *RetryBuf[3] := 0;
+
+  handler 0 {
+    ErrState      := ERR_STATE_FATAL;
+    ErrCode       := ERR_UECC;
+    ErrCount      := ErrCount + 1;
+    UeccCount     := UeccCount + 1;
+    ErrSlot       := FATAL_SLOT;
+    *ErrRegs[REG_STATUS]  := ERR_STATE_FATAL;
+    *ErrRegs[REG_ERRTYPE] := ERR_UECC;
+    *ErrRegs[REG_ERRCNT]  := ErrCount;
+    *ErrRegs[REG_FLAGS]   := ERR_UECC;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_UECC
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    TimeoutCount  := TimeoutCount + 1;
+    ErrCount      := ErrCount + 1;
+    *ErrRegs[REG_ERRPTR]  := FATAL_SLOT;
+    *ErrRegs[REG_ERRCNT]  := ErrCount;
+    *ErrRegs[REG_FLAGS]   := ERR_TIMEOUT;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_TIMEOUT
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    RetryCount    := RetryCount + 1;
+    *ErrRegs[REG_RETRYCNT] := RetryCount;
+    *ErrRegs[REG_STATUS]   := ERR_STATE_RETRY;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_RETRY
+    else unit;
+    EventHead     := EventHead + 1
+  };
+
+  handler 3 {
+    RecovCount    := RecovCount + 1;
+    ErrState      := ERR_STATE_OK;
+    *ErrRegs[REG_STATUS] := ERR_STATE_RECOV;
+    *ErrRegs[REG_FLAGS]  := ERR_NONE;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_RECOV
+    else unit;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: ErrCtrl aliases ErrRegs (same error register bank)
+  ErrCtrl := ErrRegs;
+
+  // Phase 1: initialise error table, retry buffer, and error log
+  ErrSlot := 0;
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *ErrTable[ErrSlot] := ERR_STATE_OK;
+    *RetryBuf[ErrSlot] := 0;
+    *ErrLog[ErrSlot]   := ERR_NONE;
+    ErrSlot            := ErrSlot + 1
+  );
+  ErrSlot := 0;
+
+  *EventLog[0] := MARK_RESET;
+  *EventLog[1] := ERR_STATE_OK;
+  EventHead    := 2;
+  *DiagBuf[0]  := ErrSlot;
+  *DiagBuf[1]  := ErrState;
+
+  // Phase 2: pre-fill error table with warning states
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *ErrTable[ErrSlot] := ERR_STATE_WARN;
+    ErrSlot            := ErrSlot + 1
+  );
+  ErrSlot := 0;
+
+  // Phase 3: main error processing loop
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *DiagBuf[2] := ErrSlot;
+    *DiagBuf[3] := ErrState;
+
+    // [FIX-1] Disable interrupts, re-check ErrSlot bounds before array access.
+    disable;
+    if ErrSlot >= 0
+    then (
+      if ErrSlot < MAX_ERR_SLOTS
+      then (
+        *ErrTable[ErrSlot] := ErrState;
+        *RetryBuf[ErrSlot] := ErrCount
+      )
+      else unit
+    )
+    else unit;
+    enable;
+
+    if ErrState = ERR_STATE_FATAL
+    then (
+      *EventLog[EventHead] := MARK_FATAL;
+      EventHead := EventHead + 1
+    )
+    else (
+      if ErrState = ERR_STATE_CRIT
+      then (
+        *EventLog[EventHead] := MARK_WARN;
+        EventHead := EventHead + 1
+      )
+      else (
+        *EventLog[EventHead] := MARK_MEDIA;
+        EventHead := EventHead + 1;
+        MediaErrCount := MediaErrCount + 1;
+        *ErrRegs[REG_STATUS] := ERR_STATE_WARN
+      )
+    );
+
+    // [FIX-2] Disable interrupts while reading error pointer through ErrCtrl.
+    // Handler 1 cannot corrupt ErrRegs[REG_ERRPTR] in this window.
+    disable;
+    SafeErrPtr := *ErrCtrl[REG_ERRPTR];
+    enable;
+    if SafeErrPtr < ERR_LOG_SZ
+    then (
+      *ErrLog[SafeErrPtr] := ErrCode
+    )
+    else (
+      *ErrLog[0] := ErrCode
+    );
+    LastErrPtr := SafeErrPtr;
+
+    *DiagBuf[4] := LastErrPtr;
+    *DiagBuf[5] := ErrCount;
+    *DiagBuf[6] := RetryCount;
+    *DiagBuf[7] := UeccCount;
+
+    ErrSlot := ErrSlot + 1;
+    *ErrRegs[REG_LASTSLOT] := ErrSlot
+  );
+
+  // Phase 4: retry drain loop
+  ErrSlot := 0;
+  while ErrSlot < MAX_ERR_SLOTS do (
+    *DiagBuf[0] := ErrSlot;
+    if *RetryBuf[ErrSlot] = ERR_STATE_FATAL
+    then (
+      *RetryBuf[ErrSlot] := ERR_STATE_RECOV;
+      *EventLog[EventHead] := MARK_RECOV;
+      EventHead := EventHead + 1
+    )
+    else (
+      *RetryBuf[ErrSlot] := ERR_NONE
+    );
+    ErrSlot := ErrSlot + 1
+  );
+
+  // Phase 5: error statistics
+  ErrSlot := 0;
+  while ErrSlot < ERR_LOG_SZ do (
+    if *ErrLog[ErrSlot] = ERR_NONE
+    then ( *StatLog[0] := ErrSlot )
+    else (
+      *StatLog[1] := *ErrLog[ErrSlot];
+      ErrCount := ErrCount + 1
+    );
+    ErrSlot := ErrSlot + 1
+  );
+
+  *ErrRegs[REG_ERRCNT]   := ErrCount;
+  *ErrRegs[REG_RETRYCNT] := RetryCount;
+  *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
+
+  *StatLog[2] := ErrCount;
+  *StatLog[3] := RetryCount;
+  *StatLog[4] := UeccCount;
+  *StatLog[5] := MediaErrCount;
+  *StatLog[6] := RecovCount;
+  *StatLog[7] := EventCount;
+
+  *DiagBuf[0] := ErrCount;
+  *DiagBuf[1] := RetryCount;
+  *DiagBuf[2] := UeccCount;
+  *DiagBuf[3] := MediaErrCount;
+  *DiagBuf[4] := RecovCount;
+  *DiagBuf[5] := TimeoutCount;
+  *DiagBuf[6] := EventCount;
+  *DiagBuf[7] := LastErrPtr;
+
+  // Phase 6: final error-state snapshot
+  *EventLog[EventHead] := MARK_RESET;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrState;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := RetryCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := UeccCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := RecovCount;
+  EventHead := EventHead + 1;
+  *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
+  *ErrRegs[REG_ERRCNT]   := ErrCount;
+  *ErrRegs[REG_RETRYCNT] := RetryCount;
+  *ErrRegs[REG_LASTSLOT] := ErrSlot
+}

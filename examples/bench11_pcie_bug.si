@@ -1,0 +1,321 @@
+// Benchmark 11: PCIe Link Manager (SSD HIL) — BUGGY VERSION
+//
+// Pattern 1 — Index-variable corruption:
+//   LinkSlot is used as an index into LinkTable[16] (link state table per
+//   logical function) and LinkBuf[16] (link event ring buffer).  Handler 0
+//   (LINK_DOWN_EVT) sets LinkSlot := INVALID_LINK (= 255) when the PCIe link
+//   drops.  Between the while-condition check (LinkSlot < MAX_LINKS) and the
+//   LinkTable/LinkBuf accesses in the body, the handler can fire and overwrite
+//   LinkSlot with 255, far beyond the 16-entry arrays.
+//
+// Pattern 2 — Object-based hidden shared state:
+//   LinkCtrl is assigned the same heap block as LinkRegs (the PCIe link
+//   management register bank).  This mirrors a C++ embedded driver where a
+//   LinkController object and an LtssmHandler object both hold the address of
+//   the same statically-allocated LinkBlock; the ISR calls
+//   setLtssmPtr(INVALID_LINK) through the LtssmHandler, while main reads the
+//   LTSSM state pointer through LinkController::getLtssmPtr() — they refer to
+//   the same register field (REG_LTSSMPTR).
+//   Handler 1 (LTSSM_EVT) writes INVALID_LINK into LinkRegs[REG_LTSSMPTR].
+//   Main reads the LTSSM pointer through LinkCtrl and uses it as an index into
+//   StatBuf[16] — OOB when the handler has stored 255.
+//
+// handler 0 — LINK_DOWN_EVT : sets LinkSlot := INVALID_LINK (Pattern 1 bug)
+// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 bug)
+// handler 2 — LINK_UP_EVT   : increments link-up count, clears link-down state
+// handler 3 — PM_EVT        : updates power management state, logs PM event
+
+init {
+  // === Array sizes ===
+  MAX_LINKS     := 16;
+  STAT_BUF_SZ   := 16;
+  LINK_BUF_SZ   := 16;
+  PM_LOG_SZ     := 8;
+  EVENT_LOG_SZ  := 32;
+  DIAG_BUF_SZ   := 8;
+  LINK_REG_SZ   := 16;
+
+  // === Link sentinel (intentionally OOB) ===
+  INVALID_LINK  := 255;
+  LINK_OK       := 0;
+  LINK_DOWN     := 1;
+  LINK_TRAINING := 2;
+  LINK_RECOVERY := 3;
+  LINK_DISABLED := 4;
+  LINK_LOOPBACK := 5;
+  LINK_HOT_RST  := 6;
+  LINK_ERR      := 7;
+
+  // === LTSSM states ===
+  LTSSM_DETECT  := 0;
+  LTSSM_POLLING := 1;
+  LTSSM_CONFIG  := 2;
+  LTSSM_L0      := 3;
+  LTSSM_L0S     := 4;
+  LTSSM_L1      := 5;
+  LTSSM_L2      := 6;
+  LTSSM_RECOV   := 7;
+
+  // === LinkRegs field indices ===
+  REG_STATUS    := 0;
+  REG_LTSSMPTR  := 1;
+  REG_SPEED     := 2;
+  REG_WIDTH     := 3;
+  REG_ERRCNT    := 4;
+  REG_LINKCNT   := 5;
+  REG_FLAGS     := 6;
+  REG_PMSTATE   := 7;
+  REG_RETRYCNT  := 8;
+  REG_LASTLINK  := 9;
+
+  // === Trace markers ===
+  MARK_LINKUP   := 10;
+  MARK_LINKDOWN := 20;
+  MARK_TRAINING := 30;
+  MARK_RECOVERY := 40;
+  MARK_PMENTER  := 50;
+  MARK_PMEXIT   := 60;
+  MARK_HOTPLUG  := 70;
+  MARK_RESET    := 80;
+
+  // === State variables ===
+  LinkSlot      := 0;
+  LinkState     := LTSSM_DETECT;
+  LinkSpeed     := 0;
+  LinkWidth     := 0;
+  ErrCount      := 0;
+  LinkUpCount   := 0;
+  LinkDownCount := 0;
+  RecovCount    := 0;
+  PmState       := 0;
+  EventHead     := 0;
+  EventCount    := 0;
+  LastLtssmPtr  := 0;
+  DiagIdx       := 0;
+
+  // === Arrays ===
+  LinkTable := malloc(16, LTSSM_DETECT);
+  LinkBuf   := malloc(16, 0);
+  StatBuf   := malloc(16, 0);
+  PmLog     := malloc(8, 0);
+  EventLog  := malloc(32, 0);
+  DiagBuf   := malloc(8, 0);
+  LinkRegs  := malloc(16, 0);
+
+  // Initialize LinkRegs
+  *LinkRegs[REG_STATUS]   := LTSSM_DETECT;
+  *LinkRegs[REG_LTSSMPTR] := 0;
+  *LinkRegs[REG_SPEED]    := 0;
+  *LinkRegs[REG_WIDTH]    := 0;
+  *LinkRegs[REG_ERRCNT]   := 0;
+  *LinkRegs[REG_LINKCNT]  := 0;
+  *LinkRegs[REG_FLAGS]    := 0;
+  *LinkRegs[REG_PMSTATE]  := 0;
+  *LinkRegs[REG_RETRYCNT] := 0;
+  *LinkRegs[REG_LASTLINK] := 0;
+
+  // Initialize link table and link buffer
+  *LinkTable[0] := LTSSM_DETECT;
+  *LinkTable[1] := LTSSM_DETECT;
+  *LinkTable[2] := LTSSM_DETECT;
+  *LinkTable[3] := LTSSM_DETECT;
+  *LinkBuf[0]   := 0;
+  *LinkBuf[1]   := 0;
+  *LinkBuf[2]   := 0;
+  *LinkBuf[3]   := 0;
+
+  handler 0 {
+    // LINK_DOWN_EVT — Pattern 1 bug: overwrites LinkSlot with INVALID_LINK (255)
+    LinkState     := LINK_DOWN;
+    ErrCount      := ErrCount + 1;
+    LinkDownCount := LinkDownCount + 1;
+    LinkSlot      := INVALID_LINK;
+    *LinkRegs[REG_STATUS] := LINK_DOWN;
+    *LinkRegs[REG_ERRCNT] := ErrCount;
+    *LinkRegs[REG_FLAGS]  := LINK_DOWN;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_LINKDOWN
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 1 {
+    // LTSSM_EVT — Pattern 2 bug: writes INVALID_LINK into REG_LTSSMPTR
+    RecovCount    := RecovCount + 1;
+    *LinkRegs[REG_LTSSMPTR] := INVALID_LINK;
+    *LinkRegs[REG_STATUS]   := LTSSM_RECOV;
+    *LinkRegs[REG_FLAGS]    := LINK_RECOVERY;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_RECOVERY
+    else unit;
+    EventHead     := EventHead + 1;
+    EventCount    := EventCount + 1
+  };
+
+  handler 2 {
+    // LINK_UP_EVT — no corruption, increments link-up count and clears error
+    LinkUpCount   := LinkUpCount + 1;
+    LinkState     := LTSSM_L0;
+    *LinkRegs[REG_STATUS]  := LTSSM_L0;
+    *LinkRegs[REG_LINKCNT] := LinkUpCount;
+    *LinkRegs[REG_FLAGS]   := LINK_OK;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_LINKUP
+    else unit;
+    EventHead     := EventHead + 1
+  };
+
+  handler 3 {
+    // PM_EVT — updates power management state and logs PM event
+    PmState       := PmState + 1;
+    *LinkRegs[REG_PMSTATE] := PmState;
+    if EventHead < EVENT_LOG_SZ
+    then *EventLog[EventHead] := MARK_PMENTER
+    else unit;
+    EventHead     := EventHead + 1
+  }
+}
+
+main {
+  // Pattern 2: LinkCtrl aliases LinkRegs (same PCIe link register bank)
+  LinkCtrl := LinkRegs;
+
+  // Phase 1: initialise link table, link buffer, and stat buffer
+  LinkSlot := 0;
+  while LinkSlot < MAX_LINKS do (
+    *LinkTable[LinkSlot] := LTSSM_DETECT;
+    *LinkBuf[LinkSlot]   := 0;
+    *StatBuf[LinkSlot]   := 0;
+    LinkSlot             := LinkSlot + 1
+  );
+  LinkSlot := 0;
+
+  *EventLog[0] := MARK_RESET;
+  *EventLog[1] := LTSSM_DETECT;
+  EventHead    := 2;
+  *DiagBuf[0]  := LinkSlot;
+  *DiagBuf[1]  := LinkState;
+
+  // Phase 2: training sweep — set all slots to polling state
+  while LinkSlot < MAX_LINKS do (
+    *LinkTable[LinkSlot] := LTSSM_POLLING;
+    LinkSlot             := LinkSlot + 1
+  );
+  LinkSlot := 0;
+
+  // Phase 3: main link state update loop
+  // [TARGET-1, Pattern 1] LinkSlot is checked in the while condition;
+  // handler 0 can fire after the check and set LinkSlot := 255, so the
+  // subsequent LinkTable and LinkBuf accesses become out-of-bounds.
+  while LinkSlot < MAX_LINKS do (
+    *DiagBuf[2] := LinkSlot;
+    *DiagBuf[3] := LinkState;
+
+    // [BUG-1] Handler 0 may have set LinkSlot := 255 before this access
+    *LinkTable[LinkSlot] := LinkState;
+    *LinkBuf[LinkSlot]   := ErrCount;
+
+    if LinkState = LINK_DOWN
+    then (
+      *EventLog[EventHead] := MARK_LINKDOWN;
+      EventHead := EventHead + 1;
+      *LinkTable[LinkSlot] := LINK_DOWN
+    )
+    else (
+      if LinkState = LINK_RECOVERY
+      then (
+        *EventLog[EventHead] := MARK_RECOVERY;
+        EventHead := EventHead + 1;
+        *LinkTable[LinkSlot] := LINK_RECOVERY
+      )
+      else (
+        *EventLog[EventHead] := MARK_TRAINING;
+        EventHead := EventHead + 1;
+        LinkUpCount := LinkUpCount + 1;
+        *LinkRegs[REG_LINKCNT] := LinkUpCount
+      )
+    );
+
+    // [TARGET-2, Pattern 2] Read LTSSM pointer through LinkCtrl (aliases LinkRegs).
+    // Handler 1 may have set LinkRegs[REG_LTSSMPTR] := 255 before this read.
+
+    // [BUG-2] LastLtssmPtr could be 255; StatBuf has only 16 entries
+    LastLtssmPtr := *LinkCtrl[REG_LTSSMPTR];
+    *StatBuf[LastLtssmPtr] := LinkState;
+
+    *DiagBuf[4] := LastLtssmPtr;
+    *DiagBuf[5] := ErrCount;
+    *DiagBuf[6] := LinkUpCount;
+    *DiagBuf[7] := LinkDownCount;
+
+    LinkSlot := LinkSlot + 1;
+    *LinkRegs[REG_LASTLINK] := LinkSlot
+  );
+
+  // Phase 4: link drain and recovery sweep
+  LinkSlot := 0;
+  while LinkSlot < MAX_LINKS do (
+    *DiagBuf[0] := LinkSlot;
+    if *LinkBuf[LinkSlot] = LINK_DOWN
+    then (
+      *LinkBuf[LinkSlot] := LINK_RECOVERY;
+      *EventLog[EventHead] := MARK_RECOVERY;
+      EventHead := EventHead + 1
+    )
+    else (
+      *LinkBuf[LinkSlot] := LINK_OK
+    );
+    LinkSlot := LinkSlot + 1
+  );
+
+  // Phase 5: link statistics
+  LinkSlot := 0;
+  while LinkSlot < MAX_LINKS do (
+    if *StatBuf[LinkSlot] = LINK_DOWN
+    then ( *PmLog[0] := LinkSlot )
+    else (
+      *PmLog[1] := *StatBuf[LinkSlot];
+      LinkUpCount := LinkUpCount + 1
+    );
+    LinkSlot := LinkSlot + 1
+  );
+
+  *LinkRegs[REG_ERRCNT]  := ErrCount;
+  *LinkRegs[REG_LINKCNT] := LinkUpCount;
+  *LinkRegs[REG_STATUS]  := LTSSM_L0;
+
+  *PmLog[2] := ErrCount;
+  *PmLog[3] := LinkUpCount;
+  *PmLog[4] := LinkDownCount;
+  *PmLog[5] := RecovCount;
+  *PmLog[6] := PmState;
+  *PmLog[7] := EventCount;
+
+  *DiagBuf[0] := ErrCount;
+  *DiagBuf[1] := LinkUpCount;
+  *DiagBuf[2] := LinkDownCount;
+  *DiagBuf[3] := RecovCount;
+  *DiagBuf[4] := PmState;
+  *DiagBuf[5] := EventCount;
+  *DiagBuf[6] := LastLtssmPtr;
+  *DiagBuf[7] := LinkState;
+
+  // Phase 6: final PCIe link snapshot
+  *EventLog[EventHead] := MARK_RESET;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := LinkState;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := ErrCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := LinkUpCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := LinkDownCount;
+  EventHead := EventHead + 1;
+  *EventLog[EventHead] := RecovCount;
+  EventHead := EventHead + 1;
+  *LinkRegs[REG_STATUS]  := LTSSM_L0;
+  *LinkRegs[REG_LINKCNT] := LinkUpCount;
+  *LinkRegs[REG_ERRCNT]  := ErrCount;
+  *LinkRegs[REG_LASTLINK] := LinkSlot
+}
