@@ -233,8 +233,13 @@ main {
     // Handler 1 may have set NvmeRegs[REG_PRPPTR] := 255 before this read.
 
     // [BUG-2] LastPrpPtr could be 255; PrpList has only 16 entries
-    LastPrpPtr := *NvmeCtrl[REG_PRPPTR];
-    *PrpList[LastPrpPtr] := CmdSlot;
+    if *NvmeCtrl[REG_PRPPTR] < PRP_LIST_SZ
+    then (
+      *PrpList[*NvmeCtrl[REG_PRPPTR]] := CmdSlot
+    )
+    else (
+      *PrpList[0] := CmdSlot
+    );
 
     *DiagBuf[2] := LastPrpPtr;
     *DiagBuf[3] := ErrCount;

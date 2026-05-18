@@ -13,8 +13,8 @@ init {
 
 main {
   disable;
-  (if CurrentUser = INVALID
+  if CurrentUser < INVALID
   then CurrentUser := INIT
-  else (*Status[CurrentUser] := 1; CurrentUser := SVC));
+  else ( *Status[CurrentUser] := 1; CurrentUser := SVC );
   enable
 }

@@ -548,7 +548,17 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
             size_tbl := LblMap.add lbl n_itv !size_tbl;
             (* [0, n-1] *)
             let base_l = Abs_Loc.alloc lbl (Itv (Z 0, Z 0)) in
-            let amem' = Abs_Mem.write c2.amem l v pp in
+            (* Store finite heap allocations as singleton cells. *)
+            let heap_cells =
+              match Abs_Loc.heap_singletons_opt l with
+              | Some cells -> cells
+              | None -> [ l ]
+            in
+            let amem' =
+              List.fold_left
+                (fun amem cell -> Abs_Mem.write amem cell v pp)
+                c2.amem heap_cells
+            in
             ({ r with avalue = abs_loc base_l }, { c2 with amem = amem' }))
     | Deref (e1, e2) -> (
         let r1, c1 = self c e1 in
@@ -556,29 +566,19 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let base_loc = proj_loc r1.avalue in
         let offset_itv = proj_int r2.avalue in
         let shifted_loc = Abs_Loc.offset_add base_loc offset_itv in
-        let full_base_loc, safe_itv, left_oob, right_oob =
+        (* Clip dereference targets to in-bounds offsets before memory access. *)
+        let safe_itv, left_oob, right_oob =
           match base_loc with
-          | Abs_Loc.AHeapLoc { lbl; _ } ->
-              let size_itv = find_size lbl in
-              let full_loc = Abs_Loc.AHeapLoc { lbl; offset = size_itv } in
-              let safe_itv, left_oob, right_oob = itv_overlap shifted_loc in
-              (full_loc, safe_itv, left_oob, right_oob)
+          | Abs_Loc.AHeapLoc _ -> itv_overlap shifted_loc
           | Abs_Loc.AVarLoc _ | Abs_Loc.Bot ->
-              (Abs_Loc.Bot, Itv.bot, Itv.bot, Itv.bot)
-          | Abs_Loc.Top -> (Abs_Loc.Top, Itv.top, Itv.top, Itv.top)
+              (Itv.bot, Itv.bot, Itv.bot)
+          | Abs_Loc.Top -> (Itv.top, Itv.top, Itv.top)
         in
 
-        let read_loc =
+        let access_loc =
           match base_loc with
           | Abs_Loc.AHeapLoc { lbl; _ } ->
               Abs_Loc.AHeapLoc { lbl; offset = safe_itv }
-          | Abs_Loc.AVarLoc _ | Abs_Loc.Bot -> Abs_Loc.Bot
-          | Abs_Loc.Top -> Abs_Loc.Top
-        in
-
-        let write_loc =
-          match base_loc with
-          | Abs_Loc.AHeapLoc _ -> full_base_loc
           | Abs_Loc.AVarLoc _ | Abs_Loc.Bot -> Abs_Loc.Bot
           | Abs_Loc.Top -> Abs_Loc.Top
         in
@@ -589,11 +589,11 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
             ~left_oob ~right_oob ~base_pp:r1.app ~offset_pp:r2.app c2
         in
         if lvalue then
-          match write_loc with
+          match access_loc with
           | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
-          | _ -> ({ r with avalue = abs_loc write_loc }, c2_err)
+          | _ -> ({ r with avalue = abs_loc access_loc }, c2_err)
         else
-          match read_loc with
+          match access_loc with
           | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
           | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2_err)
           | Abs_Loc.AVarLoc _ | Abs_Loc.AHeapLoc _ ->
@@ -601,7 +601,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
                 Abs_Mem.fold
                   (fun (k : Abs_Loc.t) ((v, pps) : Abs_Val.t * PPSet.t)
                        (acc_v, acc_pps) ->
-                    if loc_overlap read_loc k then
+                    if loc_overlap access_loc k then
                       (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
                     else (acc_v, acc_pps))
                   c2.amem (Abs_Val.bot, PPSet.empty)
@@ -995,6 +995,10 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
           Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = offset_itv }
         in
         let in_itv, left_oob, right_oob = itv_overlap write_loc in
+        (* Report the original target, but write only the safe in-bounds part. *)
+        let in_bounds_write_loc =
+          Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = in_itv }
+        in
         let errs' =
           if left_oob = Itv.bot && right_oob = Itv.bot then errs
           else
@@ -1015,7 +1019,7 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
         in
         let amem' =
           if in_itv = Itv.bot then amem
-          else Abs_Mem.write amem write_loc rhs_val fpa.fpa_at
+          else Abs_Mem.write amem in_bounds_write_loc rhs_val fpa.fpa_at
         in
         (amem', errs'))
       (amem1, c.errs) fp.fp_arrays

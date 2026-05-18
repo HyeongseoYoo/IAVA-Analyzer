@@ -261,6 +261,17 @@ let or_ i1 i2 =
 
 let is_singleton = function Bot -> false | Itv (l, r) -> Bound.compare l r = 0
 
+(* Extract a concrete integer from a singleton interval when possible. *)
+let singleton_int_opt = function
+  | Itv (Bound.Z l, Bound.Z r) when l = r -> Some l
+  | _ -> None
+
+(* Enumerate finite integer intervals for heap-cell materialization. *)
+let finite_ints_opt = function
+  | Itv (Bound.Z l, Bound.Z r) when Stdlib.(l <= r) ->
+      Some (List.init (r - l + 1) (fun i -> l + i))
+  | _ -> None
+
 let single_eq i1 i2 =
   match (i1, i2) with
   | Bot, _ | _, Bot -> false

@@ -47,6 +47,31 @@ module Abs_Loc = struct
     | AHeapLoc { lbl; offset = base_off } ->
         AHeapLoc { lbl; offset = Itv.add base_off offset }
 
+  let is_singleton = function
+    | Bot | Top -> false
+    | AVarLoc { offset; _ } | AHeapLoc { offset; _ } -> Itv.is_singleton offset
+
+  (* Split a finite heap interval into singleton abstract cells. *)
+  let heap_singletons_opt = function
+    | AHeapLoc { lbl; offset } ->
+        Option.map
+          (List.map (fun n -> AHeapLoc { lbl; offset = Itv.alpha n }))
+          (Itv.finite_ints_opt offset)
+    | _ -> None
+
+  (* May-alias check used to read/write interval heap targets. *)
+  let overlap l1 l2 =
+    match (l1, l2) with
+    | Bot, _ | _, Bot -> false
+    | Top, _ | _, Top -> true
+    | AVarLoc { id = id1; offset = off1 }, AVarLoc { id = id2; offset = off2 }
+      ->
+        Var.compare id1 id2 = 0 && Itv.is_overlap off1 off2
+    | ( AHeapLoc { lbl = lbl1; offset = off1 },
+        AHeapLoc { lbl = lbl2; offset = off2 } ) ->
+        Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.is_overlap off1 off2
+    | _ -> false
+
   let leq l1 l2 =
     match (l1, l2) with
     | Bot, _ -> true
@@ -264,15 +289,47 @@ module Abs_Mem = struct
     | Some vp -> vp
     | None -> (Abs_Val.bot, PPSet.empty)
 
+  (* Strong update replaces both value and provenance. *)
+  let strong_write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t)
+      (pp : ProgramPoint.t) : t =
+    LocMap.add l (v, PPSet.singleton pp) m
+
+  (* Weak update joins with the previous value at the same map key. *)
+  let weak_write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t)
+      (pp : ProgramPoint.t) : t =
+    let old_v, old_pps = find m l in
+    let new_v = Abs_Val.join old_v v in
+    let new_pps = PPSet.add pp old_pps in
+    LocMap.add l (new_v, new_pps) m
+
+  (* Weakly update every materialized cell overlapped by an interval target. *)
+  let weak_write_overlapping (m : t) (l : Abs_Loc.t) (v : Abs_Val.t)
+      (pp : ProgramPoint.t) : t =
+    let m', touched =
+      LocMap.fold
+        (fun k (old_v, old_pps) (acc, did_touch) ->
+          if Abs_Loc.overlap l k then
+            let new_v = Abs_Val.join old_v v in
+            let new_pps = PPSet.add pp old_pps in
+            (LocMap.add k (new_v, new_pps) acc, true)
+          else (acc, did_touch))
+        m (m, false)
+    in
+    if touched then m' else weak_write m l v pp
+
+  (* Top may target any location, including already materialized cells. *)
+  let weak_write_all (m : t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
+    LocMap.fold (fun k _ acc -> weak_write acc k v pp) m
+      (weak_write m Abs_Loc.Top v pp)
+
+  (* Heap singleton targets are strong; heap interval targets are weak. *)
   let write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
     match l with
-    | Abs_Loc.AVarLoc { id = _; offset = _ } ->
-        LocMap.add l (v, PPSet.singleton pp) m
-    | _ ->
-        let old_v, old_pps = find m l in
-        let new_v = Abs_Val.join old_v v in
-        let new_pps = PPSet.add pp old_pps in
-        LocMap.add l (new_v, new_pps) m
+    | Abs_Loc.Bot -> m
+    | Abs_Loc.AVarLoc _ -> strong_write m l v pp
+    | Abs_Loc.AHeapLoc _ when Abs_Loc.is_singleton l -> strong_write m l v pp
+    | Abs_Loc.AHeapLoc _ -> weak_write_overlapping m l v pp
+    | Abs_Loc.Top -> weak_write_all m v pp
 
   let fold (f : Abs_Loc.t -> Abs_Val.t * PPSet.t -> 'a -> 'a) (m : t)
       (init : 'a) : 'a =
