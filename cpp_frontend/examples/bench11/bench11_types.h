@@ -1,0 +1,58 @@
+#pragma once
+
+namespace bench11 {
+
+enum PcieConst : int {
+  MAX_LINKS = 16,
+  STAT_BUF_SZ = 16,
+  LINK_BUF_SZ = 16,
+  PM_LOG_SZ = 8,
+  EVENT_LOG_SZ = 32,
+  DIAG_BUF_SZ = 8,
+  LINK_REG_SZ = 16,
+
+  INVALID_LINK = 255,
+  LINK_OK = 0,
+  LINK_DOWN = 1,
+  LINK_TRAINING = 2,
+  LINK_RECOVERY = 3,
+  LINK_DISABLED = 4,
+  LINK_LOOPBACK = 5,
+  LINK_HOT_RST = 6,
+  LINK_ERR = 7,
+
+  LTSSM_DETECT = 0,
+  LTSSM_POLLING = 1,
+  LTSSM_CONFIG = 2,
+  LTSSM_L0 = 3,
+  LTSSM_L0S = 4,
+  LTSSM_L1 = 5,
+  LTSSM_L2 = 6,
+  LTSSM_RECOV = 7,
+
+  REG_STATUS = 0,
+  REG_LTSSMPTR = 1,
+  REG_SPEED = 2,
+  REG_WIDTH = 3,
+  REG_ERRCNT = 4,
+  REG_LINKCNT = 5,
+  REG_FLAGS = 6,
+  REG_PMSTATE = 7,
+  REG_RETRYCNT = 8,
+  REG_LASTLINK = 9,
+
+  MARK_LINKUP = 10,
+  MARK_LINKDOWN = 20,
+  MARK_TRAINING = 30,
+  MARK_RECOVERY = 40,
+  MARK_PMENTER = 50,
+  MARK_PMEXIT = 60,
+  MARK_HOTPLUG = 70,
+  MARK_RESET = 80
+};
+
+struct Task {
+  int opcode;
+};
+
+} // namespace bench11
