@@ -254,12 +254,23 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
             | Some lt -> fmt_exp lt.exp
             | None -> "<unknown>"
           in
-          let site = { pp; line; expr; value = cell_val; pps = PPSet.singleton pp } in
+          (* For scalar alias assignments (Assign(Var lhs, rhs)), look up the
+             LHS variable in the snapshot to get its actual value and ppset
+             rather than using the heap cell's value/pps, which are wrong here.
+             For heap writes (Assign(Deref(...), rhs)) or handler PPs, use
+             the passed cell_val / cell_pps. *)
+          let snapshot = Abs_Sem.find asem pp in
+          let site_value, site_pps =
+            match lbl_t_opt with
+            | Some { exp = Exp.Assign ({ exp = Exp.Var lhs_var; _ }, _); _ } ->
+                Abs_Mem.find snapshot (Abs_Loc.get lhs_var)
+            | _ -> (cell_val, cell_pps)
+          in
+          let site = { pp; line; expr; value = site_value; pps = site_pps } in
           let children =
             match lbl_t_opt with
             | None -> []
             | Some lt ->
-                let snapshot = Abs_Sem.find asem pp in
                 let rhs_vars = vars_in_exp lt.exp in
                 List.concat_map
                   (fun v ->
@@ -336,24 +347,56 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
       in
       (* Determine which variable names to trace for base and offset.
          We look at the expression at the error site to extract the base
-         variable (LHS of Deref) and offset variable (index of Deref). *)
-      let base_var, offset_var =
+         variable (LHS of Deref) and offset variable (index of Deref).
+         off_e_opt carries the Deref sub-expression when the index is itself
+         a Deref (Pattern 2: heap-mediated index), so we can call
+         trace_heap_pps instead of trace_pps for the offset provenance. *)
+      let base_var, offset_var, off_e_opt =
         match err_lbl_opt with
         | Some { exp = Exp.Deref (base_e, off_e); _ } ->
-            ( (match base_e.exp with Exp.Var x -> x | _ -> "<base>"),
-              match off_e.exp with Exp.Var x -> x | _ -> "<offset>" )
+            let bv = match base_e.exp with Exp.Var x -> x | _ -> "<base>" in
+            let ov, deref =
+              match off_e.exp with
+              | Exp.Var x -> (x, None)
+              | Exp.Deref _ -> (fmt_exp off_e.exp, Some off_e)
+              | _ -> ("<offset>", None)
+            in
+            (bv, ov, deref)
         | Some { exp = Exp.Assign (lhs, _); _ } -> (
             match lhs.exp with
             | Exp.Deref (base_e, off_e) ->
-                ( (match base_e.exp with Exp.Var x -> x | _ -> "<base>"),
-                  match off_e.exp with Exp.Var x -> x | _ -> "<offset>" )
-            | _ -> ("<base>", "<offset>"))
-        | _ -> ("<base>", "<offset>")
+                let bv = match base_e.exp with Exp.Var x -> x | _ -> "<base>" in
+                let ov, deref =
+                  match off_e.exp with
+                  | Exp.Var x -> (x, None)
+                  | Exp.Deref _ -> (fmt_exp off_e.exp, Some off_e)
+                  | _ -> ("<offset>", None)
+                in
+                (bv, ov, deref)
+            | _ -> ("<base>", "<offset>", None))
+        | _ -> ("<base>", "<offset>", None)
       in
-      (* Look up the combined value and PPSet of the index variable at the
-         error site by joining across all directly contributing PPs. *)
+      (* Look up the combined value and PPSet of the index at the error site.
+         For a simple Var index: join across contributing PP snapshots.
+         For a Deref index (heap-mediated): use the full abstract index range
+         reconstructed from the error's OOB fields, attributed to the handler
+         PPs in offset_pp. *)
+      let is_deref_index = off_e_opt <> None in
+      let handler_offset_pps =
+        PPSet.filter
+          (fun p ->
+            match p with
+            | ProgramPoint.Label (Exp.Lbl.Handler _) -> true
+            | _ -> false)
+          e.offset_pp
+      in
       let index_val, index_pps =
-        if offset_var = "<offset>" then (Abs_Val.bot, PPSet.empty)
+        if is_deref_index then
+          let full_itv =
+            Itv.join (Itv.join e.in_itv e.left_oob) e.right_oob
+          in
+          ((full_itv, Abs_Unit.bot, Abs_Loc.bot), e.offset_pp)
+        else if offset_var = "<offset>" then (Abs_Val.bot, PPSet.empty)
         else
           let loc = Abs_Loc.get offset_var in
           PPSet.fold
@@ -369,7 +412,36 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
         trace_pps e.base_pp base_var asem tbl visited0 max_depth
       in
       let offset_prov =
-        trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
+        if is_deref_index then
+          let heap_prov =
+            if PPSet.is_empty handler_offset_pps then
+              trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
+            else
+              trace_heap_pps e.offset_pp index_val asem tbl visited0 max_depth
+          in
+          (* Also trace the inner base variable (e.g. NvmeCtrl) by looking it
+             up in the snapshot at the error site. This surfaces aliasing steps
+             like `NvmeCtrl := NvmeRegs` that are not part of the heap cell's
+             own write history (offset_pp). *)
+          let alias_prov =
+            match off_e_opt with
+            | Some { exp = Exp.Deref (inner_base_e, _); _ } -> (
+                match inner_base_e.exp with
+                | Exp.Var inner_base_var ->
+                    let snapshot = Abs_Sem.find asem e.at in
+                    let _, inner_pps =
+                      Abs_Mem.find snapshot (Abs_Loc.get inner_base_var)
+                    in
+                    if PPSet.is_empty inner_pps then []
+                    else
+                      trace_pps inner_pps inner_base_var asem tbl visited0
+                        (max_depth - 1)
+                | _ -> [])
+            | _ -> []
+          in
+          heap_prov @ alias_prov
+        else
+          trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
       in
       { error = e; err_site; index_var = offset_var; base_prov; offset_prov }
       :: acc)

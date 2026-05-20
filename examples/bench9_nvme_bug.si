@@ -212,8 +212,10 @@ main {
     *DiagBuf[1] := ErrCode;
 
     // [BUG-1] Handler 0 may have set CmdSlot := 255 before this access
-    *SqBuf[CmdSlot] := CMD_ACTIVE;
-    *CqBuf[CmdSlot] := ErrCode;
+    if CmdSlot < MAX_CMDS
+    then ( *SqBuf[CmdSlot] := CMD_ACTIVE;
+    *CqBuf[CmdSlot] := ErrCode)
+    else unit;
 
     if ErrCode = ERR_NONE
     then (

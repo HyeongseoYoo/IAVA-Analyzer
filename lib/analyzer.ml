@@ -1019,7 +1019,7 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
         in
         let amem' =
           if in_itv = Itv.bot then amem
-          else Abs_Mem.write amem in_bounds_write_loc rhs_val fpa.fpa_at
+          else Abs_Mem.weak_write amem in_bounds_write_loc rhs_val fpa.fpa_at
         in
         (amem', errs'))
       (amem1, c.errs) fp.fp_arrays
@@ -1052,7 +1052,33 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
               handler_pps asem)
       c.asem fp.fp_scalars
   in
-  { c with amem = amem2; errs = errs2; asem = asem3 }
+  (* Pass 4: synthesize Abs_Sem snapshots for handler PPs of array writes.
+     For each fp_array_write with a Var RHS, record the RHS variable's value
+     and back-pps (from amem2) in a snapshot at the handler PP.  This lets
+     trace_heap_pps trace one level deeper into the RHS of the handler
+     assignment (e.g. INVALID_CID → its init assignment). *)
+  let asem4 =
+    List.fold_left
+      (fun asem (fpa : fp_array_write) ->
+        let snapshot =
+          match fpa.fpa_rhs with
+          | `Const _ -> Abs_Mem.bot
+          | `Var val_loc -> (
+              match Abs_Mem.LocMap.find_opt val_loc amem2 with
+              | None -> Abs_Mem.bot
+              | Some (v, existing_pps) ->
+                  PPSet.fold
+                    (fun pp snap -> Abs_Mem.weak_write snap val_loc v pp)
+                    existing_pps Abs_Mem.bot)
+        in
+        if snapshot = Abs_Mem.bot then asem
+        else
+          PPSet.fold
+            (fun pp asem' -> Abs_Sem.weak_write asem' pp snapshot)
+            fpa.fpa_offset_pp asem)
+      asem3 fp.fp_arrays
+  in
+  { c with amem = amem2; errs = errs2; asem = asem4 }
 
 (* apply_fixpoint_to_conf: the new post_steps_fn.
    For programs where all handlers compiled successfully, apply the pre-compiled
