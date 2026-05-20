@@ -12,8 +12,14 @@
 //     into LinkRegs[REG_LTSSMPTR] between the read and the StatBuf write.
 //     An explicit bounds guard on SafeLtssmPtr eliminates residual OOB widening.
 //
+//   FIX-3 (Pattern 3): Same technique as FIX-2 applied at the innermost level
+//     of the 5-level alias chain.  Disable interrupts before reading
+//     L5StateRef[REG_LTSSMPTR] and re-enable immediately after capturing the
+//     value into SafeLtssmPtr2.  The bounds guard on SafeLtssmPtr2 then prevents
+//     OOB into StatBuf2 even if the captured value is later seen as unconstrained.
+//
 // handler 0 — LINK_DOWN_EVT : sets LinkSlot := INVALID_LINK (Pattern 1 bug source)
-// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 bug source)
+// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 + 3 bug source)
 // handler 2 — LINK_UP_EVT   : increments link-up count, clears link-down state
 // handler 3 — PM_EVT        : updates power management state, logs PM event
 
@@ -84,6 +90,7 @@ init {
   EventCount    := 0;
   LastLtssmPtr  := 0;
   SafeLtssmPtr  := 0;
+  SafeLtssmPtr2 := 0;
   DiagIdx       := 0;
 
   // === Arrays ===
@@ -94,6 +101,7 @@ init {
   EventLog  := malloc(32, 0);
   DiagBuf   := malloc(8, 0);
   LinkRegs  := malloc(16, 0);
+  StatBuf2  := malloc(16, 0);
 
   // Initialize LinkRegs
   *LinkRegs[REG_STATUS]   := LTSSM_DETECT;
@@ -170,6 +178,14 @@ main {
   // Pattern 2: LinkCtrl aliases LinkRegs (same PCIe link register bank)
   LinkCtrl := LinkRegs;
 
+  // Pattern 3: 5-level pointer chain — every level aliases LinkRegs
+  // Simulates: main -> getLinkSubsys -> getLinkManager -> getLinkChannel -> getLtssmEngine
+  L1LinkRef  := LinkCtrl;   // "getLinkSubsys(ctrl)"
+  L2SubRef   := L1LinkRef;  // "getLinkManager(subsys)"
+  L3FuncRef  := L2SubRef;   // "getLinkChannel(manager)"
+  L4LtssmRef := L3FuncRef;  // "getLtssmEngine(channel)"
+  L5StateRef := L4LtssmRef; // "getLtssmDescriptor(engine)" — aliases LinkRegs
+
   // Phase 1: initialise link table, link buffer, and stat buffer
   LinkSlot := 0;
   while LinkSlot < MAX_LINKS do (
@@ -244,6 +260,18 @@ main {
       *StatBuf[0] := LinkState
     );
     LastLtssmPtr := SafeLtssmPtr;
+
+    // [FIX-3] Disable interrupts while reading through the 5-level deep chain.
+    // Without the critical section, handler 1 could corrupt LinkRegs[REG_LTSSMPTR]
+    // between the bounds check on *L5StateRef[REG_LTSSMPTR] and its use as an index.
+    disable;
+    SafeLtssmPtr2 := *L5StateRef[REG_LTSSMPTR];
+    enable;
+    if SafeLtssmPtr2 < STAT_BUF_SZ
+    then (
+      *StatBuf2[SafeLtssmPtr2] := LinkState
+    )
+    else unit;
 
     *DiagBuf[4] := LastLtssmPtr;
     *DiagBuf[5] := ErrCount;

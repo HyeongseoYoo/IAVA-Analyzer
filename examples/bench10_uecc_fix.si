@@ -12,8 +12,14 @@
 //     into ErrRegs[REG_ERRPTR] between the read and the ErrLog write.
 //     An explicit bounds guard on SafeErrPtr eliminates residual OOB widening.
 //
+//   FIX-3 (Pattern 3): Same technique as FIX-2 applied at the innermost level
+//     of the 5-level alias chain.  Disable interrupts before reading
+//     L5SlotRef[REG_ERRPTR] and re-enable immediately after capturing the value
+//     into SafeErrPtr2.  The bounds guard on SafeErrPtr2 then prevents OOB
+//     into ErrLog2 even if the captured value is later seen as unconstrained.
+//
 // handler 0 — UECC_EVT      : sets ErrSlot := FATAL_SLOT (Pattern 1 bug source)
-// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 bug source)
+// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 + 3 bug source)
 // handler 2 — RETRY_EVT     : increments retry count, updates retry state
 // handler 3 — RECOVERY_EVT  : increments recovery count, clears error state
 
@@ -83,6 +89,7 @@ init {
   EventCount    := 0;
   LastErrPtr    := 0;
   SafeErrPtr    := 0;
+  SafeErrPtr2   := 0;
   DiagIdx       := 0;
 
   // === Arrays ===
@@ -93,6 +100,7 @@ init {
   EventLog := malloc(32, 0);
   DiagBuf  := malloc(8, 0);
   ErrRegs  := malloc(16, 0);
+  ErrLog2  := malloc(16, ERR_NONE);
 
   // Initialize ErrRegs
   *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
@@ -172,6 +180,14 @@ main {
   // Pattern 2: ErrCtrl aliases ErrRegs (same error register bank)
   ErrCtrl := ErrRegs;
 
+  // Pattern 3: 5-level pointer chain — every level aliases ErrRegs
+  // Simulates: main -> getErrSubsys -> getErrManager -> getErrChannel -> getErrEngine
+  L1ErrRef  := ErrCtrl;    // "getErrSubsys(ctrl)"
+  L2CtrlRef := L1ErrRef;   // "getErrManager(subsys)"
+  L3MgrRef  := L2CtrlRef;  // "getErrChannel(manager)"
+  L4HndlRef := L3MgrRef;   // "getErrEngine(channel)"
+  L5SlotRef := L4HndlRef;  // "getErrDescriptor(engine)" — aliases ErrRegs
+
   // Phase 1: initialise error table, retry buffer, and error log
   ErrSlot := 0;
   while ErrSlot < MAX_ERR_SLOTS do (
@@ -246,6 +262,18 @@ main {
       *ErrLog[0] := ErrCode
     );
     LastErrPtr := SafeErrPtr;
+
+    // [FIX-3] Disable interrupts while reading through the 5-level deep chain.
+    // Without the critical section, handler 1 could corrupt ErrRegs[REG_ERRPTR]
+    // between the bounds check on *L5SlotRef[REG_ERRPTR] and its use as an index.
+    disable;
+    SafeErrPtr2 := *L5SlotRef[REG_ERRPTR];
+    enable;
+    if SafeErrPtr2 < ERR_LOG_SZ
+    then (
+      *ErrLog2[SafeErrPtr2] := ErrCode
+    )
+    else unit;
 
     *DiagBuf[4] := LastErrPtr;
     *DiagBuf[5] := ErrCount;

@@ -20,8 +20,20 @@
 //   Main reads the LTSSM pointer through LinkCtrl and uses it as an index into
 //   StatBuf[16] — OOB when the handler has stored 255.
 //
+// Pattern 3 — Deep-chain hidden shared state (5-level alias):
+//   Same root cause as Pattern 2, but the alias is buried under five levels of
+//   pointer indirection, simulating a real firmware call chain:
+//     main -> getLinkSubsys -> getLinkManager -> getLinkChannel -> getLtssmEngine
+//   Each level passes a link register reference one step deeper.  The analyzer
+//   must trace L5StateRef->L4LtssmRef->L3FuncRef->L2SubRef->L1LinkRef->LinkCtrl->
+//   LinkRegs to conclude that the LTSSM_EVT handler can corrupt the value read
+//   by main five indirections away.
+//   Handler 1 (LTSSM_EVT) writes INVALID_LINK into LinkRegs[REG_LTSSMPTR].
+//   Main reads through L5StateRef and uses the value as an index into StatBuf2[16]
+//   — OOB when the handler has stored 255 between the check and the use.
+//
 // handler 0 — LINK_DOWN_EVT : sets LinkSlot := INVALID_LINK (Pattern 1 bug)
-// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 bug)
+// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 + 3 bug)
 // handler 2 — LINK_UP_EVT   : increments link-up count, clears link-down state
 // handler 3 — PM_EVT        : updates power management state, logs PM event
 
@@ -101,6 +113,7 @@ init {
   EventLog  := malloc(32, 0);
   DiagBuf   := malloc(8, 0);
   LinkRegs  := malloc(16, 0);
+  StatBuf2  := malloc(16, 0);
 
   // Initialize LinkRegs
   *LinkRegs[REG_STATUS]   := LTSSM_DETECT;
@@ -181,6 +194,14 @@ main {
   // Pattern 2: LinkCtrl aliases LinkRegs (same PCIe link register bank)
   LinkCtrl := LinkRegs;
 
+  // Pattern 3: 5-level pointer chain — every level aliases LinkRegs
+  // Simulates: main -> getLinkSubsys -> getLinkManager -> getLinkChannel -> getLtssmEngine
+  L1LinkRef  := LinkCtrl;   // "getLinkSubsys(ctrl)"
+  L2SubRef   := L1LinkRef;  // "getLinkManager(subsys)"
+  L3FuncRef  := L2SubRef;   // "getLinkChannel(manager)"
+  L4LtssmRef := L3FuncRef;  // "getLtssmEngine(channel)"
+  L5StateRef := L4LtssmRef; // "getLtssmDescriptor(engine)" — aliases LinkRegs
+
   // Phase 1: initialise link table, link buffer, and stat buffer
   LinkSlot := 0;
   while LinkSlot < MAX_LINKS do (
@@ -243,6 +264,19 @@ main {
     // [BUG-2] LastLtssmPtr could be 255; StatBuf has only 16 entries
     LastLtssmPtr := *LinkCtrl[REG_LTSSMPTR];
     *StatBuf[LastLtssmPtr] := LinkState;
+
+    // [TARGET-3, Pattern 3] Same shared-state bug as Pattern 2, buried under a
+    // 5-level pointer chain.  A developer reading only the innermost level cannot
+    // tell that L5StateRef aliases LinkRegs without tracing five assignments back.
+    // Handler 1 may write INVALID_LINK to LinkRegs[REG_LTSSMPTR] between the two
+    // reads of *L5StateRef[REG_LTSSMPTR], turning the bounds check into a false
+    // guarantee and making the subsequent array index 255.
+    // [BUG-3] second read of *L5StateRef[REG_LTSSMPTR] can be 255; StatBuf2 has 16 entries
+    if *L5StateRef[REG_LTSSMPTR] < STAT_BUF_SZ
+    then (
+      *StatBuf2[*L5StateRef[REG_LTSSMPTR]] := LinkState
+    )
+    else unit;
 
     *DiagBuf[4] := LastLtssmPtr;
     *DiagBuf[5] := ErrCount;

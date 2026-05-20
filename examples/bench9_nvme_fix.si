@@ -11,6 +11,12 @@
 //     into NvmeRegs[REG_PRPPTR] between the read and the PrpList write.
 //     An explicit bounds guard on SafePrpPtr eliminates residual OOB widening.
 //
+//   FIX-3 (Pattern 3): Same technique as FIX-2 applied at the innermost level
+//     of the 5-level alias chain.  Disable interrupts before reading
+//     L5DmaRef[REG_PRPPTR] and re-enable immediately after capturing the value
+//     into SafePrpPtr2.  The bounds guard on SafePrpPtr2 then prevents OOB
+//     into PrpList2 even if the captured value is later seen as unconstrained.
+//
 // handler 0 — NVME_ERR_EVT  : sets CmdSlot := INVALID_CID (Pattern 1 bug source)
 // handler 1 — TIMEOUT_EVT   : sets NvmeRegs[REG_PRPPTR] := INVALID_CID (Pattern 2 bug source)
 // handler 2 — CQ_FULL_EVT   : advances CQ head, increments completion count
@@ -83,6 +89,7 @@ init {
   EventCount    := 0;
   LastPrpPtr    := 0;
   SafePrpPtr    := 0;
+  SafePrpPtr2   := 0;
   DiagIdx       := 0;
 
   // === Arrays ===
@@ -93,6 +100,7 @@ init {
   EventLog := malloc(32, 0);
   DiagBuf  := malloc(8, 0);
   NvmeRegs := malloc(16, 0);
+  PrpList2 := malloc(16, 0);
 
   // Initialize NvmeRegs
   *NvmeRegs[REG_STATUS]   := ERR_NONE;
@@ -168,6 +176,14 @@ main {
   // Pattern 2: NvmeCtrl aliases NvmeRegs (same BAR0 register block)
   NvmeCtrl := NvmeRegs;
 
+  // Pattern 3: 5-level pointer chain — every level aliases NvmeRegs
+  // Simulates: main -> getSubsystem -> getQueueManager -> getIoChannel -> getDmaEngine
+  L1CtrlRef   := NvmeCtrl;    // "getSubsystem(ctrl)"
+  L2SubsysRef := L1CtrlRef;   // "getQueueManager(subsys)"
+  L3QueueRef  := L2SubsysRef; // "getIoChannel(queue)"
+  L4ChanRef   := L3QueueRef;  // "getDmaEngine(channel)"
+  L5DmaRef    := L4ChanRef;   // "getDescriptor(dma)" — aliases NvmeRegs
+
   // Phase 1: flush SQ, CQ, and error log
   CmdSlot := 0;
   while CmdSlot < MAX_CMDS do (
@@ -198,17 +214,14 @@ main {
 
     // [FIX-1] Disable interrupts, re-check CmdSlot bounds before array access.
     disable;
-    if CmdSlot >= 0
-    then (
-      if CmdSlot < MAX_CMDS
+    if CmdSlot < MAX_CMDS
       then (
         *SqBuf[CmdSlot] := CMD_ACTIVE;
         *CqBuf[CmdSlot] := ErrCode
       )
-      else unit
-    )
     else unit;
     enable;
+
 
     if ErrCode = ERR_NONE
     then (
@@ -235,6 +248,18 @@ main {
       *PrpList[0] := CmdSlot
     );
     LastPrpPtr := SafePrpPtr;
+
+    // [FIX-3] Disable interrupts while reading through the 5-level deep chain.
+    // Without the critical section, handler 1 could corrupt NvmeRegs[REG_PRPPTR]
+    // between the bounds check on *L5DmaRef[REG_PRPPTR] and its use as an index.
+    disable;
+    SafePrpPtr2 := *L5DmaRef[REG_PRPPTR];
+    enable;
+    if SafePrpPtr2 < PRP_LIST_SZ
+    then (
+      *PrpList2[SafePrpPtr2] := CmdSlot
+    )
+    else unit;
 
     *DiagBuf[2] := LastPrpPtr;
     *DiagBuf[3] := ErrCount;
