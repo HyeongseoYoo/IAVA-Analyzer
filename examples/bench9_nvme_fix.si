@@ -11,15 +11,15 @@
 //     into NvmeRegs[REG_PRPPTR] between the read and the PrpList write.
 //     An explicit bounds guard on SafePrpPtr eliminates residual OOB widening.
 //
-//   FIX-3 (Pattern 3): Same technique as FIX-2 applied at the innermost level
-//     of the 5-level alias chain.  Disable interrupts before reading
-//     L5DmaRef[REG_PRPPTR] and re-enable immediately after capturing the value
-//     into SafePrpPtr2.  The bounds guard on SafePrpPtr2 then prevents OOB
-//     into PrpList2 even if the captured value is later seen as unconstrained.
+//   FIX-3 (Pattern 3): Disable interrupts while reading through the 3-level heap
+//     alias chain.  Disable interrupts before reading EngineRef[REG_PRPPTR] and
+//     re-enable immediately after capturing the value into SafePrpPtr2.  The
+//     bounds guard on SafePrpPtr2 then prevents OOB into PrpList2 even if the
+//     captured value is later seen as unconstrained.
 //
 // handler 0 — NVME_ERR_EVT  : sets CmdSlot := INVALID_CID (Pattern 1 bug source)
 // handler 1 — TIMEOUT_EVT   : sets NvmeRegs[REG_PRPPTR] := INVALID_CID (Pattern 2 bug source)
-// handler 2 — CQ_FULL_EVT   : advances CQ head, increments completion count
+// handler 2 — CQ_FULL_EVT   : corrupts DmaConfig[REG_PRPPTR] via alias (Pattern 3 bug)
 // handler 3 — DOORBELL_EVT  : increments SQ tail, logs doorbell event
 
 init {
@@ -99,8 +99,10 @@ init {
   ErrLog   := malloc(16, ERR_NONE);
   EventLog := malloc(32, 0);
   DiagBuf  := malloc(8, 0);
-  NvmeRegs := malloc(16, 0);
-  PrpList2 := malloc(16, 0);
+  NvmeRegs     := malloc(16, 0);
+  PrpList2     := malloc(16, 0);
+  DmaConfig    := malloc(16, 0);
+  DmaDescTable := malloc(4, 0);
 
   // Initialize NvmeRegs
   *NvmeRegs[REG_STATUS]   := ERR_NONE;
@@ -113,6 +115,10 @@ init {
   *NvmeRegs[REG_FLAGS]    := 0;
   *NvmeRegs[REG_TIMEOUT]  := 0;
   *NvmeRegs[REG_LASTCID]  := 0;
+
+  // Initialize DMA descriptor table: slot 0 points to DmaConfig
+  *DmaDescTable[0] := DmaConfig;
+  *DmaConfig[REG_PRPPTR] := 0;
 
   // Initialize SQ entries
   *SqBuf[0] := CMD_FREE;
@@ -151,10 +157,16 @@ init {
   };
 
   handler 2 {
+    // CQ_FULL_EVT — advances CQ head; on overflow also resets DMA PRP pointer
+    // Pattern 3 bug (2-level alias):
+    //   HandlerDmaPtr aliases DmaConfig directly (level 1)
+    //   then writes INVALID_CID through it (level 2)
     CmdDone       := CmdDone + 1;
     CqHead        := CqHead + 1;
     *NvmeRegs[REG_CQHEAD] := CqHead;
     *NvmeRegs[REG_CMDCNT] := CmdDone;
+    HandlerDmaPtr := DmaConfig;                   // level 1: alias to DmaConfig
+    *HandlerDmaPtr[REG_PRPPTR] := INVALID_CID;    // level 2: corrupt PRP pointer
     if EventHead < EVENT_LOG_SZ
     then *EventLog[EventHead] := MARK_COMPLETE
     else unit;
@@ -176,13 +188,16 @@ main {
   // Pattern 2: NvmeCtrl aliases NvmeRegs (same BAR0 register block)
   NvmeCtrl := NvmeRegs;
 
-  // Pattern 3: 5-level pointer chain — every level aliases NvmeRegs
-  // Simulates: main -> getSubsystem -> getQueueManager -> getIoChannel -> getDmaEngine
-  L1CtrlRef   := NvmeCtrl;    // "getSubsystem(ctrl)"
-  L2SubsysRef := L1CtrlRef;   // "getQueueManager(subsys)"
-  L3QueueRef  := L2SubsysRef; // "getIoChannel(queue)"
-  L4ChanRef   := L3QueueRef;  // "getDmaEngine(channel)"
-  L5DmaRef    := L4ChanRef;   // "getDescriptor(dma)" — aliases NvmeRegs
+  // Pattern 3: 3-level chain from main via heap-stored pointer alias
+  // DmaDescTable[0] holds the DmaConfig address (pointer stored in heap).
+  // Level 1: SysRef is a var alias to DmaDescTable (simple, visible in source).
+  // Level 2: EngineRef is loaded by dereferencing SysRef[0] — this is the
+  //          pointer alias: EngineRef aliases DmaConfig because DmaDescTable[0]
+  //          stores DmaConfig's address.  Unlike a plain "x := y" assignment,
+  //          the aliasing here is established through heap storage and is not
+  //          visible at the EngineRef assignment site alone.
+  SysRef    := DmaDescTable;  // level 1: var alias to the descriptor table
+  EngineRef := *SysRef[0];   // level 2: heap dereference — EngineRef aliases DmaConfig
 
   // Phase 1: flush SQ, CQ, and error log
   CmdSlot := 0;
@@ -249,11 +264,11 @@ main {
     );
     LastPrpPtr := SafePrpPtr;
 
-    // [FIX-3] Disable interrupts while reading through the 5-level deep chain.
-    // Without the critical section, handler 1 could corrupt NvmeRegs[REG_PRPPTR]
-    // between the bounds check on *L5DmaRef[REG_PRPPTR] and its use as an index.
+    // [FIX-3] Disable interrupts while reading through the 3-level heap alias chain.
+    // Without the critical section, handler 2 could corrupt DmaConfig[REG_PRPPTR]
+    // between the bounds check on *EngineRef[REG_PRPPTR] and its use as an index.
     disable;
-    SafePrpPtr2 := *L5DmaRef[REG_PRPPTR];
+    SafePrpPtr2 := *EngineRef[REG_PRPPTR];
     enable;
     if SafePrpPtr2 < PRP_LIST_SZ
     then (

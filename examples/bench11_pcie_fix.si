@@ -12,15 +12,15 @@
 //     into LinkRegs[REG_LTSSMPTR] between the read and the StatBuf write.
 //     An explicit bounds guard on SafeLtssmPtr eliminates residual OOB widening.
 //
-//   FIX-3 (Pattern 3): Same technique as FIX-2 applied at the innermost level
-//     of the 5-level alias chain.  Disable interrupts before reading
-//     L5StateRef[REG_LTSSMPTR] and re-enable immediately after capturing the
-//     value into SafeLtssmPtr2.  The bounds guard on SafeLtssmPtr2 then prevents
-//     OOB into StatBuf2 even if the captured value is later seen as unconstrained.
+//   FIX-3 (Pattern 3): Disable interrupts while reading through the 3-level heap
+//     alias chain.  Disable interrupts before reading EngineLinkRef[REG_LTSSMPTR]
+//     and re-enable immediately after capturing the value into SafeLtssmPtr2.
+//     The bounds guard on SafeLtssmPtr2 then prevents OOB into StatBuf2 even if
+//     the captured value is later seen as unconstrained.
 //
 // handler 0 — LINK_DOWN_EVT : sets LinkSlot := INVALID_LINK (Pattern 1 bug source)
-// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 + 3 bug source)
-// handler 2 — LINK_UP_EVT   : increments link-up count, clears link-down state
+// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 bug source)
+// handler 2 — LINK_UP_EVT   : corrupts LtssmConfig[REG_LTSSMPTR] via alias (Pattern 3 bug)
 // handler 3 — PM_EVT        : updates power management state, logs PM event
 
 init {
@@ -100,8 +100,10 @@ init {
   PmLog     := malloc(8, 0);
   EventLog  := malloc(32, 0);
   DiagBuf   := malloc(8, 0);
-  LinkRegs  := malloc(16, 0);
-  StatBuf2  := malloc(16, 0);
+  LinkRegs       := malloc(16, 0);
+  StatBuf2       := malloc(16, 0);
+  LtssmConfig    := malloc(16, 0);
+  LtssmDescTable := malloc(4, 0);
 
   // Initialize LinkRegs
   *LinkRegs[REG_STATUS]   := LTSSM_DETECT;
@@ -114,6 +116,10 @@ init {
   *LinkRegs[REG_PMSTATE]  := 0;
   *LinkRegs[REG_RETRYCNT] := 0;
   *LinkRegs[REG_LASTLINK] := 0;
+
+  // Initialize LTSSM descriptor table: slot 0 points to LtssmConfig
+  *LtssmDescTable[0] := LtssmConfig;
+  *LtssmConfig[REG_LTSSMPTR] := 0;
 
   // Initialize link table and link buffer
   *LinkTable[0] := LTSSM_DETECT;
@@ -153,6 +159,10 @@ init {
   };
 
   handler 2 {
+    // LINK_UP_EVT — increments link-up count; also corrupts LTSSM config pointer
+    // Pattern 3 bug (2-level alias):
+    //   HandlerLtssmPtr aliases LtssmConfig directly (level 1)
+    //   then writes INVALID_LINK through it (level 2)
     LinkUpCount   := LinkUpCount + 1;
     LinkState     := LTSSM_L0;
     *LinkRegs[REG_STATUS]  := LTSSM_L0;
@@ -161,7 +171,9 @@ init {
     if EventHead < EVENT_LOG_SZ
     then *EventLog[EventHead] := MARK_LINKUP
     else unit;
-    EventHead     := EventHead + 1
+    EventHead        := EventHead + 1;
+    HandlerLtssmPtr  := LtssmConfig;                    // level 1: alias to LtssmConfig
+    *HandlerLtssmPtr[REG_LTSSMPTR] := INVALID_LINK      // level 2: corrupt LTSSM pointer
   };
 
   handler 3 {
@@ -178,13 +190,14 @@ main {
   // Pattern 2: LinkCtrl aliases LinkRegs (same PCIe link register bank)
   LinkCtrl := LinkRegs;
 
-  // Pattern 3: 5-level pointer chain — every level aliases LinkRegs
-  // Simulates: main -> getLinkSubsys -> getLinkManager -> getLinkChannel -> getLtssmEngine
-  L1LinkRef  := LinkCtrl;   // "getLinkSubsys(ctrl)"
-  L2SubRef   := L1LinkRef;  // "getLinkManager(subsys)"
-  L3FuncRef  := L2SubRef;   // "getLinkChannel(manager)"
-  L4LtssmRef := L3FuncRef;  // "getLtssmEngine(channel)"
-  L5StateRef := L4LtssmRef; // "getLtssmDescriptor(engine)" — aliases LinkRegs
+  // Pattern 3: 3-level chain from main via heap-stored pointer alias
+  // LtssmDescTable[0] holds the LtssmConfig address (pointer stored in heap).
+  // Level 1: SysLinkRef is a var alias to LtssmDescTable.
+  // Level 2: EngineLinkRef is loaded by dereferencing SysLinkRef[0] — this is the
+  //          pointer alias: EngineLinkRef aliases LtssmConfig because LtssmDescTable[0]
+  //          stores LtssmConfig's address.
+  SysLinkRef    := LtssmDescTable;  // level 1: var alias to the descriptor table
+  EngineLinkRef := *SysLinkRef[0];  // level 2: heap dereference — EngineLinkRef aliases LtssmConfig
 
   // Phase 1: initialise link table, link buffer, and stat buffer
   LinkSlot := 0;
@@ -261,11 +274,11 @@ main {
     );
     LastLtssmPtr := SafeLtssmPtr;
 
-    // [FIX-3] Disable interrupts while reading through the 5-level deep chain.
-    // Without the critical section, handler 1 could corrupt LinkRegs[REG_LTSSMPTR]
-    // between the bounds check on *L5StateRef[REG_LTSSMPTR] and its use as an index.
+    // [FIX-3] Disable interrupts while reading through the 3-level heap alias chain.
+    // Without the critical section, handler 2 could corrupt LtssmConfig[REG_LTSSMPTR]
+    // between the bounds check on *EngineLinkRef[REG_LTSSMPTR] and its use as an index.
     disable;
-    SafeLtssmPtr2 := *L5StateRef[REG_LTSSMPTR];
+    SafeLtssmPtr2 := *EngineLinkRef[REG_LTSSMPTR];
     enable;
     if SafeLtssmPtr2 < STAT_BUF_SZ
     then (

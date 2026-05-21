@@ -20,21 +20,24 @@
 //   Main reads the LTSSM pointer through LinkCtrl and uses it as an index into
 //   StatBuf[16] — OOB when the handler has stored 255.
 //
-// Pattern 3 — Deep-chain hidden shared state (5-level alias):
-//   Same root cause as Pattern 2, but the alias is buried under five levels of
-//   pointer indirection, simulating a real firmware call chain:
-//     main -> getLinkSubsys -> getLinkManager -> getLinkChannel -> getLtssmEngine
-//   Each level passes a link register reference one step deeper.  The analyzer
-//   must trace L5StateRef->L4LtssmRef->L3FuncRef->L2SubRef->L1LinkRef->LinkCtrl->
-//   LinkRegs to conclude that the LTSSM_EVT handler can corrupt the value read
-//   by main five indirections away.
-//   Handler 1 (LTSSM_EVT) writes INVALID_LINK into LinkRegs[REG_LTSSMPTR].
-//   Main reads through L5StateRef and uses the value as an index into StatBuf2[16]
-//   — OOB when the handler has stored 255 between the check and the use.
+// Pattern 3 — Heap-mediated pointer alias (3-level main + 2-level handler):
+//   LtssmConfig is an LTSSM engine config block.  LtssmDescTable is a 4-entry
+//   pointer table; LtssmDescTable[0] holds the address of LtssmConfig.
+//   Main accesses LtssmConfig through a 3-level chain:
+//     SysLinkRef (var alias to LtssmDescTable)
+//     -> EngineLinkRef := *SysLinkRef[0]   (heap dereference — pointer alias via table)
+//     -> *EngineLinkRef[REG_LTSSMPTR]       (reads LtssmConfig field as an index)
+//   Handler 2 (LINK_UP_EVT) goes 2 levels deep via a simple alias:
+//     HandlerLtssmPtr := LtssmConfig   (level 1: direct var alias)
+//     -> *HandlerLtssmPtr[REG_LTSSMPTR] := INVALID_LINK   (level 2: write through alias)
+//   Between main's bounds check and the StatBuf2 index use, handler 2 can fire
+//   and corrupt LtssmConfig[REG_LTSSMPTR] to 255, causing OOB on StatBuf2[16].
+//   The alias is hidden: main reaches LtssmConfig via the pointer stored in the
+//   table (a heap dereference), while handler 2 names it directly.
 //
 // handler 0 — LINK_DOWN_EVT : sets LinkSlot := INVALID_LINK (Pattern 1 bug)
-// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 + 3 bug)
-// handler 2 — LINK_UP_EVT   : increments link-up count, clears link-down state
+// handler 1 — LTSSM_EVT     : sets LinkRegs[REG_LTSSMPTR] := INVALID_LINK (Pattern 2 bug)
+// handler 2 — LINK_UP_EVT   : corrupts LtssmConfig[REG_LTSSMPTR] via alias (Pattern 3 bug)
 // handler 3 — PM_EVT        : updates power management state, logs PM event
 
 init {
@@ -112,8 +115,10 @@ init {
   PmLog     := malloc(8, 0);
   EventLog  := malloc(32, 0);
   DiagBuf   := malloc(8, 0);
-  LinkRegs  := malloc(16, 0);
-  StatBuf2  := malloc(16, 0);
+  LinkRegs       := malloc(16, 0);
+  StatBuf2       := malloc(16, 0);
+  LtssmConfig    := malloc(16, 0);
+  LtssmDescTable := malloc(4, 0);
 
   // Initialize LinkRegs
   *LinkRegs[REG_STATUS]   := LTSSM_DETECT;
@@ -126,6 +131,10 @@ init {
   *LinkRegs[REG_PMSTATE]  := 0;
   *LinkRegs[REG_RETRYCNT] := 0;
   *LinkRegs[REG_LASTLINK] := 0;
+
+  // Initialize LTSSM descriptor table: slot 0 points to LtssmConfig
+  *LtssmDescTable[0] := LtssmConfig;
+  *LtssmConfig[REG_LTSSMPTR] := 0;
 
   // Initialize link table and link buffer
   *LinkTable[0] := LTSSM_DETECT;
@@ -167,7 +176,10 @@ init {
   };
 
   handler 2 {
-    // LINK_UP_EVT — no corruption, increments link-up count and clears error
+    // LINK_UP_EVT — increments link-up count; also corrupts LTSSM config pointer
+    // Pattern 3 bug (2-level alias):
+    //   HandlerLtssmPtr aliases LtssmConfig directly (level 1)
+    //   then writes INVALID_LINK through it (level 2)
     LinkUpCount   := LinkUpCount + 1;
     LinkState     := LTSSM_L0;
     *LinkRegs[REG_STATUS]  := LTSSM_L0;
@@ -176,7 +188,9 @@ init {
     if EventHead < EVENT_LOG_SZ
     then *EventLog[EventHead] := MARK_LINKUP
     else unit;
-    EventHead     := EventHead + 1
+    EventHead        := EventHead + 1;
+    HandlerLtssmPtr  := LtssmConfig;                    // level 1: alias to LtssmConfig
+    *HandlerLtssmPtr[REG_LTSSMPTR] := INVALID_LINK      // level 2: corrupt LTSSM pointer
   };
 
   handler 3 {
@@ -194,13 +208,14 @@ main {
   // Pattern 2: LinkCtrl aliases LinkRegs (same PCIe link register bank)
   LinkCtrl := LinkRegs;
 
-  // Pattern 3: 5-level pointer chain — every level aliases LinkRegs
-  // Simulates: main -> getLinkSubsys -> getLinkManager -> getLinkChannel -> getLtssmEngine
-  L1LinkRef  := LinkCtrl;   // "getLinkSubsys(ctrl)"
-  L2SubRef   := L1LinkRef;  // "getLinkManager(subsys)"
-  L3FuncRef  := L2SubRef;   // "getLinkChannel(manager)"
-  L4LtssmRef := L3FuncRef;  // "getLtssmEngine(channel)"
-  L5StateRef := L4LtssmRef; // "getLtssmDescriptor(engine)" — aliases LinkRegs
+  // Pattern 3: 3-level chain from main via heap-stored pointer alias
+  // LtssmDescTable[0] holds the LtssmConfig address (pointer stored in heap).
+  // Level 1: SysLinkRef is a var alias to LtssmDescTable.
+  // Level 2: EngineLinkRef is loaded by dereferencing SysLinkRef[0] — this is the
+  //          pointer alias: EngineLinkRef aliases LtssmConfig because LtssmDescTable[0]
+  //          stores LtssmConfig's address.
+  SysLinkRef    := LtssmDescTable;  // level 1: var alias to the descriptor table
+  EngineLinkRef := *SysLinkRef[0];  // level 2: heap dereference — EngineLinkRef aliases LtssmConfig
 
   // Phase 1: initialise link table, link buffer, and stat buffer
   LinkSlot := 0;
@@ -265,16 +280,14 @@ main {
     LastLtssmPtr := *LinkCtrl[REG_LTSSMPTR];
     *StatBuf[LastLtssmPtr] := LinkState;
 
-    // [TARGET-3, Pattern 3] Same shared-state bug as Pattern 2, buried under a
-    // 5-level pointer chain.  A developer reading only the innermost level cannot
-    // tell that L5StateRef aliases LinkRegs without tracing five assignments back.
-    // Handler 1 may write INVALID_LINK to LinkRegs[REG_LTSSMPTR] between the two
-    // reads of *L5StateRef[REG_LTSSMPTR], turning the bounds check into a false
-    // guarantee and making the subsequent array index 255.
-    // [BUG-3] second read of *L5StateRef[REG_LTSSMPTR] can be 255; StatBuf2 has 16 entries
-    if *L5StateRef[REG_LTSSMPTR] < STAT_BUF_SZ
+    // [TARGET-3, Pattern 3] EngineLinkRef aliases LtssmConfig via the pointer stored in
+    // LtssmDescTable[0].  Handler 2 may fire between the check and the second read
+    // of *EngineLinkRef[REG_LTSSMPTR] and corrupt LtssmConfig[REG_LTSSMPTR] to INVALID_LINK
+    // (255) through HandlerLtssmPtr, turning the bounds check into a false guarantee.
+    // [BUG-3] second read of *EngineLinkRef[REG_LTSSMPTR] can be 255; StatBuf2 has 16 entries
+    if *EngineLinkRef[REG_LTSSMPTR] < STAT_BUF_SZ
     then (
-      *StatBuf2[*L5StateRef[REG_LTSSMPTR]] := LinkState
+      *StatBuf2[*EngineLinkRef[REG_LTSSMPTR]] := LinkState
     )
     else unit;
 

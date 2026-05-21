@@ -49,6 +49,7 @@ type fp_array_write = {
   fpa_at        : ProgramPoint.t;
   fpa_offset_pp : PPSet.t;
   fpa_guard     : (Exp.bop * Exp.lbl_t) option; (* same as summary_atom.guard: narrowed before index lookup *)
+  fpa_base_var  : Abs_Loc.t; (* the pointer variable used as base in *base[idx] := rhs *)
 }
 
 type compiled_fixpoint = {
@@ -958,7 +959,8 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
           let fpa_guard = atom.guard in
           array_writes :=
             { fpa_lbl = lbl; fpa_idx; fpa_rhs; fpa_at;
-              fpa_offset_pp = PPSet.singleton fpa_at; fpa_guard }
+              fpa_offset_pp = PPSet.singleton fpa_at; fpa_guard;
+              fpa_base_var = arr_var_loc }
             :: !array_writes
       | None -> ())
   | _ -> ()
@@ -1094,11 +1096,19 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
      For each fp_array_write with a Var RHS, record the RHS variable's value
      and back-pps (from amem2) in a snapshot at the handler PP.  This lets
      trace_heap_pps trace one level deeper into the RHS of the handler
-     assignment (e.g. INVALID_CID → its init assignment). *)
+     assignment (e.g. INVALID_CID → its init assignment).
+     Also record the base pointer variable (e.g. HandlerDmaPtr) with its
+     pointer value and its handler assignment PPSet so trace_heap_pps can
+     show the alias step (e.g. HandlerDmaPtr := DmaConfig). *)
+  let scalar_pps_map =
+    List.fold_left
+      (fun m (loc, _, pps) -> Abs_Mem.LocMap.add loc pps m)
+      Abs_Mem.LocMap.empty fp.fp_scalars
+  in
   let asem4 =
     List.fold_left
       (fun asem (fpa : fp_array_write) ->
-        let snapshot =
+        let rhs_snapshot =
           match fpa.fpa_rhs with
           | `Const _ -> Abs_Mem.bot
           | `Var val_loc -> (
@@ -1109,11 +1119,42 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
                     (fun pp snap -> Abs_Mem.weak_write snap val_loc v pp)
                     existing_pps Abs_Mem.bot)
         in
-        if snapshot = Abs_Mem.bot then asem
-        else
-          PPSet.fold
-            (fun pp asem' -> Abs_Sem.weak_write asem' pp snapshot)
-            fpa.fpa_offset_pp asem)
+        (* Enrich snapshot with the base pointer variable when it was assigned
+           inside the handler (i.e. it appears in fp_scalars). *)
+        let base_assign_pps =
+          match Abs_Mem.LocMap.find_opt fpa.fpa_base_var scalar_pps_map with
+          | Some pps -> pps
+          | None -> PPSet.empty
+        in
+        let base_ptr_val_opt =
+          if PPSet.is_empty base_assign_pps then None
+          else
+            Some (abs_loc (Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = Itv.alpha 0 }))
+        in
+        let enriched_snapshot =
+          match base_ptr_val_opt with
+          | None -> rhs_snapshot
+          | Some bpv ->
+              Abs_Mem.LocMap.add fpa.fpa_base_var (bpv, base_assign_pps) rhs_snapshot
+        in
+        let asem' =
+          if enriched_snapshot = Abs_Mem.bot then asem
+          else
+            PPSet.fold
+              (fun pp asem_acc -> Abs_Sem.weak_write asem_acc pp enriched_snapshot)
+              fpa.fpa_offset_pp asem
+        in
+        (* Also synthesize a snapshot at each base-pointer assignment PP so
+           trace_pps can display the "base := alias" expression. *)
+        match base_ptr_val_opt with
+        | None -> asem'
+        | Some bpv ->
+            let base_snapshot =
+              Abs_Mem.LocMap.add fpa.fpa_base_var (bpv, PPSet.empty) Abs_Mem.bot
+            in
+            PPSet.fold
+              (fun pp asem_acc -> Abs_Sem.weak_write asem_acc pp base_snapshot)
+              base_assign_pps asem')
       asem3 fp.fp_arrays
   in
   { c with amem = amem2; errs = errs2; asem = asem4 }

@@ -280,12 +280,21 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
             | None -> []
             | Some lt ->
                 let rhs_vars = vars_in_exp lt.exp in
+                (* Also trace the LHS base pointer for heap writes like
+                   *base[idx] := rhs so the alias step (base := ...) appears. *)
+                let lhs_base_vars =
+                  match lt.exp with
+                  | Exp.Assign
+                      ({ exp = Exp.Deref ({ exp = Exp.Var bv; _ }, _); _ }, _) ->
+                      [ bv ]
+                  | _ -> []
+                in
                 List.concat_map
                   (fun v ->
                     let v_loc = Abs_Loc.get v in
                     let _, sub_pps = Abs_Mem.find snapshot v_loc in
                     trace_pps sub_pps v asem tbl visited_with_siblings (depth - 1))
-                  rhs_vars
+                  (rhs_vars @ lhs_base_vars)
           in
           { site; children } :: acc)
       cell_pps []

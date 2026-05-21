@@ -12,15 +12,15 @@
 //     into ErrRegs[REG_ERRPTR] between the read and the ErrLog write.
 //     An explicit bounds guard on SafeErrPtr eliminates residual OOB widening.
 //
-//   FIX-3 (Pattern 3): Same technique as FIX-2 applied at the innermost level
-//     of the 5-level alias chain.  Disable interrupts before reading
-//     L5SlotRef[REG_ERRPTR] and re-enable immediately after capturing the value
-//     into SafeErrPtr2.  The bounds guard on SafeErrPtr2 then prevents OOB
-//     into ErrLog2 even if the captured value is later seen as unconstrained.
+//   FIX-3 (Pattern 3): Disable interrupts while reading through the 3-level heap
+//     alias chain.  Disable interrupts before reading EngineErrRef[REG_ERRPTR]
+//     and re-enable immediately after capturing the value into SafeErrPtr2.
+//     The bounds guard on SafeErrPtr2 then prevents OOB into ErrLog2 even if the
+//     captured value is later seen as unconstrained.
 //
 // handler 0 — UECC_EVT      : sets ErrSlot := FATAL_SLOT (Pattern 1 bug source)
-// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 + 3 bug source)
-// handler 2 — RETRY_EVT     : increments retry count, updates retry state
+// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 bug source)
+// handler 2 — RETRY_EVT     : corrupts EccConfig[REG_ERRPTR] via alias (Pattern 3 bug)
 // handler 3 — RECOVERY_EVT  : increments recovery count, clears error state
 
 init {
@@ -99,8 +99,10 @@ init {
   StatLog  := malloc(8, 0);
   EventLog := malloc(32, 0);
   DiagBuf  := malloc(8, 0);
-  ErrRegs  := malloc(16, 0);
-  ErrLog2  := malloc(16, ERR_NONE);
+  ErrRegs      := malloc(16, 0);
+  ErrLog2      := malloc(16, ERR_NONE);
+  EccConfig    := malloc(16, 0);
+  EccDescTable := malloc(4, 0);
 
   // Initialize ErrRegs
   *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
@@ -113,6 +115,10 @@ init {
   *ErrRegs[REG_WEAR]     := 0;
   *ErrRegs[REG_FLAGS]    := 0;
   *ErrRegs[REG_LASTSLOT] := 0;
+
+  // Initialize ECC descriptor table: slot 0 points to EccConfig
+  *EccDescTable[0] := EccConfig;
+  *EccConfig[REG_ERRPTR] := 0;
 
   // Initialize error table and retry buffer
   *ErrTable[0] := ERR_STATE_OK;
@@ -155,13 +161,19 @@ init {
   };
 
   handler 2 {
+    // CQ_FULL_EVT — advances CQ head; on overflow also resets DMA PRP pointer
+    // Pattern 3 bug (2-level alias):
+    //   HandlerEccPtr aliases EccConfig directly (level 1)
+    //   then writes FATAL_SLOT through it (level 2)
     RetryCount    := RetryCount + 1;
     *ErrRegs[REG_RETRYCNT] := RetryCount;
     *ErrRegs[REG_STATUS]   := ERR_STATE_RETRY;
     if EventHead < EVENT_LOG_SZ
     then *EventLog[EventHead] := MARK_RETRY
     else unit;
-    EventHead     := EventHead + 1
+    EventHead     := EventHead + 1;
+    HandlerEccPtr := EccConfig;                    // level 1: alias to EccConfig
+    *HandlerEccPtr[REG_ERRPTR] := FATAL_SLOT       // level 2: corrupt error pointer
   };
 
   handler 3 {
@@ -180,13 +192,14 @@ main {
   // Pattern 2: ErrCtrl aliases ErrRegs (same error register bank)
   ErrCtrl := ErrRegs;
 
-  // Pattern 3: 5-level pointer chain — every level aliases ErrRegs
-  // Simulates: main -> getErrSubsys -> getErrManager -> getErrChannel -> getErrEngine
-  L1ErrRef  := ErrCtrl;    // "getErrSubsys(ctrl)"
-  L2CtrlRef := L1ErrRef;   // "getErrManager(subsys)"
-  L3MgrRef  := L2CtrlRef;  // "getErrChannel(manager)"
-  L4HndlRef := L3MgrRef;   // "getErrEngine(channel)"
-  L5SlotRef := L4HndlRef;  // "getErrDescriptor(engine)" — aliases ErrRegs
+  // Pattern 3: 3-level chain from main via heap-stored pointer alias
+  // EccDescTable[0] holds the EccConfig address (pointer stored in heap).
+  // Level 1: SysErrRef is a var alias to EccDescTable.
+  // Level 2: EngineErrRef is loaded by dereferencing SysErrRef[0] — this is the
+  //          pointer alias: EngineErrRef aliases EccConfig because EccDescTable[0]
+  //          stores EccConfig's address.
+  SysErrRef    := EccDescTable;  // level 1: var alias to the descriptor table
+  EngineErrRef := *SysErrRef[0]; // level 2: heap dereference — EngineErrRef aliases EccConfig
 
   // Phase 1: initialise error table, retry buffer, and error log
   ErrSlot := 0;
@@ -263,11 +276,11 @@ main {
     );
     LastErrPtr := SafeErrPtr;
 
-    // [FIX-3] Disable interrupts while reading through the 5-level deep chain.
-    // Without the critical section, handler 1 could corrupt ErrRegs[REG_ERRPTR]
-    // between the bounds check on *L5SlotRef[REG_ERRPTR] and its use as an index.
+    // [FIX-3] Disable interrupts while reading through the 3-level heap alias chain.
+    // Without the critical section, handler 2 could corrupt EccConfig[REG_ERRPTR]
+    // between the bounds check on *EngineErrRef[REG_ERRPTR] and its use as an index.
     disable;
-    SafeErrPtr2 := *L5SlotRef[REG_ERRPTR];
+    SafeErrPtr2 := *EngineErrRef[REG_ERRPTR];
     enable;
     if SafeErrPtr2 < ERR_LOG_SZ
     then (

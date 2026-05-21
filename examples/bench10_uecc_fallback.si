@@ -23,21 +23,24 @@
 //   Main reads the error pointer through ErrCtrl and uses it as an index into
 //   ErrLog[16] — OOB when the handler has stored 200.
 //
-// Pattern 3 — Deep-chain hidden shared state (5-level alias):
-//   Same root cause as Pattern 2, but the alias is buried under five levels of
-//   pointer indirection, simulating a real firmware call chain:
-//     main -> getErrSubsys -> getErrManager -> getErrChannel -> getErrEngine
-//   Each level passes an error register reference one step deeper.  The analyzer
-//   must trace L5SlotRef->L4HndlRef->L3MgrRef->L2CtrlRef->L1ErrRef->ErrCtrl->
-//   ErrRegs to conclude that the TIMEOUT_EVT handler can corrupt the value read
-//   by main five indirections away.
-//   Handler 1 (TIMEOUT_EVT) writes FATAL_SLOT into ErrRegs[REG_ERRPTR].
-//   Main reads through L5SlotRef and uses the value as an index into ErrLog2[16]
-//   — OOB when the handler has stored 200 between the check and the use.
+// Pattern 3 — Heap-mediated pointer alias (3-level main + 2-level handler):
+//   EccConfig is an ECC engine config block.  EccDescTable is a 4-entry pointer
+//   table; EccDescTable[0] holds the address of EccConfig.
+//   Main accesses EccConfig through a 3-level chain:
+//     SysErrRef (var alias to EccDescTable)
+//     -> EngineErrRef := *SysErrRef[0]   (heap dereference — pointer alias via table)
+//     -> *EngineErrRef[REG_ERRPTR]        (reads EccConfig field as an index)
+//   Handler 2 (RETRY_EVT) goes 2 levels deep via a simple alias:
+//     HandlerEccPtr := EccConfig   (level 1: direct var alias)
+//     -> *HandlerEccPtr[REG_ERRPTR] := FATAL_SLOT   (level 2: write through alias)
+//   Between main's bounds check and the ErrLog2 index use, handler 2 can fire
+//   and corrupt EccConfig[REG_ERRPTR] to 200, causing OOB on ErrLog2[16].
+//   The alias is hidden: main reaches EccConfig via the pointer stored in the
+//   table (a heap dereference), while handler 2 names it directly.
 //
 // handler 0 — UECC_EVT      : sets ErrSlot := FATAL_SLOT (Pattern 1 bug)
-// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 + 3 bug)
-// handler 2 — RETRY_EVT     : increments retry count, updates retry state
+// handler 1 — TIMEOUT_EVT   : sets ErrRegs[REG_ERRPTR] := FATAL_SLOT (Pattern 2 bug)
+// handler 2 — RETRY_EVT     : corrupts EccConfig[REG_ERRPTR] via alias (Pattern 3 bug)
 // handler 3 — RECOVERY_EVT  : increments recovery count, clears error state
 
 init {
@@ -114,8 +117,10 @@ init {
   StatLog  := malloc(8, 0);
   EventLog := malloc(32, 0);
   DiagBuf  := malloc(8, 0);
-  ErrRegs  := malloc(16, 0);
-  ErrLog2  := malloc(16, ERR_NONE);
+  ErrRegs      := malloc(16, 0);
+  ErrLog2      := malloc(16, ERR_NONE);
+  EccConfig    := malloc(16, 0);
+  EccDescTable := malloc(4, 0);
 
   // Initialize ErrRegs
   *ErrRegs[REG_STATUS]   := ERR_STATE_OK;
@@ -128,6 +133,10 @@ init {
   *ErrRegs[REG_WEAR]     := 0;
   *ErrRegs[REG_FLAGS]    := 0;
   *ErrRegs[REG_LASTSLOT] := 0;
+
+  // Initialize ECC descriptor table: slot 0 points to EccConfig
+  *EccDescTable[0] := EccConfig;
+  *EccConfig[REG_ERRPTR] := 0;
 
   // Initialize error table and retry buffer
   *ErrTable[0] := ERR_STATE_OK;
@@ -172,14 +181,19 @@ init {
   };
 
   handler 2 {
-    // RETRY_EVT — no corruption, increments retry count and logs
+    // RETRY_EVT — increments retry count; also corrupts ECC error pointer
+    // Pattern 3 bug (2-level alias):
+    //   HandlerEccPtr aliases EccConfig directly (level 1)
+    //   then writes FATAL_SLOT through it (level 2)
     RetryCount    := RetryCount + 1;
     *ErrRegs[REG_RETRYCNT] := RetryCount;
     *ErrRegs[REG_STATUS]   := ERR_STATE_RETRY;
     if EventHead < EVENT_LOG_SZ
     then *EventLog[EventHead] := MARK_RETRY
     else unit;
-    EventHead     := EventHead + 1
+    EventHead     := EventHead + 1;
+    HandlerEccPtr := EccConfig;                    // level 1: alias to EccConfig
+    *HandlerEccPtr[REG_ERRPTR] := FATAL_SLOT       // level 2: corrupt error pointer
   };
 
   handler 3 {
@@ -202,13 +216,14 @@ main {
   // Pattern 2: ErrCtrl aliases ErrRegs (same error register bank)
   ErrCtrl := ErrRegs;
 
-  // Pattern 3: 5-level pointer chain — every level aliases ErrRegs
-  // Simulates: main -> getErrSubsys -> getErrManager -> getErrChannel -> getErrEngine
-  L1ErrRef  := ErrCtrl;    // "getErrSubsys(ctrl)"
-  L2CtrlRef := L1ErrRef;   // "getErrManager(subsys)"
-  L3MgrRef  := L2CtrlRef;  // "getErrChannel(manager)"
-  L4HndlRef := L3MgrRef;   // "getErrEngine(channel)"
-  L5SlotRef := L4HndlRef;  // "getErrDescriptor(engine)" — aliases ErrRegs
+  // Pattern 3: 3-level chain from main via heap-stored pointer alias
+  // EccDescTable[0] holds the EccConfig address (pointer stored in heap).
+  // Level 1: SysErrRef is a var alias to EccDescTable.
+  // Level 2: EngineErrRef is loaded by dereferencing SysErrRef[0] — this is the
+  //          pointer alias: EngineErrRef aliases EccConfig because EccDescTable[0]
+  //          stores EccConfig's address.
+  SysErrRef    := EccDescTable;  // level 1: var alias to the descriptor table
+  EngineErrRef := *SysErrRef[0]; // level 2: heap dereference — EngineErrRef aliases EccConfig
 
   // Phase 1: initialise error table, retry buffer, and error log
   ErrSlot := 0;
@@ -273,16 +288,14 @@ main {
     LastErrPtr := *ErrCtrl[REG_ERRPTR];
     *ErrLog[LastErrPtr] := ErrCode;
 
-    // [TARGET-3, Pattern 3] Same shared-state bug as Pattern 2, buried under a
-    // 5-level pointer chain.  A developer reading only the innermost level cannot
-    // tell that L5SlotRef aliases ErrRegs without tracing five assignments back.
-    // Handler 1 may write FATAL_SLOT to ErrRegs[REG_ERRPTR] between the two
-    // reads of *L5SlotRef[REG_ERRPTR], turning the bounds check into a false
-    // guarantee and making the subsequent array index 200.
-    // [BUG-3] second read of *L5SlotRef[REG_ERRPTR] can be 200; ErrLog2 has 16 entries
-    if *L5SlotRef[REG_ERRPTR] < ERR_LOG_SZ
+    // [TARGET-3, Pattern 3] EngineErrRef aliases EccConfig via the pointer stored in
+    // EccDescTable[0].  Handler 2 may fire between the check and the second read
+    // of *EngineErrRef[REG_ERRPTR] and corrupt EccConfig[REG_ERRPTR] to FATAL_SLOT
+    // (200) through HandlerEccPtr, turning the bounds check into a false guarantee.
+    // [BUG-3] second read of *EngineErrRef[REG_ERRPTR] can be 200; ErrLog2 has 16 entries
+    if *EngineErrRef[REG_ERRPTR] < ERR_LOG_SZ
     then (
-      *ErrLog2[*L5SlotRef[REG_ERRPTR]] := ErrCode
+      *ErrLog2[*EngineErrRef[REG_ERRPTR]] := ErrCode
     )
     else unit;
 

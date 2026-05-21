@@ -20,21 +20,24 @@
 //   Main reads the PRP pointer through NvmeCtrl and uses it as an index into
 //   PrpList[16] — OOB when the handler has stored 255.
 //
-// Pattern 3 — Deep-chain hidden shared state (5-level alias):
-//   Same root cause as Pattern 2, but the alias is buried under five levels of
-//   pointer indirection, simulating a real firmware call chain:
-//     main -> getSubsystem -> getQueueManager -> getIoChannel -> getDmaEngine
-//   Each level passes a controller reference one step deeper.  The analyzer must
-//   trace L5DmaRef->L4ChanRef->L3QueueRef->L2SubsysRef->L1CtrlRef->NvmeCtrl->
-//   NvmeRegs to conclude that the TIMEOUT_EVT handler can corrupt the value read
-//   by main five indirections away.
-//   Handler 1 (TIMEOUT_EVT) writes INVALID_CID into NvmeRegs[REG_PRPPTR].
-//   Main reads through L5DmaRef and uses the value as an index into PrpList2[16]
-//   — OOB when the handler has stored 255 between the check and the use.
+// Pattern 3 — Heap-mediated pointer alias (3-level main + 2-level handler):
+//   DmaConfig is a DMA engine config block.  DmaDescTable is a 4-entry pointer
+//   table; DmaDescTable[0] holds the address of DmaConfig.
+//   Main accesses DmaConfig through a 3-level chain:
+//     SysRef (var alias to DmaDescTable)
+//     -> EngineRef := *SysRef[0]   (heap dereference — pointer alias via table)
+//     -> *EngineRef[REG_PRPPTR]    (reads DmaConfig field as an index)
+//   Handler 2 (CQ_FULL_EVT) goes 2 levels deep via a simple alias:
+//     HandlerDmaPtr := DmaConfig   (level 1: direct var alias)
+//     -> *HandlerDmaPtr[REG_PRPPTR] := INVALID_CID   (level 2: write through alias)
+//   Between main's bounds check and the PrpList2 index use, handler 2 can fire
+//   and corrupt DmaConfig[REG_PRPPTR] to 255, causing OOB on PrpList2[16].
+//   The alias is hidden: main reaches DmaConfig via the pointer stored in the
+//   table (a heap dereference), while handler 2 names it directly.
 //
 // handler 0 — NVME_ERR_EVT  : sets CmdSlot := INVALID_CID (Pattern 1 bug)
-// handler 1 — TIMEOUT_EVT   : sets NvmeRegs[REG_PRPPTR] := INVALID_CID (Pattern 2 + 3 bug)
-// handler 2 — CQ_FULL_EVT   : advances CQ head, increments completion count
+// handler 1 — TIMEOUT_EVT   : sets NvmeRegs[REG_PRPPTR] := INVALID_CID (Pattern 2 bug)
+// handler 2 — CQ_FULL_EVT   : corrupts DmaConfig[REG_PRPPTR] via alias (Pattern 3 bug)
 // handler 3 — DOORBELL_EVT  : increments SQ tail, logs doorbell event
 
 init {
@@ -112,8 +115,10 @@ init {
   ErrLog   := malloc(16, ERR_NONE);
   EventLog := malloc(32, 0);
   DiagBuf  := malloc(8, 0);
-  NvmeRegs := malloc(16, 0);
-  PrpList2 := malloc(16, 0);
+  NvmeRegs     := malloc(16, 0);
+  PrpList2     := malloc(16, 0);
+  DmaConfig    := malloc(16, 0);
+  DmaDescTable := malloc(4, 0);
 
   // Initialize NvmeRegs
   *NvmeRegs[REG_STATUS]   := ERR_NONE;
@@ -126,6 +131,10 @@ init {
   *NvmeRegs[REG_FLAGS]    := 0;
   *NvmeRegs[REG_TIMEOUT]  := 0;
   *NvmeRegs[REG_LASTCID]  := 0;
+
+  // Initialize DMA descriptor table: slot 0 points to DmaConfig
+  *DmaDescTable[0] := DmaConfig;
+  *DmaConfig[REG_PRPPTR] := 0;
 
   // Initialize SQ entries
   *SqBuf[0] := CMD_FREE;
@@ -167,11 +176,16 @@ init {
   };
 
   handler 2 {
-    // CQ_FULL_EVT — advances CQ head, increments completion count
+    // CQ_FULL_EVT — advances CQ head; on overflow also resets DMA PRP pointer
+    // Pattern 3 bug (2-level alias):
+    //   HandlerDmaPtr aliases DmaConfig directly (level 1)
+    //   then writes INVALID_CID through it (level 2)
     CmdDone       := CmdDone + 1;
     CqHead        := CqHead + 1;
     *NvmeRegs[REG_CQHEAD] := CqHead;
     *NvmeRegs[REG_CMDCNT] := CmdDone;
+    HandlerDmaPtr := DmaConfig;                   // level 1: alias to DmaConfig
+    *HandlerDmaPtr[REG_PRPPTR] := INVALID_CID;    // level 2: corrupt PRP pointer
     if EventHead < EVENT_LOG_SZ
     then *EventLog[EventHead] := MARK_COMPLETE
     else unit;
@@ -194,13 +208,16 @@ main {
   // Pattern 2: NvmeCtrl aliases NvmeRegs (same BAR0 register block)
   NvmeCtrl := NvmeRegs;
 
-  // Pattern 3: 5-level pointer chain — every level aliases NvmeRegs
-  // Simulates: main -> getSubsystem -> getQueueManager -> getIoChannel -> getDmaEngine
-  L1CtrlRef   := NvmeCtrl;    // "getSubsystem(ctrl)"
-  L2SubsysRef := L1CtrlRef;   // "getQueueManager(subsys)"
-  L3QueueRef  := L2SubsysRef; // "getIoChannel(queue)"
-  L4ChanRef   := L3QueueRef;  // "getDmaEngine(channel)"
-  L5DmaRef    := L4ChanRef;   // "getDescriptor(dma)" — aliases NvmeRegs
+  // Pattern 3: 3-level chain from main via heap-stored pointer alias
+  // DmaDescTable[0] holds the DmaConfig address (pointer stored in heap).
+  // Level 1: SysRef is a var alias to DmaDescTable (simple, visible in source).
+  // Level 2: EngineRef is loaded by dereferencing SysRef[0] — this is the
+  //          pointer alias: EngineRef aliases DmaConfig because DmaDescTable[0]
+  //          stores DmaConfig's address.  Unlike a plain "x := y" assignment,
+  //          the aliasing here is established through heap storage and is not
+  //          visible at the EngineRef assignment site alone.
+  SysRef    := DmaDescTable;  // level 1: var alias to the descriptor table
+  EngineRef := *SysRef[0];   // level 2: heap dereference — EngineRef aliases DmaConfig
 
   // Phase 1: flush SQ, CQ, and error log
   CmdSlot := 0;
@@ -265,16 +282,14 @@ main {
       *PrpList[0] := CmdSlot
     );
 
-    // [TARGET-3, Pattern 3] Same shared-state bug as Pattern 2, buried under a
-    // 5-level pointer chain.  A developer reading only the innermost level cannot
-    // tell that L5DmaRef aliases NvmeRegs without tracing five assignments back.
-    // Handler 1 may write INVALID_CID to NvmeRegs[REG_PRPPTR] between the two
-    // reads of *L5DmaRef[REG_PRPPTR], turning the bounds check into a false
-    // guarantee and making the subsequent array index 255.
-    // [BUG-3] second read of *L5DmaRef[REG_PRPPTR] can be 255; PrpList2 has 16 entries
-    if *L5DmaRef[REG_PRPPTR] < PRP_LIST_SZ
+    // [TARGET-3, Pattern 3] EngineRef aliases DmaConfig via the pointer stored in
+    // DmaDescTable[0].  Handler 2 may fire between the check and the second read
+    // of *EngineRef[REG_PRPPTR] and corrupt DmaConfig[REG_PRPPTR] to INVALID_CID
+    // (255) through HandlerDmaPtr, turning the bounds check into a false guarantee.
+    // [BUG-3] second read of *EngineRef[REG_PRPPTR] can be 255; PrpList2 has 16 entries
+    if *EngineRef[REG_PRPPTR] < PRP_LIST_SZ
     then (
-      *PrpList2[*L5DmaRef[REG_PRPPTR]] := CmdSlot
+      *PrpList2[*EngineRef[REG_PRPPTR]] := CmdSlot
     )
     else unit;
 
