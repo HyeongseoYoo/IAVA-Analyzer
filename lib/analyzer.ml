@@ -864,10 +864,40 @@ let apply_fp_scalar (fps : fp_scalar) ((itv, u, l) : Abs_Val.t) : Abs_Val.t =
   in
   (new_itv, u, l)
 
+(* Build a map from handler-local pointer variable names to heap labels by
+   scanning for [x := y] atoms where y resolves to a heap pointer in
+   init_amem or in the map being built (handles multi-hop aliases). *)
+let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
+    (string, Exp.Lbl.t) Hashtbl.t =
+  let tbl : (string, Exp.Lbl.t) Hashtbl.t = Hashtbl.create 4 in
+  let resolve_ptr_lbl name =
+    let loc = Abs_Loc.get name in
+    match Abs_Mem.LocMap.find_opt loc init_amem with
+    | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) -> Some lbl
+    | _ -> Hashtbl.find_opt tbl name
+  in
+  List.iter
+    (fun (atom : summary_atom) ->
+      match atom.lhs.exp with
+      | Var x -> (
+          match atom.rhs.exp with
+          | Var y -> (
+              match resolve_ptr_lbl y with
+              | Some lbl -> Hashtbl.replace tbl x lbl
+              | None -> ())
+          | _ -> ())
+      | _ -> ())
+    atoms;
+  tbl
+
 (* Classify one summary_atom into scalar and array-write effects.
-   init_amem is used to resolve which heap block an array pointer refers to. *)
+   init_amem is used to resolve which heap block an array pointer refers to.
+   local_ptr_map provides fallback resolution for handler-local pointer aliases
+   (e.g. [NVMeHandler := NvmeRegs; *NVMeHandler[i] := v]) that are not in
+   init_amem. *)
 let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
     (const_map : (string, int) Hashtbl.t)
+    (local_ptr_map : (string, Exp.Lbl.t) Hashtbl.t)
     (scalar_tbl : (Abs_Loc.t, fp_scalar * PPSet.t) Hashtbl.t)
     (array_writes : fp_array_write list ref) : unit =
   match atom.lhs.exp with
@@ -901,10 +931,17 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
         (combine_fp_scalar old_fps fps, PPSet.add handler_pp old_pps)
   | Deref ({ exp = Var arr_name; _ }, idx_e) ->
       (* Array write: *arr_name[idx] := rhs.
-         Look up which heap block arr_name points to in init_amem. *)
+         Look up which heap block arr_name points to. First check init_amem
+         (for globals like NvmeRegs), then fall back to local_ptr_map for
+         handler-local aliases like [NVMeHandler := NvmeRegs]. *)
       let arr_var_loc = Abs_Loc.get arr_name in
-      (match Abs_Mem.LocMap.find_opt arr_var_loc init_amem with
-      | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) ->
+      let heap_lbl_opt =
+        match Abs_Mem.LocMap.find_opt arr_var_loc init_amem with
+        | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) -> Some lbl
+        | _ -> Hashtbl.find_opt local_ptr_map arr_name
+      in
+      (match heap_lbl_opt with
+      | Some lbl ->
           let fpa_idx =
             match idx_e.exp with
             | Int n -> `Const (Itv.alpha n)
@@ -923,7 +960,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
             { fpa_lbl = lbl; fpa_idx; fpa_rhs; fpa_at;
               fpa_offset_pp = PPSet.singleton fpa_at; fpa_guard }
             :: !array_writes
-      | _ -> ())
+      | None -> ())
   | _ -> ()
 
 (* Scan all Compiled handler summaries and build a compiled_fixpoint.
@@ -936,9 +973,10 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
     (fun _iid summary ->
       match summary with
       | Compiled atoms ->
+          let local_ptr_map = build_local_ptr_map atoms init_amem in
           List.iter
             (fun atom ->
-              classify_atom atom init_amem const_map scalar_tbl array_writes)
+              classify_atom atom init_amem const_map local_ptr_map scalar_tbl array_writes)
             atoms
       | Fallback _ -> ())
     !handler_summaries;

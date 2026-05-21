@@ -254,16 +254,24 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
             | Some lt -> fmt_exp lt.exp
             | None -> "<unknown>"
           in
-          (* For scalar alias assignments (Assign(Var lhs, rhs)), look up the
-             LHS variable in the snapshot to get its actual value and ppset
-             rather than using the heap cell's value/pps, which are wrong here.
-             For heap writes (Assign(Deref(...), rhs)) or handler PPs, use
-             the passed cell_val / cell_pps. *)
+          (* Choose the most precise value/ppset for this specific write PP:
+             - Scalar alias (Var lhs := rhs): look up lhs in the snapshot.
+             - Heap write (deref base[idx] := rhs): resolve the cell from the
+               snapshot to get the value as-of-this-write (e.g. [0,0] for the
+               init write, not the globally-joined [0,255]).
+               Falls back to cell_val when the snapshot is minimal and does not
+               contain the base pointer (handler fast-path snapshots).
+             - Anything else: use the passed cell_val / cell_pps. *)
           let snapshot = Abs_Sem.find asem pp in
           let site_value, site_pps =
             match lbl_t_opt with
             | Some { exp = Exp.Assign ({ exp = Exp.Var lhs_var; _ }, _); _ } ->
                 Abs_Mem.find snapshot (Abs_Loc.get lhs_var)
+            | Some { exp = Exp.Assign
+                ({ exp = Exp.Deref (base_e, idx_e); _ }, _); _ } -> (
+                match resolve_deref_cell snapshot base_e idx_e with
+                | Some (v, pps) -> (v, pps)
+                | None -> (cell_val, cell_pps))
             | _ -> (cell_val, cell_pps)
           in
           let site = { pp; line; expr; value = site_value; pps = site_pps } in
@@ -391,20 +399,18 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
           e.offset_pp
       in
       let index_val, index_pps =
-        if is_deref_index then
+        if offset_var = "<offset>" then (Abs_Val.bot, PPSet.empty)
+        else
+          (* Reconstruct the actual index interval from the OOB fields recorded
+             at the error site.  Joining the variable's value across offset_pp
+             snapshots gives a widened value (e.g. [0,∞] from loop widening)
+             that disagrees with the in_itv/right_oob already shown on the same
+             line.  Using join(in_itv, left_oob, right_oob) is consistent with
+             how the deref-index (Pattern 2/3) case already works. *)
           let full_itv =
             Itv.join (Itv.join e.in_itv e.left_oob) e.right_oob
           in
           ((full_itv, Abs_Unit.bot, Abs_Loc.bot), e.offset_pp)
-        else if offset_var = "<offset>" then (Abs_Val.bot, PPSet.empty)
-        else
-          let loc = Abs_Loc.get offset_var in
-          PPSet.fold
-            (fun pp (v_acc, pps_acc) ->
-              let snapshot = Abs_Sem.find asem pp in
-              let v, _ = Abs_Mem.find snapshot loc in
-              (Abs_Val.join v_acc v, PPSet.add pp pps_acc))
-            e.offset_pp (Abs_Val.bot, PPSet.empty)
       in
       let err_site = { err_site with value = index_val; pps = index_pps } in
       let visited0 = PPSet.singleton e.at in

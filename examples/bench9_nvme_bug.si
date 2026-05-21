@@ -154,6 +154,7 @@ init {
     // TIMEOUT_EVT — Pattern 2 bug: writes INVALID_CID into REG_PRPPTR
     TimeoutCount  := TimeoutCount + 1;
     ErrCount      := ErrCount + 1;
+    //NVMeHandler := NvmeRegs;
     *NvmeRegs[REG_PRPPTR]  := INVALID_CID;
     *NvmeRegs[REG_ERRCNT]  := ErrCount;
     *NvmeRegs[REG_TIMEOUT] := TimeoutCount;
