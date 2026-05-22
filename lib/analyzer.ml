@@ -540,7 +540,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
          pure expressions amem is unchanged so the handler effect would be
          identical to the one already recorded at the nearest Var/Assign. *)
       let is_yield_point =
-        match exp with Assign _ | Malloc _ | Var _ -> true | _ -> false
+        match exp with Assign _ | Malloc _ | Var _ | Deref _ -> true | _ -> false
       in
       if is_yield_point then
         let c_after_post = !post_steps_fn c_after_eval in
