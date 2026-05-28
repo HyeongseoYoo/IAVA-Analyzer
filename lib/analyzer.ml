@@ -510,15 +510,19 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let rec iterate (i : int) (input : abs_conf) : abs_conf =
           let rcond, ccond = self input econd in
           let cond_itv = proj_int rcond.avalue in
-          if cond_itv = Itv.Bool.false_ then ccond
+          if cond_itv = Itv.Bool.false_ then
+            { ccond with amem = refine_amem econd false ccond.amem }
           else begin
-            let _rbody, cbody = self ccond ebody in
+            let ccond_true = { ccond with amem = refine_amem econd true ccond.amem } in
+            let _rbody, cbody = self ccond_true ebody in
             let next =
               if cond_itv = Itv.Bool.top then join_conf ccond cbody else cbody
             in
             (* widen condition *)
             let wconf = if i < widen_cnt then next else widen_conf input next in
-            if leq_conf_noasem wconf input then input else iterate (i + 1) wconf
+            if leq_conf_noasem wconf input then
+              { ccond with amem = refine_amem econd false ccond.amem }
+            else iterate (i + 1) wconf
           end
         in
         let output = iterate 0 c in

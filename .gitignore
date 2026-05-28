@@ -50,6 +50,7 @@ _opam/
 .opam-switch/
 .env
 .env.local
+.envrc
 
 # =========================
 # Logs / misc

@@ -1,7 +1,7 @@
 open Provenance
 
-let api_url = "https://api.anthropic.com/v1/messages"
-let model = "claude-sonnet-4-6"
+let api_url = "https://api.openai.com/v1/chat/completions"
+let model = "gpt-4o"
 
 (* ===== Prompt builder ===== *)
 
@@ -57,22 +57,25 @@ let extract_text (json_str : string) : string =
   try
     match Yojson.Basic.from_string json_str with
     | `Assoc fields -> (
-        match List.assoc_opt "content" fields with
-        | Some (`List ((`Assoc block_fields :: _))) -> (
-            match List.assoc_opt "text" block_fields with
-            | Some (`String t) -> t
-            | _ -> "(no text in response)")
+        match List.assoc_opt "choices" fields with
+        | Some (`List (`Assoc choice_fields :: _)) -> (
+            match List.assoc_opt "message" choice_fields with
+            | Some (`Assoc msg_fields) -> (
+                match List.assoc_opt "content" msg_fields with
+                | Some (`String t) -> t
+                | _ -> "(no text in response)")
+            | _ -> "(unexpected response shape)")
         | _ -> "(unexpected response shape)")
     | _ -> "(unexpected response shape)"
   with _ -> "(failed to parse API response)"
 
 let call_api (prompt : string) : string =
   let api_key =
-    match Sys.getenv_opt "ANTHROPIC_API_KEY" with
+    match Sys.getenv_opt "OPENAI_API_KEY" with
     | Some k -> k
     | None ->
         failwith
-          "ANTHROPIC_API_KEY environment variable is not set"
+          "OPENAI_API_KEY environment variable is not set"
   in
   let body_str = build_request_body prompt in
   let result = ref "" in
@@ -81,8 +84,7 @@ let call_api (prompt : string) : string =
      let headers =
        Cohttp.Header.of_list
          [
-           ("x-api-key", api_key);
-           ("anthropic-version", "2023-06-01");
+           ("authorization", "Bearer " ^ api_key);
            ("content-type", "application/json");
          ]
      in
