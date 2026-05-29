@@ -32,6 +32,7 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
               raise
                 (Runtime_error
                    ("[Mem] Location " ^ Loc.string_of_t l ^ " not found")))
+    | AddrOf x -> ({ r with value = Value.Loc (Loc.get x) }, c)
     | Enable -> (r, { c with imode = Interrupt.Enabled })
     | Disable -> (r, { c with imode = Interrupt.Disabled })
     | Malloc (e1, e2) ->

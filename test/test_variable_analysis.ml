@@ -12,6 +12,13 @@ let assert_itv msg expected actual =
 let assert_int_value msg expected ((actual, _, _) : Abs_dom.Abs_Val.t) =
   assert_itv msg (Itv.alpha expected) actual
 
+let assert_loc_value msg expected ((_, _, actual) : Abs_dom.Abs_Val.t) =
+  if Abs_dom.Abs_Loc.compare expected actual <> 0 then
+    failwith
+      (Printf.sprintf "%s: expected %s, got %s" msg
+         (Abs_dom.Abs_Loc.string_of_t expected)
+         (Abs_dom.Abs_Loc.string_of_t actual))
+
 let heap_loc lbl n =
   Abs_dom.Abs_Loc.AHeapLoc { lbl; offset = Itv.alpha n }
 
@@ -100,8 +107,143 @@ main {
   let v, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "X") in
   assert_int_value "reading A[0] should not join A[1]" 1 v
 
+let test_analyzer_reads_through_address_of () =
+  let c =
+    run_abs
+      {|
+init {
+  X := 1;
+  P := &X
+}
+
+main {
+  Y := *P[0]
+}
+|}
+  in
+  let v, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Y") in
+  assert_int_value "reading through &X should read X" 1 v
+
+let test_analyzer_writes_through_address_of () =
+  let c =
+    run_abs
+      {|
+init {
+  X := 1;
+  P := &X
+}
+
+main {
+  *P[0] := 2;
+  Y := X
+}
+|}
+  in
+  let vx, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "X") in
+  let vy, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Y") in
+  assert_int_value "writing through &X should update X" 2 vx;
+  assert_int_value "reading X after address write should see update" 2 vy
+
+let test_analyzer_compares_address_of () =
+  let c =
+    run_abs
+      {|
+init {
+  X := 1
+}
+
+main {
+  Same := &X = &X;
+  Diff := &X = &Same
+}
+|}
+  in
+  let same, _ =
+    Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Same")
+  in
+  let diff, _ =
+    Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Diff")
+  in
+  assert_int_value "&X = &X should be true" 1 same;
+  assert_int_value "&X = &Same should be false" 0 diff
+
+let test_compiled_handler_preserves_address_of_scalar_assignment () =
+  let c =
+    run_abs
+      {|
+init {
+  X := 0;
+  Y := 0;
+  handler 0 {
+    X := &Y
+  }
+}
+
+main {
+  Tick := 0;
+  Addr := X
+}
+|}
+  in
+  let addr, _ =
+    Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Addr")
+  in
+  assert_loc_value "compiled handler scalar assignment should preserve &Y"
+    (Abs_dom.Abs_Loc.get "Y") addr
+
+let test_nonzero_offset_through_address_of_raises () =
+  match
+    run_abs
+      {|
+init {
+  X := 0;
+  P := &X
+}
+
+main {
+  Y := *P[1]
+}
+|}
+  with
+  | exception Interp.Runtime_error _ -> ()
+  | _ ->
+      failwith
+        "expected Runtime_error for non-zero variable-address dereference"
+
+let test_compiled_handler_preserves_address_of_array_write () =
+  let c =
+    run_abs
+      {|
+init {
+  X := 0;
+  Book := malloc(1, 0);
+  *Book[0] := &X;
+
+  handler 0 {
+    *Book[0] := &X
+  }
+}
+
+main {
+  Tick := 0;
+  Addr := *Book[0]
+}
+|}
+  in
+  let addr, _ =
+    Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Addr")
+  in
+  assert_loc_value "compiled handler should preserve &X value"
+    (Abs_dom.Abs_Loc.get "X") addr
+
 let () =
   test_heap_strong_singleton_write ();
   test_heap_interval_write_updates_overlapping_cells ();
   test_top_write_updates_existing_locations ();
-  test_analyzer_reads_singleton_cell ()
+  test_analyzer_reads_singleton_cell ();
+  test_analyzer_reads_through_address_of ();
+  test_analyzer_writes_through_address_of ();
+  test_analyzer_compares_address_of ();
+  test_compiled_handler_preserves_address_of_array_write ();
+  test_compiled_handler_preserves_address_of_scalar_assignment ();
+  test_nonzero_offset_through_address_of_raises ()

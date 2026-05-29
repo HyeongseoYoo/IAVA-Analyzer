@@ -42,6 +42,7 @@ let rec fmt_exp : Exp.t -> string = function
   | Exp.Unit -> "unit"
   | Exp.Int n -> string_of_int n
   | Exp.Var x -> x
+  | Exp.AddrOf x -> "&" ^ x
   | Exp.Enable -> "enable"
   | Exp.Disable -> "disable"
   | Exp.Bop (bop, e1, e2) ->
@@ -66,7 +67,7 @@ let rec fmt_exp : Exp.t -> string = function
    RHS is traversed so we follow the data that was written, not the target. *)
 let rec vars_in_exp : Exp.t -> string list = function
   | Exp.Var x -> [ x ]
-  | Exp.Int _ | Exp.Unit | Exp.Enable | Exp.Disable -> []
+  | Exp.Int _ | Exp.Unit | Exp.AddrOf _ | Exp.Enable | Exp.Disable -> []
   | Exp.Bop (_, e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
   | Exp.Deref (e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
   | Exp.Malloc (e1, e2) -> vars_in_exp e1.exp @ vars_in_exp e2.exp
@@ -129,7 +130,7 @@ let build_lbl_table (pgm : Program.t) :
           acc
       in
       match exp with
-      | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.Enable | Exp.Disable -> acc
+      | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.AddrOf _ | Exp.Enable | Exp.Disable -> acc
       | Exp.Bop (_, e1, e2)
       | Exp.Deref (e1, e2)
       | Exp.Malloc (e1, e2)

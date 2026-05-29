@@ -18,10 +18,6 @@ type summary_atom = {
   rhs : Exp.lbl_t;
   assign_lbl : Exp.Lbl.t;
   guard : (Exp.bop * Exp.lbl_t) option;
-  (* Some(bop, cond) ↔ atom lives inside a guarded if-branch.
-     bop is the effective operator for the branch:
-       then-branch of "Var < N"  →  (Lt, cond)  → narrow idx to Var < N
-       else-branch of "Var < N"  →  (Ge, cond)  → narrow idx to Var >= N *)
 }
 
 (* Pre-compiled symbolic summary of a handler body *)
@@ -37,6 +33,7 @@ type fp_scalar =
   | FPS_Inc                 (* x := x + c (c>0): fixpoint sets upper → +∞ *)
   | FPS_Dec                 (* x := x - c (c>0): fixpoint sets lower → -∞ *)
   | FPS_JoinConsts of Itv.t (* x := constant: join current value with this itv *)
+  | FPS_JoinVal of Abs_Val.t (* x := abstract constant, such as &y *)
   | FPS_Top                 (* complex write: widen to top *)
 
 (* A single heap-array write effect extracted from handler bodies *)
@@ -287,19 +284,34 @@ let itv_overlap (loc : Abs_Loc.t) : Itv.t * Itv.t * Itv.t =
 let equal_check (v1 : Abs_Val.t) (v2 : Abs_Val.t) : Itv.t =
   let itv1, _u1, loc1 = v1 in
   let itv2, _u2, loc2 = v2 in
-  (* print_endline ("[Equal Check] " ^ Abs_Val.string_of_t v1 ^ " vs " ^
-     Abs_Val.string_of_t v2); *)
-  let itv_bot = itv1 = Itv.bot || itv2 = Itv.bot in
-  let loc_bot = loc1 = Abs_Loc.bot || loc2 = Abs_Loc.bot in
-  if itv_bot && loc_bot then Itv.Bool.false_
-  else
-    let itv_must_true = Itv.single_eq itv1 itv2 in
-    let itv_must_false = not (Itv.is_overlap itv1 itv2) in
-    let loc_must_true = Abs_Loc.compare loc1 loc2 = 0 in
-    let loc_must_false = not (loc_overlap loc1 loc2) in
-    if itv_must_true && loc_must_true then Itv.Bool.true_
-    else if itv_must_false && loc_must_false then Itv.Bool.false_
-    else Itv.Bool.top
+  let has_int1 = itv1 <> Itv.bot in
+  let has_int2 = itv2 <> Itv.bot in
+  let has_loc1 = loc1 <> Abs_Loc.bot in
+  let has_loc2 = loc2 <> Abs_Loc.bot in
+  (* Values are a product domain, so a joined int-or-location value may have both
+     components.  Only return a definite answer when every possible component
+     pair agrees; otherwise keep the comparison unknown. *)
+  let int_answer =
+    if not has_int1 && not has_int2 then None
+    else if has_int1 && has_int2 then
+      if Itv.single_eq itv1 itv2 then Some Itv.Bool.true_
+      else if not (Itv.is_overlap itv1 itv2) then Some Itv.Bool.false_
+      else Some Itv.Bool.top
+    else Some Itv.Bool.false_
+  in
+  let loc_answer =
+    if not has_loc1 && not has_loc2 then None
+    else if has_loc1 && has_loc2 then
+      if Abs_Loc.single_eq loc1 loc2 then Some Itv.Bool.true_
+      else if not (loc_overlap loc1 loc2) then Some Itv.Bool.false_
+      else Some Itv.Bool.top
+    else Some Itv.Bool.false_
+  in
+  match (int_answer, loc_answer) with
+  | None, None -> Itv.Bool.false_
+  | Some a, None | None, Some a -> a
+  | Some a, Some b ->
+      if a = b then a else Itv.Bool.top
 
 let is_pp_handler (pp : ProgramPoint.t) : bool =
   match pp with ProgramPoint.Label (Exp.Lbl.Handler _) -> true | _ -> false
@@ -347,6 +359,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           | Some (v, p') -> ({ avalue = v; app = p' }, c)
           | None ->
               raise (Runtime_error ("[Abs_Mem] Variable " ^ x ^ " not found")))
+    | AddrOf x -> ({ r with avalue = abs_loc (Abs_Loc.get x) }, c)
     | Enable ->
         ({ r with avalue = abs_unit () }, { c with aimode = Interrupt.Enabled })
     | Disable ->
@@ -354,8 +367,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     | Malloc (e1, e2) -> (
         let r1, c1 = self c e1 in
         let r2, c2 = self c1 e2 in
-        (* TO-DO: if there is a negative value in range n_itv, it should be
-           added in error list *)
+        (* TO-DO: if there is a negative value in range n_itv, it should be added in error list *)
         let n_itv = get_offset (proj_int r1.avalue) in
         (* max positive offset *)
         let v = r2.avalue in
@@ -389,16 +401,28 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         let safe_itv, left_oob, right_oob =
           match base_loc with
           | Abs_Loc.AHeapLoc _ -> itv_overlap shifted_loc
-          | Abs_Loc.AVarLoc _ | Abs_Loc.Bot ->
-              (Itv.bot, Itv.bot, Itv.bot)
+          | Abs_Loc.AVarLoc _ ->
+              (* TODO: model/report invalid variable-address offsets.  For now
+                 &x behaves as a scalar address and only offset 0 is accepted.
+                 Checking offset_itv alone is equivalent to checking
+                 shifted_loc's offset because all AVarLoc base pointers carry
+                 offset [0,0] (created only via Abs_Loc.get in AddrOf). *)
+              if Itv.leq offset_itv (Itv.alpha 0) then
+                (Itv.alpha 0, Itv.bot, Itv.bot)
+              else
+                raise
+                  (Runtime_error
+                     "[Deref] Variable-address dereference only supports offset 0")
+          | Abs_Loc.Bot -> (Itv.bot, Itv.bot, Itv.bot)
           | Abs_Loc.Top -> (Itv.top, Itv.top, Itv.top)
         in
 
         let access_loc =
-          match base_loc with
+          match shifted_loc with
           | Abs_Loc.AHeapLoc { lbl; _ } ->
               Abs_Loc.AHeapLoc { lbl; offset = safe_itv }
-          | Abs_Loc.AVarLoc _ | Abs_Loc.Bot -> Abs_Loc.Bot
+          | Abs_Loc.AVarLoc _ -> shifted_loc
+          | Abs_Loc.Bot -> Abs_Loc.Bot
           | Abs_Loc.Top -> Abs_Loc.Top
         in
 
@@ -665,27 +689,37 @@ let combine_fp_scalar (a : fp_scalar) (b : fp_scalar) : fp_scalar =
   | FPS_Inc, FPS_Inc -> FPS_Inc
   | FPS_Dec, FPS_Dec -> FPS_Dec
   | FPS_Inc, FPS_Dec | FPS_Dec, FPS_Inc -> FPS_Top
+  | FPS_Inc, FPS_JoinVal _ | FPS_JoinVal _, FPS_Inc -> FPS_Top
+  | FPS_Dec, FPS_JoinVal _ | FPS_JoinVal _, FPS_Dec -> FPS_Top
   | FPS_Inc, FPS_JoinConsts _ | FPS_JoinConsts _, FPS_Inc -> FPS_Inc
   | FPS_Dec, FPS_JoinConsts _ | FPS_JoinConsts _, FPS_Dec -> FPS_Dec
+  | FPS_JoinConsts c, FPS_JoinVal v | FPS_JoinVal v, FPS_JoinConsts c ->
+      FPS_JoinVal (Abs_Val.join (abs_int c) v)
   | FPS_JoinConsts c1, FPS_JoinConsts c2 -> FPS_JoinConsts (Itv.join c1 c2)
+  | FPS_JoinVal v1, FPS_JoinVal v2 -> FPS_JoinVal (Abs_Val.join v1 v2)
 
 (* Apply a pre-compiled scalar fixpoint effect to an abstract value *)
-let apply_fp_scalar (fps : fp_scalar) ((itv, u, l) : Abs_Val.t) : Abs_Val.t =
-  let new_itv =
-    match fps with
-    | FPS_Unchanged -> itv
-    | FPS_Inc -> (
+let apply_fp_scalar (fps : fp_scalar) (((itv, u, l) as v) : Abs_Val.t) :
+    Abs_Val.t =
+  match fps with
+  | FPS_Unchanged -> v
+  | FPS_Inc ->
+      let new_itv =
         match itv with
         | Itv.Bot -> Itv.Bot
-        | Itv.Itv (lo, _) -> Itv.Itv (lo, Itv.Bound.P_inf))
-    | FPS_Dec -> (
+        | Itv.Itv (lo, _) -> Itv.Itv (lo, Itv.Bound.P_inf)
+      in
+      (new_itv, u, l)
+  | FPS_Dec ->
+      let new_itv =
         match itv with
         | Itv.Bot -> Itv.Bot
-        | Itv.Itv (_, hi) -> Itv.Itv (Itv.Bound.N_inf, hi))
-    | FPS_JoinConsts c -> Itv.join itv c
-    | FPS_Top -> Itv.top
-  in
-  (new_itv, u, l)
+        | Itv.Itv (_, hi) -> Itv.Itv (Itv.Bound.N_inf, hi)
+      in
+      (new_itv, u, l)
+  | FPS_JoinConsts c -> Abs_Val.join v (abs_int c)
+  | FPS_JoinVal v' -> Abs_Val.join v v'
+  | FPS_Top -> (Itv.top, u, l)
 
 (* Build a map from handler-local pointer variable names to heap labels by
    scanning for [x := y] atoms where y resolves to a heap pointer in
@@ -729,6 +763,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
       let fps =
         match atom.rhs.exp with
         | Int n -> FPS_JoinConsts (Itv.alpha n)
+        | AddrOf y -> FPS_JoinVal (abs_loc (Abs_Loc.get y))
         | Bop (Plus, { exp = Var y; _ }, { exp = Int n; _ })
           when String.equal x y ->
             if n > 0 then FPS_Inc else if n < 0 then FPS_Dec else FPS_Unchanged
@@ -774,6 +809,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
           let fpa_rhs =
             match atom.rhs.exp with
             | Int n -> `Const (abs_int (Itv.alpha n))
+            | AddrOf x -> `Const (abs_loc (Abs_Loc.get x))
             | Var v -> `Var (Abs_Loc.get v)
             | _ -> `Const Abs_Val.top
           in
@@ -819,7 +855,8 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
    1. Scalar pass: update each scalar loc's interval according to its fp_scalar.
       - FPS_Inc  →  upper bound → +∞  (models unbounded increments at fixpoint)
       - FPS_Dec  →  lower bound → -∞  (models unbounded decrements at fixpoint)
-      - FPS_JoinConsts c  →  join current itv with c
+      - FPS_JoinConsts c  →  join current value with integer c
+      - FPS_JoinVal v     →  join current value with v
       - FPS_Top  →  set to top
    2. Array pass: for each fp_array_write, resolve the index and value
       from the post-scalar amem (so that widened scalar values propagate
@@ -900,10 +937,13 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
             let contributed_itv =
               match fps with
               | FPS_JoinConsts c -> c
+              | FPS_JoinVal (itv, _, _) -> itv
               | _ -> Itv.top
             in
             let contributed_val =
-              (contributed_itv, Abs_Unit.bot, Abs_Loc.bot)
+              match fps with
+              | FPS_JoinVal v -> v
+              | _ -> (contributed_itv, Abs_Unit.bot, Abs_Loc.bot)
             in
             PPSet.fold
               (fun pp asem' ->
@@ -1054,7 +1094,7 @@ let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
       (match (then_summary, else_summary) with
       | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
       | _ -> Fallback lbl_exp)
-  | Enable | Disable | Unit | Int _ | Var _ | Bop _ | Deref _ ->
+  | Enable | Disable | Unit | Int _ | Var _ | AddrOf _ | Bop _ | Deref _ ->
       Compiled []
   | While _ | Malloc _ ->
       Fallback lbl_exp

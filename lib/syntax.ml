@@ -37,6 +37,7 @@ module Exp = struct
     | Unit
     | Int of int
     | Var of string
+    | AddrOf of string (* &x *)
     | Enable
     | Disable
     | Bop of bop * lbl_t * lbl_t
@@ -66,7 +67,7 @@ module Exp = struct
     let rec tabulate' ({ lbl; exp; _ } : lbl_t) (tbl : t Lbl_map.t) =
       let tbl = Lbl_map.add (Either.left lbl) exp tbl in
       match exp with
-      | Unit | Int _ | Var _ | Enable | Disable -> tbl
+      | Unit | Int _ | Var _ | AddrOf _ | Enable | Disable -> tbl
       | Bop (_, e1, e2)
       | Deref (e1, e2)
       | Malloc (e1, e2)
@@ -86,7 +87,7 @@ module Exp = struct
     let rec relabel' (lbl : Lbl.t) ({ exp; line; _ } : lbl_t) : lbl_t * Lbl.t =
       let my_lbl = Lbl.succ_lbl lbl in
       match exp with
-      | Unit | Int _ | Var _ | Enable | Disable ->
+      | Unit | Int _ | Var _ | AddrOf _ | Enable | Disable ->
           ({ lbl = my_lbl; exp; line }, my_lbl)
       | Bop (b, e1, e2) ->
           let e1', l1 = relabel' my_lbl e1 in
@@ -143,6 +144,7 @@ module Exp = struct
     | Unit -> "unit"
     | Int n -> string_of_int n
     | Var x -> x
+    | AddrOf x -> "&" ^ x
     | Enable -> "enable"
     | Disable -> "disable"
     | Bop (bop, e1, e2) ->

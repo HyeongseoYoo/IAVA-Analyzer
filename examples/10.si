@@ -1,0 +1,76 @@
+(*
+   Example 10: Address values (&x) in nested heap structures
+
+   This example is meant to stress the new address-of syntax together with
+   existing complex expression syntax:
+
+   - AddrBook stores variable addresses, such as &Status and &ErrorFlag.
+   - PtrBox stores the heap pointer AddrBook, so main must use a nested
+     dereference to read an address out of the address book.
+   - Handlers can update scalar state and replace entries in AddrBook.
+   - Main copies the selected address, compares it with fresh &x expressions,
+     and uses the result in boolean/control-flow expressions.
+
+   Note: &x produces a variable-location value. It is meaningful to store,
+   copy, and compare that value, but this language does not model using an
+   address value as an assignable dereference target.
+*)
+
+init {
+  Status := 1;
+  ErrorFlag := 0;
+  Slot := 0;
+  Limit := 3;
+
+  AddrBook := malloc(4, 0);
+  PtrBox := malloc(1, 0);
+  IndexBox := malloc(1, 0);
+  Trace := malloc(8, 0);
+
+  *AddrBook[0] := &Status;
+  *AddrBook[1] := &ErrorFlag;
+  *AddrBook[2] := &Slot;
+  *AddrBook[3] := &Limit;
+
+  *PtrBox[0] := AddrBook;
+  *IndexBox[0] := 0;
+
+  handler 0 {
+    Status := Status + 1;
+    *AddrBook[0] := &Status;
+    *AddrBook[2] := &Status
+  };
+
+  handler 1 {
+    ErrorFlag := 1;
+    *IndexBox[0] := 1;
+    *AddrBook[1] := &ErrorFlag
+  }
+}
+
+main {
+  *Trace[0] := Status;
+
+  SelectedAddr := * ( *PtrBox[0]) [*IndexBox[0]];
+  SelectedIsStatus := SelectedAddr = &Status;
+  SelectedIsError := SelectedAddr = &ErrorFlag;
+
+  if (SelectedIsStatus && Status < Limit) || SelectedIsError
+  then (
+    *Trace[1] := Status;
+    *Trace[2] := ErrorFlag
+  )
+  else (
+    *Trace[1] := 0;
+    *Trace[2] := Limit
+  );
+
+  while Slot < 2 do (
+    *Trace[Slot + 3] := Status + Slot;
+    Slot := Slot + 1
+  );
+
+  FinalAddr := *AddrBook[2];
+  FinalIsStatus := FinalAddr = &Status;
+  *Trace[7] := FinalIsStatus
+}

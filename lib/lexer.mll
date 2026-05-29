@@ -63,6 +63,7 @@ rule read =
   | '['       { LBRACK }
   | ']'       { RBRACK }
   | ','       { COMMA }
+  | '&'       { AMP }
   | semi      { SEMI }
   | eof       { EOF }
   | _         { raise (SyntaxError ("Unexpected char: " ^ lexeme lexbuf)) }

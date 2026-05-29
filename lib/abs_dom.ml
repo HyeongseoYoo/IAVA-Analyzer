@@ -40,10 +40,15 @@ module Abs_Loc = struct
   let get (id : Var.t) : t = AVarLoc { id; offset = Itv.alpha 0 }
   let alloc (lbl : Exp.Lbl.t) (offset : Itv.t) : t = AHeapLoc { lbl; offset }
 
+  (* AVarLoc base pointers are always created with offset [0,0] via `get`, so
+     the only reachable case is adding the dereference index on top of that.
+     The Deref OOB check in analyzer.ml enforces that this index is [0,0]. *)
   let offset_add (base : t) (offset : Itv.t) : t =
     match base with
     | Top -> Top
-    | Bot | AVarLoc _ -> Bot
+    | Bot -> Bot
+    | AVarLoc { id; offset = base_off } ->
+        AVarLoc { id; offset = Itv.add base_off offset }
     | AHeapLoc { lbl; offset = base_off } ->
         AHeapLoc { lbl; offset = Itv.add base_off offset }
 

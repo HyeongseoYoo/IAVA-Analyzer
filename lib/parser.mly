@@ -22,7 +22,7 @@ open Lexing
 %token COLONEQ
 %token OR AND
 %token EQ LT GT NE LE GE
-%token MINUS PLUS STAR
+%token MINUS PLUS STAR AMP
 
 %token EOF
 
@@ -134,6 +134,10 @@ exp:
     | mkexp(e1 = exp; AND; e2 = exp { Exp.Bop (Exp.And, e1, e2) })
       { $1 }
     | mkexp(e1 = exp; OR; e2 = exp { Exp.Bop (Exp.Or, e1, e2) })
+      { $1 }
+
+    (* address-of *)
+    | mkexp(AMP; x = ID { Exp.AddrOf x })
       { $1 }
 
     (* heap *)
