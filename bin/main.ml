@@ -9,7 +9,28 @@ let opt_analyze = ref false
 let opt_analyze_detail = ref false
 let opt_prov = ref false
 let opt_report = ref false
+let report_out = ref None
 let opt_summary = ref false
+
+let read_all (ic : in_channel) : string =
+  let buf = Buffer.create 4096 in
+  (try
+     while true do
+       Buffer.add_string buf (input_line ic);
+       Buffer.add_char buf '\n'
+     done
+   with End_of_file -> ());
+  Buffer.contents buf
+
+let write_all (path : string) (contents : string) : unit =
+  let oc = open_out path in
+  Fun.protect
+    ~finally:(fun () -> close_out oc)
+    (fun () -> output_string oc contents)
+
+let default_report_path () : string =
+  if !src = "" then "codex_bug_report.md"
+  else Filename.remove_extension !src ^ ".report.md"
 
 let main () =
   Arg.parse
@@ -33,15 +54,26 @@ let main () =
         "provenance analysis: trace bug origins (no LLM)" );
       ( "-report",
         Arg.Unit (fun _ -> opt_report := true),
-        "LLM bug report: provenance analysis + Claude explanation" );
+        "write LLM bug report markdown: provenance analysis + Codex explanation" );
+      ( "-report-out",
+        Arg.String (fun path -> report_out := Some path),
+        "FILE write -report markdown to FILE" );
       ( "-summary",
         Arg.Unit (fun _ -> opt_summary := true),
         "print pre-compiled handler summaries" );
     ]
     (fun x -> src := x)
     ("Usage : " ^ Filename.basename Sys.argv.(0) ^ " [-option] [filename] ");
+  let source_code =
+    if !src = "" then read_all stdin
+    else
+      let ic = open_in !src in
+      Fun.protect
+        ~finally:(fun () -> close_in ic)
+        (fun () -> read_all ic)
+  in
   let lexbuf =
-    Lexing.from_channel (if !src = "" then stdin else open_in !src)
+    Lexing.from_string source_code
   in
   let pgm = Parser.prog Lexer.read lexbuf in
   let open Syntax.Program in
@@ -89,7 +121,13 @@ let main () =
      if !opt_prov then
        print_endline (Provenance.string_of_report chains);
      if !opt_report then
-       print_endline (Reporter.explain chains)
+       let path = Option.value !report_out ~default:(default_report_path ()) in
+       let t3 = Unix.gettimeofday () in
+       let markdown = Reporter.explain ~source_code chains in
+       let t4 = Unix.gettimeofday () in
+       Printf.eprintf "[time] codex_exec  : %.3fs\n" (t4 -. t3);
+       write_all path markdown;
+       Printf.eprintf "[report] wrote %s\n" path
    end);
   if
     not

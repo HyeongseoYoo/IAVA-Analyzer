@@ -2,7 +2,7 @@
 (library
  (name variable_analysis)
  (modules syntax parser lexer analyzer interp domain itv abs_dom provenance reporter)
- (libraries cohttp-lwt-unix yojson))
+ (libraries unix))
 
 (menhir
  (modules parser))

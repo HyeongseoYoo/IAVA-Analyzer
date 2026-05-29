@@ -23,9 +23,8 @@
  (depends ocaml
          (ocaml-base-compiler
            (= 5.3.0))
-         menhir
-         cohttp-lwt-unix
-         yojson)
+         (menhir
+           (>= 20180523)))
  (tags
   ("abstract interpretation" "interrupt" "variable analysis")))
 

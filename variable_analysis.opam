@@ -13,9 +13,7 @@ depends: [
   "dune" {>= "2.9"}
   "ocaml"
   "ocaml-base-compiler" {= "5.3.0"}
-  "menhir"
-  "cohttp-lwt-unix"
-  "yojson"
+  "menhir" {>= "20180523"}
   "odoc" {with-doc}
 ]
 build: [
