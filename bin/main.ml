@@ -118,7 +118,10 @@ let main () =
      let t0 = Unix.gettimeofday () in
      let asem, errs = Analyzer.abs_analyze ~use_opt:(not !opt_optoff) pgm in
      let t1 = Unix.gettimeofday () in
-     let chains = Provenance.analyze errs asem pgm in
+     let chains =
+       Provenance.analyze errs asem pgm
+       |> List.filter (fun (c : Provenance.chain) -> c.error.handler_caused)
+     in
      let t2 = Unix.gettimeofday () in
      Printf.eprintf "[time] abs_analyze : %.3fs\n" (t1 -. t0);
      Printf.eprintf "[time] prov_analyze : %.3fs\n" (t2 -. t1);
