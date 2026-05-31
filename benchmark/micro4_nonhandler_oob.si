@@ -1,0 +1,75 @@
+// micro4_nonhandler_oob.si — Precision test: non-handler-caused OOB (no fixed version)
+// Bug: main loops TX_TOTAL (10) times on TxBuf[MAX_SLOTS=8] -> OOB at TxIdx in [8,9]
+// No handler touches TxIdx or TxBuf -> handler_caused = false
+// Expected: OOB reported WITHOUT "[caused by interrupt: ...]" annotation
+//
+init {
+  // === Array sizes ===
+  MAX_SLOTS  := 8;
+  PRP_SZ     := 8;
+  TX_TOTAL   := 10;
+  REG_SZ     := 4;
+
+  // === OOB sentinel ===
+  ABORT_SLOT := 255;
+
+  // === Register field indices ===
+  REG_STATUS := 0;
+  REG_PRPPTR := 1;
+  REG_ERRCNT := 2;
+
+  // === Error codes ===
+  ERR_NONE    := 0;
+  ERR_INVAL   := 1;
+  ERR_TIMEOUT := 2;
+
+  // === State variables ===
+  SlotIdx  := 0;
+  ErrCode  := 0;
+  ErrCount := 0;
+
+  // === Arrays ===
+  SqBuf     := malloc(8, 0);
+  RegFile   := malloc(4, 0);
+  PrpList   := malloc(8, 0);
+  DmaConf   := malloc(4, 0);
+  DescTable := malloc(4, 0);
+  PrpList2  := malloc(8, 0);
+  TxBuf     := malloc(8, 0);
+  DiagBuf   := malloc(4, 0);
+
+  // === Initialize shared heap state ===
+  *RegFile[REG_PRPPTR] := 0;
+  *DescTable[0]        := DmaConf;
+  *DmaConf[REG_PRPPTR] := 0;
+
+  handler 0 {
+    // NVME_ERR_EVT: corrupts SlotIdx (direct scalar) — bug source for micro1
+    ErrCode  := ERR_INVAL;
+    ErrCount := ErrCount + 1;
+    SlotIdx  := ABORT_SLOT
+  };
+
+  handler 1 {
+    // TIMEOUT_EVT: corrupts RegFile[REG_PRPPTR] — bug source for micro2
+    ErrCount             := ErrCount + 1;
+    *RegFile[REG_PRPPTR] := ABORT_SLOT
+  };
+
+  handler 2 {
+    // CQ_FULL_EVT: corrupts DmaConf[REG_PRPPTR] via 1-level alias — bug source for micro3
+    DmaPtr              := DmaConf;
+    *DmaPtr[REG_PRPPTR] := ABORT_SLOT
+  }
+}
+
+main {
+  // TX_TOTAL (10) > MAX_SLOTS (8): iterations at TxIdx=8 and TxIdx=9 are OOB.
+  // No handler writes TxIdx or TxBuf, so handler_caused = false for this access.
+  // The analyzer should report the OOB but omit "[caused by interrupt: ...]".
+  TxIdx := 0;
+  while TxIdx < TX_TOTAL do (
+    *TxBuf[TxIdx] := TxIdx;   // [OOB-4] TxIdx in [8,9] > MAX_SLOTS-1; not handler-caused
+    TxIdx := TxIdx + 1
+  )
+}

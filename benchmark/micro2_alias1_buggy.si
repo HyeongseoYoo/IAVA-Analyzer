@@ -1,0 +1,75 @@
+// micro2_alias1_buggy.si — Pattern 2: 1-depth pointer alias (BUGGY)
+// Bug: handler 1 corrupts RegFile[REG_PRPPTR] between if-check and then-branch.
+// Expected: 1 interrupt warning, [caused by interrupt: handler 1]
+// Fix: see micro2_alias1_fixed.si — snapshot the value inside disable/enable
+//
+init {
+  // === Array sizes ===
+  MAX_SLOTS  := 8;
+  PRP_SZ     := 8;
+  TX_TOTAL   := 10;
+  REG_SZ     := 4;
+
+  // === OOB sentinel ===
+  ABORT_SLOT := 255;
+
+  // === Register field indices ===
+  REG_STATUS := 0;
+  REG_PRPPTR := 1;
+  REG_ERRCNT := 2;
+
+  // === Error codes ===
+  ERR_NONE    := 0;
+  ERR_INVAL   := 1;
+  ERR_TIMEOUT := 2;
+
+  // === State variables ===
+  SlotIdx  := 0;
+  ErrCode  := 0;
+  ErrCount := 0;
+
+  // === Arrays ===
+  SqBuf     := malloc(8, 0);
+  RegFile   := malloc(4, 0);
+  PrpList   := malloc(8, 0);
+  DmaConf   := malloc(4, 0);
+  DescTable := malloc(4, 0);
+  PrpList2  := malloc(8, 0);
+  TxBuf     := malloc(8, 0);
+  DiagBuf   := malloc(4, 0);
+
+  // === Initialize shared heap state ===
+  *RegFile[REG_PRPPTR] := 0;
+  *DescTable[0]        := DmaConf;
+  *DmaConf[REG_PRPPTR] := 0;
+
+  handler 0 {
+    // NVME_ERR_EVT: corrupts SlotIdx (direct scalar) — bug source for micro1
+    ErrCode  := ERR_INVAL;
+    ErrCount := ErrCount + 1;
+    SlotIdx  := ABORT_SLOT
+  };
+
+  handler 1 {
+    // TIMEOUT_EVT: corrupts RegFile[REG_PRPPTR] — bug source for micro2
+    ErrCount             := ErrCount + 1;
+    *RegFile[REG_PRPPTR] := ABORT_SLOT
+  };
+
+  handler 2 {
+    // CQ_FULL_EVT: corrupts DmaConf[REG_PRPPTR] via 1-level alias — bug source for micro3
+    DmaPtr              := DmaConf;
+    *DmaPtr[REG_PRPPTR] := ABORT_SLOT
+  }
+}
+
+main {
+  // 1-depth alias: NvmeCtrl -> RegFile (same heap block as handler 1 writes)
+  NvmeCtrl := RegFile;
+  // [BUG-2] The if-check reads RegFile[REG_PRPPTR]; handler 1 can fire before
+  // the then-branch and set it to 255.  The second read in the then-branch
+  // is unguarded and may produce an out-of-bounds index into PrpList[8].
+  if *NvmeCtrl[REG_PRPPTR] < PRP_SZ
+  then *PrpList[*NvmeCtrl[REG_PRPPTR]] := 0   // OOB: re-read may be 255
+  else *PrpList[0] := 0
+}

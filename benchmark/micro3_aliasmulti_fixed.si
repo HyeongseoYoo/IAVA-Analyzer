@@ -1,0 +1,80 @@
+// micro3_aliasmulti_fixed.si — Pattern 3: multi-depth heap alias (FIXED)
+// Fix: snapshot DmaConf[REG_PRPPTR] into SafePrp2 inside disable/enable.
+// Expected: 0 interrupt warnings
+// Safe because: SafePrp2 is a plain variable no handler writes, so the
+// if-check narrowing is stable across the then-branch.
+//
+init {
+  // === Array sizes ===
+  MAX_SLOTS  := 8;
+  PRP_SZ     := 8;
+  TX_TOTAL   := 10;
+  REG_SZ     := 4;
+
+  // === OOB sentinel ===
+  ABORT_SLOT := 255;
+
+  // === Register field indices ===
+  REG_STATUS := 0;
+  REG_PRPPTR := 1;
+  REG_ERRCNT := 2;
+
+  // === Error codes ===
+  ERR_NONE    := 0;
+  ERR_INVAL   := 1;
+  ERR_TIMEOUT := 2;
+
+  // === State variables ===
+  SlotIdx  := 0;
+  ErrCode  := 0;
+  ErrCount := 0;
+
+  // === Arrays ===
+  SqBuf     := malloc(8, 0);
+  RegFile   := malloc(4, 0);
+  PrpList   := malloc(8, 0);
+  DmaConf   := malloc(4, 0);
+  DescTable := malloc(4, 0);
+  PrpList2  := malloc(8, 0);
+  TxBuf     := malloc(8, 0);
+  DiagBuf   := malloc(4, 0);
+
+  // === Initialize shared heap state ===
+  *RegFile[REG_PRPPTR] := 0;
+  *DescTable[0]        := DmaConf;
+  *DmaConf[REG_PRPPTR] := 0;
+
+  handler 0 {
+    // NVME_ERR_EVT: corrupts SlotIdx (direct scalar) — bug source for micro1
+    ErrCode  := ERR_INVAL;
+    ErrCount := ErrCount + 1;
+    SlotIdx  := ABORT_SLOT
+  };
+
+  handler 1 {
+    // TIMEOUT_EVT: corrupts RegFile[REG_PRPPTR] — bug source for micro2
+    ErrCount             := ErrCount + 1;
+    *RegFile[REG_PRPPTR] := ABORT_SLOT
+  };
+
+  handler 2 {
+    // CQ_FULL_EVT: corrupts DmaConf[REG_PRPPTR] via 1-level alias — bug source for micro3
+    DmaPtr              := DmaConf;
+    *DmaPtr[REG_PRPPTR] := ABORT_SLOT
+  }
+}
+
+main {
+  SysRef := DescTable;
+  EngRef := *SysRef[0];
+  // [FIX-3] Capture DmaConf[REG_PRPPTR] atomically via the alias chain.
+  // Handler 2 cannot corrupt DmaConf[REG_PRPPTR] in the disable window.
+  // SafePrp2 is a plain variable not written by any handler, so the
+  // if-check below is stable across the then-branch.
+  disable;
+  SafePrp2 := *EngRef[REG_PRPPTR];
+  enable;
+  if SafePrp2 < PRP_SZ
+  then *PrpList2[SafePrp2] := 0
+  else unit
+}
