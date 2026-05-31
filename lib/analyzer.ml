@@ -1151,7 +1151,8 @@ let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let _, c_final = evalA c_init pgm.main in
   filter_main_sem c_final.asem
 
-let abs_analyze (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
+let abs_analyze ?(use_opt = true) (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
   let c_init = init_confa pgm in
+  if not use_opt then use_compiled_fp := false;
   let _, c_final = evalA c_init pgm.main in
   (c_final.asem, c_final.errs)

@@ -11,6 +11,7 @@ let opt_prov = ref false
 let opt_report = ref false
 let report_out = ref None
 let opt_summary = ref false
+let opt_optoff = ref false
 
 let read_all (ic : in_channel) : string =
   let buf = Buffer.create 4096 in
@@ -61,6 +62,9 @@ let main () =
       ( "-summary",
         Arg.Unit (fun _ -> opt_summary := true),
         "print pre-compiled handler summaries" );
+      ( "-optoff",
+        Arg.Unit (fun _ -> opt_optoff := true),
+        "disable handler fixpoint optimization (use with -prov or -report)" );
     ]
     (fun x -> src := x)
     ("Usage : " ^ Filename.basename Sys.argv.(0) ^ " [-option] [filename] ");
@@ -112,7 +116,7 @@ let main () =
      ());
   (if !opt_prov || !opt_report then begin
      let t0 = Unix.gettimeofday () in
-     let asem, errs = Analyzer.abs_analyze pgm in
+     let asem, errs = Analyzer.abs_analyze ~use_opt:(not !opt_optoff) pgm in
      let t1 = Unix.gettimeofday () in
      let chains = Provenance.analyze errs asem pgm in
      let t2 = Unix.gettimeofday () in
