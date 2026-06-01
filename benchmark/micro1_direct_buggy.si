@@ -1,5 +1,5 @@
 // micro1_direct_buggy.si — Pattern 1: direct shared scalar variable (BUGGY)
-// Bug: handler 0 corrupts SlotIdx after while-check -> OOB on SqBuf[8]
+// Bug: handler 0 corrupts SlotIdx after if-check -> OOB on SqBuf[8]
 // Expected: 1 interrupt warning, [caused by interrupt: handler 0]
 // Fix: see micro1_direct_fixed.si — wrap SqBuf write in disable/enable
 //
@@ -65,10 +65,9 @@ init {
 
 main {
   SlotIdx := 0;
-  // [BUG-1] handler 0 can fire after the while-check and set SlotIdx := 255.
-  // The subsequent SqBuf write uses the corrupted index without re-checking.
-  while SlotIdx < MAX_SLOTS do (
-    *SqBuf[SlotIdx] := ERR_NONE;   // OOB: SlotIdx in [0,255] when handler 0 fires
-    SlotIdx := SlotIdx + 1
-  )
+  // [BUG-1] handler 0 can fire after the if-check and set SlotIdx := 255.
+  // The then-branch body uses the corrupted index without re-checking.
+  if SlotIdx < MAX_SLOTS
+  then *SqBuf[SlotIdx] := ERR_NONE   // OOB: SlotIdx in [0,255] when handler 0 fires
+  else unit
 }

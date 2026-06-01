@@ -1,5 +1,5 @@
 // micro1_direct_fixed.si — Pattern 1: direct shared scalar variable (FIXED)
-// Fix: disable before re-checking SlotIdx; no handler can fire in the window.
+// Fix: disable before the if-check; no handler can fire in the window.
 // Expected: 0 interrupt warnings
 // Safe because: SlotIdx narrowed inside critical section, SqBuf[SlotIdx] in [0,7]
 //
@@ -65,15 +65,11 @@ init {
 
 main {
   SlotIdx := 0;
-  while SlotIdx < MAX_SLOTS do (
-    // [FIX-1] Disable interrupts and re-check SlotIdx before the write.
-    // No handler can fire between the if-check and the SqBuf access,
-    // so SlotIdx stays in [0, MAX_SLOTS-1] and the write is safe.
-    disable;
-    if SlotIdx < MAX_SLOTS
-    then *SqBuf[SlotIdx] := ERR_NONE
-    else unit;
-    enable;
-    SlotIdx := SlotIdx + 1
-  )
+  // [FIX-1] Disable interrupts so no handler can fire between the if-check
+  // and the SqBuf access; SlotIdx stays in [0, MAX_SLOTS-1].
+  disable;
+  if SlotIdx < MAX_SLOTS
+  then *SqBuf[SlotIdx] := ERR_NONE
+  else unit;
+  enable
 }

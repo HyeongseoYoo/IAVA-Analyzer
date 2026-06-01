@@ -34,45 +34,49 @@ No handler writes `TxIdx`, `TxBuf`, or `DiagBuf`, so micro4's OOB is non-handler
 
 ### micro1_direct_buggy.si / micro1_direct_fixed.si — Pattern 1: direct scalar
 
-**Bug site:** `*SqBuf[SlotIdx]` (line 71 of buggy file)
+**Bug site:** `*SqBuf[SlotIdx]` (line 70 of buggy file)
 
-`SlotIdx` is checked in the `while SlotIdx < MAX_SLOTS` condition, but handler 0
-can fire at the yield point inside the loop body and overwrite it with
-`ABORT_SLOT` (255) before the `SqBuf` write.  At the access site, the abstract
-value of `SlotIdx` is `[0, 255]`; `SqBuf` has 8 entries.
+`SlotIdx` is checked in the `if SlotIdx < MAX_SLOTS` condition, but handler 0
+can fire at the yield point between the check and the `then`-branch body,
+overwriting `SlotIdx` with `ABORT_SLOT` (255) before the `SqBuf` write.  At
+the access site the abstract value of `SlotIdx` is `[0, 255]`; `SqBuf` has 8
+entries.
 
 | | Expected |
 |---|---|
 | Buggy | 1 warning — `[caused by interrupt: handler 0]`, right OOB `[8, 255]` |
 | Fixed | 0 warnings |
 
-**Fix strategy:** wrap the body in `disable; if SlotIdx < MAX_SLOTS then *SqBuf[SlotIdx] := ERR_NONE else unit; enable`.
-Inside the critical section no handler can fire, so the re-check on `SlotIdx`
+**Fix strategy:** wrap the entire `if` in `disable/enable`:
+`disable; if SlotIdx < MAX_SLOTS then *SqBuf[SlotIdx] := ERR_NONE else unit; enable`.
+Inside the critical section no handler can fire, so the check on `SlotIdx`
 is stable and the write is provably safe.
 
 ---
 
 ### micro2_alias1_buggy.si / micro2_alias1_fixed.si ��� Pattern 2: 1-depth alias
 
-**Bug site:** `*PrpList[*NvmeCtrl[REG_PRPPTR]]` (line 73 of buggy file)
+**Bug site:** `*PrpList[*NvmeCtrl[REG_PRPPTR]]` (line 72 of buggy file)
 
 `NvmeCtrl := RegFile` creates a variable alias to the same heap block that
-handler 1 corrupts (`*RegFile[REG_PRPPTR] := ABORT_SLOT`).  The `if` condition
-checks `*NvmeCtrl[REG_PRPPTR] < PRP_SZ`, but between that check and the
-`then`-branch body, handler 1 can fire and store 255 into `RegFile[REG_PRPPTR]`.
-The second (unguarded) read then uses 255 as an index into `PrpList[8]`.
+handler 1 corrupts (`*RegFile[REG_PRPPTR] := ABORT_SLOT`).  The `while`
+condition checks `*NvmeCtrl[REG_PRPPTR] < PRP_SZ`, but between that check
+and the loop body, handler 1 can fire and store 255 into `RegFile[REG_PRPPTR]`.
+The second (unguarded) read in the body then uses 255 as an index into
+`PrpList[8]`.  Because the loop also increments `REG_PRPPTR`, the abstract
+value is unbounded; the analyzer reports right OOB `[8, ∞]`.
 
 | | Expected |
 |---|---|
-| Buggy | 1 warning ��� `[caused by interrupt: handler 1]`, right OOB `[8, 255]` |
+| Buggy | 1 warning ��� `[caused by interrupt: handler 1]`, right OOB `[8, ∞]` |
 | Fixed | 0 warnings |
 
-**Fix strategy:** capture the value atomically:
+**Fix strategy:** inside the loop body, capture the value atomically before use:
 ```
 disable;
 SafePrp := *NvmeCtrl[REG_PRPPTR];
 enable;
-if SafePrp < PRP_SZ then *PrpList[SafePrp] := 0 else *PrpList[0] := 0
+if SafePrp < PRP_SZ then *PrpList[SafePrp] := 0 else unit
 ```
 `SafePrp` is a plain variable no handler writes, so the `if`-check narrowing
 survives into the `then`-branch.
@@ -247,10 +251,10 @@ Run with `-prov` flag:
 
 | File | Lines | Expected bugs | Interrupt warnings |
 |---|---|---|---|
-| micro1_direct_buggy.si | 74 | 1 | 1 (handler 0) |
-| micro1_direct_fixed.si | 79 | 0 | 0 |
-| micro2_alias1_buggy.si | 75 | 1 | 1 (handler 1) |
-| micro2_alias1_fixed.si | 79 | 0 | 0 |
+| micro1_direct_buggy.si | 73 | 1 | 1 (handler 0) |
+| micro1_direct_fixed.si | 75 | 0 | 0 |
+| micro2_alias1_buggy.si | 76 | 1 | 1 (handler 1) |
+| micro2_alias1_fixed.si | 82 | 0 | 0 |
 | micro3_aliasmulti_buggy.si | 81 | 1 | 1 (handler 2) |
 | micro3_aliasmulti_fixed.si | 80 | 0 | 0 |
 | micro4_nonhandler_oob.si | 75 | 1 | 0 (true-negative) |

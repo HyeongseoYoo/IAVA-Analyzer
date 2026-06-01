@@ -1,5 +1,5 @@
 // micro2_alias1_buggy.si — Pattern 2: 1-depth pointer alias (BUGGY)
-// Bug: handler 1 corrupts RegFile[REG_PRPPTR] between if-check and then-branch.
+// Bug: handler 1 corrupts RegFile[REG_PRPPTR] between while-check and body re-read.
 // Expected: 1 interrupt warning, [caused by interrupt: handler 1]
 // Fix: see micro2_alias1_fixed.si — snapshot the value inside disable/enable
 //
@@ -66,10 +66,11 @@ init {
 main {
   // 1-depth alias: NvmeCtrl -> RegFile (same heap block as handler 1 writes)
   NvmeCtrl := RegFile;
-  // [BUG-2] The if-check reads RegFile[REG_PRPPTR]; handler 1 can fire before
-  // the then-branch and set it to 255.  The second read in the then-branch
-  // is unguarded and may produce an out-of-bounds index into PrpList[8].
-  if *NvmeCtrl[REG_PRPPTR] < PRP_SZ
-  then *PrpList[*NvmeCtrl[REG_PRPPTR]] := 0   // OOB: re-read may be 255
-  else *PrpList[0] := 0
+  // [BUG-2] The while-check reads RegFile[REG_PRPPTR]; handler 1 can fire before
+  // the body and set it to 255.  The second read in the body is unguarded
+  // and may produce an out-of-bounds index into PrpList[8].
+  while *NvmeCtrl[REG_PRPPTR] < PRP_SZ do (
+    *PrpList[*NvmeCtrl[REG_PRPPTR]] := 0;   // OOB: re-read may be 255
+    *RegFile[REG_PRPPTR] := *RegFile[REG_PRPPTR] + 1
+  )
 }

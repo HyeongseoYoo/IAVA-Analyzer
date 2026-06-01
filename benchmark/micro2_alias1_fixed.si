@@ -66,14 +66,17 @@ init {
 
 main {
   NvmeCtrl := RegFile;
-  // [FIX-2] Capture RegFile[REG_PRPPTR] atomically: handler 1 cannot fire
-  // between the read and the assignment when interrupts are disabled.
-  // SafePrp is a plain variable not written by any handler, so the
-  // if-check below is stable across the then-branch.
-  disable;
-  SafePrp := *NvmeCtrl[REG_PRPPTR];
-  enable;
-  if SafePrp < PRP_SZ
-  then *PrpList[SafePrp] := 0
-  else *PrpList[0] := 0
+  while *NvmeCtrl[REG_PRPPTR] < PRP_SZ do (
+    // [FIX-2] Capture RegFile[REG_PRPPTR] atomically: handler 1 cannot fire
+    // between the read and the assignment when interrupts are disabled.
+    // SafePrp is a plain variable not written by any handler, so the
+    // if-check below is stable across the then-branch.
+    disable;
+    SafePrp := *NvmeCtrl[REG_PRPPTR];
+    enable;
+    if SafePrp < PRP_SZ
+    then *PrpList[SafePrp] := 0
+    else unit;
+    *RegFile[REG_PRPPTR] := *RegFile[REG_PRPPTR] + 1
+  )
 }
