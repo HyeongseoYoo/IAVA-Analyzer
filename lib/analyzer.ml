@@ -4,10 +4,8 @@ open Abs_dom
 open Interp
 
 type abs_conf = {
-  asem : Abs_Sem.t;
   amem : Abs_Mem.t;
   aimode : Interrupt.t;
-  errs : ErrorSet.t;
 }
 
 type abs_res = { avalue : Abs_Val.t; app : PPSet.t }
@@ -58,10 +56,16 @@ let handler_summaries : handler_summary HandlerStore.IidMap.t ref =
 let compiled_fp : compiled_fixpoint ref =
   ref { fp_scalars = []; fp_arrays = [] }
 let use_compiled_fp : bool ref = ref false
+let asem : Abs_Sem.t ref = ref Abs_Sem.bot
+let errs : ErrorSet.t ref = ref ErrorSet.empty
 
 (* Forward reference: will be set to apply_fixpoint_to_conf after it is defined *)
 let post_steps_fn : (abs_conf -> abs_conf) ref = ref (fun c -> c)
 let widen_cnt = 3
+
+let reset_outputs () =
+  asem := Abs_Sem.bot;
+  errs := ErrorSet.empty
 
 (* Helper *)
 let join_res r1 r2 =
@@ -69,25 +73,20 @@ let join_res r1 r2 =
 
 let join_conf c1 c2 =
   {
-    asem = Abs_Sem.join c1.asem c2.asem;
     amem = Abs_Mem.join c1.amem c2.amem;
     aimode = Interrupt.join c1.aimode c2.aimode;
-    errs = ErrorSet.union c1.errs c2.errs;
   }
 
 let join_out (r1, c1) (r2, c2) = (join_res r1 r2, join_conf c1 c2)
 
 let widen_conf c1 c2 =
   {
-    asem = Abs_Sem.widen c1.asem c2.asem;
     amem = Abs_Mem.widen c1.amem c2.amem;
     aimode = Interrupt.join c1.aimode c2.aimode;
-    errs = ErrorSet.union c1.errs c2.errs;
   }
 
 let leq_conf c1 c2 =
-  Abs_Sem.leq c1.asem c2.asem
-  && Abs_Mem.leq c1.amem c2.amem
+  Abs_Mem.leq c1.amem c2.amem
   &&
   match (c1.aimode, c2.aimode) with
   | Interrupt.Disabled, Interrupt.Enabled -> true
@@ -95,13 +94,8 @@ let leq_conf c1 c2 =
   | Interrupt.Enabled, Interrupt.Enabled -> true
   | Interrupt.Enabled, Interrupt.Disabled -> false
 
-(* Convergence check for the handler post-step fixpoint.
-   Excludes asem: record_sem inside eval_no_post grows asem on every
-   iteration, so including it would prevent convergence even after amem
-   has stabilised, causing unnecessary extra iterations. *)
 let leq_conf_noasem c1 c2 =
   Abs_Mem.leq c1.amem c2.amem
-  && ErrorSet.subset c1.errs c2.errs
   &&
   match (c1.aimode, c2.aimode) with
   | Interrupt.Disabled, Interrupt.Enabled -> true
@@ -109,8 +103,8 @@ let leq_conf_noasem c1 c2 =
   | Interrupt.Enabled, Interrupt.Enabled -> true
   | Interrupt.Enabled, Interrupt.Disabled -> false
 
-let record_sem (pp : ProgramPoint.t) (c : abs_conf) : abs_conf =
-  { c with asem = Abs_Sem.weak_write c.asem pp c.amem }
+let record_sem (pp : ProgramPoint.t) (c : abs_conf) : unit =
+  asem := Abs_Sem.weak_write !asem pp c.amem
 
 (* Narrow v1 assuming (v1 bop v2) is true *)
 let narrow_left (bop : Exp.bop) (v1 : Itv.t) (v2 : Itv.t) : Itv.t =
@@ -337,7 +331,8 @@ let add_deref_oob_errors ~(at : ProgramPoint.t) ~(access : Error.access)
           Error.make ~at ~access ~base ~in_itv ~left_oob ~right_oob ~base_pp
             ~offset_pp ~handler_caused
         in
-        { c with errs = ErrorSet.add err c.errs }
+        errs := ErrorSet.add err !errs;
+        c
 
 
 let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
@@ -555,8 +550,8 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
   match c.aimode with
   (* Check imode of input config *)
   | Disabled ->
-      let c_recorded = record_sem pp c_after_eval in
-      (res, c_recorded)
+      record_sem pp c_after_eval;
+      (res, c_after_eval)
   | Enabled ->
       (* Restrict handler post-steps to the expressions where they carry new
          information, rather than firing at every AST node.
@@ -570,13 +565,14 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
       let is_yield_point =
         match exp with Assign _ | Malloc _ | Var _ | Deref _ -> true | _ -> false
       in
-      if is_yield_point then
+      if is_yield_point then begin
         let c_after_post = !post_steps_fn c_after_eval in
-        let c_recorded = record_sem pp c_after_post in
-        (res, c_recorded)
-      else
-        let c_recorded = record_sem pp c_after_eval in
-        (res, c_recorded)
+        record_sem pp c_after_post;
+        (res, c_after_post)
+      end else begin
+        record_sem pp c_after_eval;
+        (res, c_after_eval)
+      end
 
 let rec evalA ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
     abs_res * abs_conf =
@@ -616,15 +612,11 @@ let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf
       let _r, c' = eval_no_post c body in
       c'
 
-(* One step of the handler fixpoint using precompiled summaries.
-   Each handler is evaluated with asem = bot to avoid record_sem calls inside
-   eval_no_post from inflating the main asem on every invocation.  The handler
-   body's own semantic states (small and bounded) are merged back once at the
-   end so provenance tracing can still reach handler expressions. *)
+(* One step of the handler fixpoint using precompiled summaries. *)
 let post_step_summary (c : abs_conf) : abs_conf =
-  let input_c = c in
-  (* Strip asem so handler-body record_sem calls don't grow it each iteration *)
-  let input_clean = { input_c with asem = Abs_Sem.bot; aimode = Interrupt.Disabled } in
+  let input_clean = { c with aimode = Interrupt.Disabled } in
+  let saved_asem = !asem in
+  asem := Abs_Sem.bot;
   let joined =
     IidSet.fold
       (fun iid acc ->
@@ -635,12 +627,11 @@ let post_step_summary (c : abs_conf) : abs_conf =
             join_conf acc c')
       !iset { input_clean with aimode = c.aimode }
   in
-  (* Restore aimode; merge bounded handler-body asem into the caller's asem *)
-  { joined with aimode = c.aimode; asem = Abs_Sem.join c.asem joined.asem }
+  let handler_asem = !asem in
+  asem := Abs_Sem.join saved_asem handler_asem;
+  { joined with aimode = c.aimode }
 
-(* Iterate post_step_summary to a fixpoint with widening.
-   Uses leq_conf_noasem so that asem growth from record_sem calls inside
-   eval_no_post does not prevent convergence on amem. *)
+(* Iterate post_step_summary to a fixpoint with widening. *)
 let post_steps_summary (c0 : abs_conf) : abs_conf =
   let rec iterate (i : int) (cur : abs_conf) : abs_conf =
     let stepped = post_step_summary cur in
@@ -878,7 +869,7 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
       c.amem fp.fp_scalars
   in
   (* Pass 2: array write effects using post-scalar amem for index/value lookup *)
-  let amem2, errs2 =
+  let amem2 =
     List.fold_left
       (fun (amem, errs) (fpa : fp_array_write) ->
         let amem_for_idx = refine_amem_by_guard fpa.fpa_guard amem in
@@ -921,7 +912,10 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
           else Abs_Mem.weak_write amem in_bounds_write_loc rhs_val fpa.fpa_at
         in
         (amem', errs'))
-      (amem1, c.errs) fp.fp_arrays
+      (amem1, !errs) fp.fp_arrays
+    |> fun (amem, errs') ->
+    errs := errs';
+    amem
   in
   (* Pass 3: synthesize Abs_Sem snapshots for handler PPs so provenance
      tracing can show meaningful values for handler assignment nodes.
@@ -952,7 +946,7 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
                 in
                 Abs_Sem.weak_write asem' pp snapshot)
               handler_pps asem)
-      c.asem fp.fp_scalars
+      !asem fp.fp_scalars
   in
   (* Pass 4: synthesize Abs_Sem snapshots for handler PPs of array writes.
      For each fp_array_write with a Var RHS, record the RHS variable's value
@@ -1019,7 +1013,8 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
               base_assign_pps asem')
       asem3 fp.fp_arrays
   in
-  { c with amem = amem2; errs = errs2; asem = asem4 }
+  asem := asem4;
+  { c with amem = amem2 }
 
 (* apply_fixpoint_to_conf: the new post_steps_fn.
    For programs where all handlers compiled successfully, apply the pre-compiled
@@ -1100,14 +1095,8 @@ let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
       Fallback lbl_exp
 
 let init_confa (pgm : Program.t) : abs_conf =
-  let c0 =
-    {
-      asem = Abs_Sem.bot;
-      amem = Abs_Mem.bot;
-      aimode = Interrupt.Disabled;
-      errs = ErrorSet.empty;
-    }
-  in
+  reset_outputs ();
+  let c0 = { amem = Abs_Mem.bot; aimode = Interrupt.Disabled } in
   let _, c_globals = evalA c0 pgm.global in
   let hs', iset' =
     List.fold_left
@@ -1130,10 +1119,8 @@ let init_confa (pgm : Program.t) : abs_conf =
   compile_fixpoint c_globals.amem;
   print_handler_summaries ();
   {
-    asem = c_globals.asem;
     amem = c_globals.amem;
     aimode = Interrupt.Enabled;
-    errs = c_globals.errs;
   }
 
 let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
@@ -1148,11 +1135,11 @@ let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
 
 let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let c_init = init_confa pgm in
-  let _, c_final = evalA c_init pgm.main in
-  filter_main_sem c_final.asem
+  let _, _c_final = evalA c_init pgm.main in
+  filter_main_sem !asem
 
 let abs_analyze ?(use_opt = true) (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
   let c_init = init_confa pgm in
   if not use_opt then use_compiled_fp := false;
-  let _, c_final = evalA c_init pgm.main in
-  (c_final.asem, c_final.errs)
+  let _, _c_final = evalA c_init pgm.main in
+  (!asem, !errs)
