@@ -8,12 +8,19 @@ Usage (from project root):
     python3 benchmark/run_benchmarks.py --md       # GitHub-Flavored Markdown
     python3 benchmark/run_benchmarks.py --latex    # LaTeX tabular block
     python3 benchmark/run_benchmarks.py --csv      # CSV
-    python3 benchmark/run_benchmarks.py --all      # include all output formats
+    python3 benchmark/run_benchmarks.py --all      # all three formats at once
+
+    python3 benchmark/run_benchmarks.py --optoff           # side-by-side opt vs no-opt
+    python3 benchmark/run_benchmarks.py --optoff --latex   # same, LaTeX output
 
 Options:
     --md        GitHub-Flavored Markdown table
     --latex     LaTeX tabular (requires booktabs)
-    --csv       CSV (header row included)
+    --csv       CSV with header row
+    --all       print ASCII + Markdown + LaTeX together
+    --optoff    also run each benchmark with -optoff and append result columns
+                (Warnings, Left OOB, Right OOB, Time) for the no-opt run plus
+                a Speedup column — lets you compare correctness and performance
     --dir DIR   benchmark directory  [default: benchmark/]
     --bin PATH  analyzer binary      [default: ./_build/default/bin/main.exe]
 
@@ -24,6 +31,7 @@ Notes:
     intentionally non-handler-caused; they will show 0 interrupt warnings,
     which is the correct (passing) result.
   * Analysis of composite files can take ~30-40 seconds each.
+  * --optoff doubles the number of runs; composite files take ~30-40 s each pass.
 """
 
 import argparse
@@ -33,12 +41,11 @@ import sys
 import time
 from pathlib import Path
 
-# ── configuration ────────────────────────────────────────────────────────────
+# ── configuration ─────────────────────────────────────────────────────────────
 
-BINARY_DEFAULT = "./_build/default/bin/main.exe"
+BINARY_DEFAULT    = "./_build/default/bin/main.exe"
 BENCH_DIR_DEFAULT = "benchmark"
 
-# Preferred display order — files are sorted by the first prefix they match.
 _ORDER = [
     "micro1_direct_buggy",
     "micro1_direct_fixed",
@@ -60,54 +67,79 @@ def _rank(path: Path) -> int:
     return len(_ORDER)
 
 
-# ── running + parsing ─────────────────────────────────────────────────────────
+# ── column schemas ─────────────────────────────────────────────────────────────
+# Each schema is (headers, row-keys, alignments).  "l" = left, "r" = right.
 
-def run_analyzer(binary: str, bench_path: Path) -> tuple[str, str]:
-    """Return (stdout, stderr) from running `binary -prov bench_path`."""
-    result = subprocess.run(
-        [binary, "-prov", str(bench_path)],
-        capture_output=True,
-        text=True,
-    )
+_SCHEMA_BASE = (
+    ["Benchmark",  "LOC", "Warnings", "Caused by", "Left OOB",  "Right OOB",  "Time (s)"],
+    ["name",       "loc", "bugs",     "handlers",  "left_oob",  "right_oob",  "time"],
+    ["l",          "r",   "r",        "l",         "l",         "l",          "r"],
+)
+
+_SCHEMA_OPTOFF = (
+    # opt columns                                                   no-opt columns            compare
+    ["Benchmark",  "LOC",
+     "Warnings",   "Caused by",  "Left OOB",  "Right OOB",  "Time (s)",
+     "Warnings*",  "Left OOB*",  "Right OOB*", "Time* (s)",  "Speedup"],
+    ["name",       "loc",
+     "bugs",       "handlers",   "left_oob",  "right_oob",  "time",
+     "bugs2",      "left_oob2",  "right_oob2", "time2",      "speedup"],
+    ["l",          "r",
+     "r",          "l",          "l",         "l",          "r",
+     "r",          "l",          "l",          "r",          "r"],
+)
+# * columns come from the -optoff (no-opt) run
+
+
+# ── running + parsing ──────────────────────────────────────────────────────────
+
+def run_analyzer(binary: str, bench_path: Path, optoff: bool = False) -> tuple[str, str]:
+    """Return (stdout, stderr) from `binary -prov [-optoff] bench_path`."""
+    cmd = [binary, "-prov"]
+    if optoff:
+        cmd.append("-optoff")
+    cmd.append(str(bench_path))
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout, result.stderr
 
 
 def parse_output(stdout: str, stderr: str) -> dict:
     """
-    Parse analyzer output into a structured dict:
+    Returns:
       bugs       int        — interrupt-caused bugs found
       handlers   list[int]  — handler ids that caused a bug (deduplicated)
-      oob_rights list[str]  — right-OOB range per bug (e.g. "[8,255]", "⟂")
-      abs_time   float      — abs_analyze seconds
-      prov_time  float      — prov_analyze seconds
+      left_oobs  list[str]  — left-OOB range per bug  (e.g. "⟂", "[-∞,-1]")
+      right_oobs list[str]  — right-OOB range per bug (e.g. "[8,255]", "⟂")
+      abs_time   float      — abs_analyze wall seconds
+      prov_time  float      — prov_analyze wall seconds
     """
-    # Total count
     m = re.search(r"Provenance Report: (\d+) bugs? found", stdout)
     bugs = int(m.group(1)) if m else 0
 
-    # Per-bug details: split on "--- Bug #N ---" markers
-    handlers = []
-    oob_rights = []
+    handlers, left_oobs, right_oobs = [], [], []
     for block in re.split(r"--- Bug #\d+ ---", stdout)[1:]:
         hm = re.search(r"\[caused by interrupt: handler (\d+)\]", block)
         if hm:
             handlers.append(int(hm.group(1)))
-        rm = re.search(r"right OOB: (\S+)", block)
-        oob_rights.append(rm.group(1) if rm else "?")
+        # "left OOB: ⟂  |  right OOB: [8,255]"
+        lm = re.search(r"left OOB:\s*(\S+)", block)
+        rm = re.search(r"right OOB:\s*(\S+)", block)
+        left_oobs.append(lm.group(1) if lm else "?")
+        right_oobs.append(rm.group(1) if rm else "?")
 
-    # Timings from stderr
     abs_time = prov_time = 0.0
     for line in stderr.splitlines():
-        if m := re.search(r"\[time\] abs_analyze\s*:\s*([\d.]+)s", line):
-            abs_time = float(m.group(1))
-        if m := re.search(r"\[time\] prov_analyze\s*:\s*([\d.]+)s", line):
-            prov_time = float(m.group(1))
+        if m2 := re.search(r"\[time\] abs_analyze\s*:\s*([\d.]+)s", line):
+            abs_time = float(m2.group(1))
+        if m2 := re.search(r"\[time\] prov_analyze\s*:\s*([\d.]+)s", line):
+            prov_time = float(m2.group(1))
 
     return {
-        "bugs": bugs,
-        "handlers": sorted(set(handlers)),
-        "oob_rights": oob_rights,
-        "abs_time": abs_time,
+        "bugs":      bugs,
+        "handlers":  sorted(set(handlers)),
+        "left_oobs": left_oobs,
+        "right_oobs": right_oobs,
+        "abs_time":  abs_time,
         "prov_time": prov_time,
     }
 
@@ -116,74 +148,109 @@ def _fmt_handlers(handlers: list[int]) -> str:
     return ", ".join(f"H{h}" for h in handlers) if handlers else "—"
 
 
-def _fmt_oob(oob_rights: list[str]) -> str:
-    if not oob_rights:
+def _fmt_oob(oobs: list[str]) -> str:
+    """Deduplicated OOB ranges joined with ' / ', or '—' if empty."""
+    if not oobs:
         return "—"
     seen: dict[str, None] = {}
-    for r in oob_rights:
+    for r in oobs:
         seen[r] = None
     return " / ".join(seen)
 
 
-def _fmt_time(abs_t: float, prov_t: float) -> str:
-    return f"{abs_t + prov_t:.3f}"
+def _fmt_time(t: float) -> str:
+    return f"{t:.3f}"
 
 
-# ── data collection ───────────────────────────────────────────────────────────
+def _fmt_speedup(t_opt: float, t_noopt: float) -> str:
+    if t_opt <= 0:
+        return "—"
+    return f"{t_noopt / t_opt:.2f}x"
 
-def collect_rows(binary: str, bench_dir: str) -> list[dict]:
+
+# ── data collection ────────────────────────────────────────────────────────────
+
+def collect_rows(binary: str, bench_dir: str, with_optoff: bool = False) -> list[dict]:
     paths = sorted(Path(bench_dir).glob("*.si"), key=_rank)
     rows = []
     total = len(paths)
+
     for i, path in enumerate(paths, 1):
-        print(f"  [{i:2d}/{total}] {path.name} ...", end=" ", flush=True, file=sys.stderr)
-        loc = sum(1 for _ in open(path))
+        label = f"[{i:2d}/{total}] {path.name}"
+        tag   = " (opt)   " if with_optoff else " "
+
+        # optimized pass
+        print(f"  {label}{tag}...", end=" ", flush=True, file=sys.stderr)
         t0 = time.perf_counter()
-        stdout, stderr = run_analyzer(binary, path)
+        stdout, stderr = run_analyzer(binary, path, optoff=False)
         wall = time.perf_counter() - t0
-        parsed = parse_output(stdout, stderr)
+        p = parse_output(stdout, stderr)
+        t_opt = p["abs_time"] + p["prov_time"]
         print(f"{wall:.1f}s", file=sys.stderr)
-        rows.append({
-            "name":     path.stem,
-            "loc":      loc,
-            "bugs":     parsed["bugs"],
-            "handlers": _fmt_handlers(parsed["handlers"]),
-            "oob":      _fmt_oob(parsed["oob_rights"]),
-            "time":     _fmt_time(parsed["abs_time"], parsed["prov_time"]),
-        })
+
+        loc = sum(1 for _ in open(path))
+        row: dict = {
+            "name":      path.stem,
+            "loc":       loc,
+            "bugs":      p["bugs"],
+            "handlers":  _fmt_handlers(p["handlers"]),
+            "left_oob":  _fmt_oob(p["left_oobs"]),
+            "right_oob": _fmt_oob(p["right_oobs"]),
+            "time":      _fmt_time(t_opt),
+        }
+
+        # no-opt pass
+        if with_optoff:
+            print(f"  {label} (no-opt) ...", end=" ", flush=True, file=sys.stderr)
+            t0 = time.perf_counter()
+            stdout2, stderr2 = run_analyzer(binary, path, optoff=True)
+            wall2 = time.perf_counter() - t0
+            p2 = parse_output(stdout2, stderr2)
+            t_noopt = p2["abs_time"] + p2["prov_time"]
+            print(f"{wall2:.1f}s", file=sys.stderr)
+
+            row["bugs2"]      = p2["bugs"]
+            row["left_oob2"]  = _fmt_oob(p2["left_oobs"])
+            row["right_oob2"] = _fmt_oob(p2["right_oobs"])
+            row["time2"]      = _fmt_time(t_noopt)
+            row["speedup"]    = _fmt_speedup(t_opt, t_noopt)
+
+        rows.append(row)
+
     return rows
 
 
-# ── table rendering ───────────────────────────────────────────────────────────
+# ── table rendering ────────────────────────────────────────────────────────────
 
-HEADERS = ["Benchmark",  "LOC", "Int. warnings", "Caused by", "Right OOB",  "Time (s)"]
-KEYS    = ["name",       "loc", "bugs",           "handlers",  "oob",        "time"]
-ALIGNS  = ["l",          "r",   "r",              "l",         "l",          "r"]
-
-
-def _cells(rows: list[dict]) -> list[list[str]]:
-    out = [list(HEADERS)]
+def _build_cells(rows: list[dict], headers: list[str],
+                 keys: list[str]) -> list[list[str]]:
+    out = [list(headers)]
     for row in rows:
-        out.append([str(row[k]) for k in KEYS])
+        out.append([str(row[k]) for k in keys])
     return out
 
 
 def _col_widths(cells: list[list[str]]) -> list[int]:
     return [max(len(cells[r][c]) for r in range(len(cells)))
-            for c in range(len(HEADERS))]
+            for c in range(len(cells[0]))]
 
 
 def _pad(s: str, w: int, align: str) -> str:
     return s.rjust(w) if align == "r" else s.ljust(w)
 
 
-def render_ascii(rows: list[dict]) -> str:
-    cells = _cells(rows)
+def _is_composite(row: dict) -> bool:
+    return row["name"].startswith("composite")
+
+
+def render_ascii(rows: list[dict], schema: tuple) -> str:
+    headers, keys, aligns = schema
+    cells  = _build_cells(rows, headers, keys)
     widths = _col_widths(cells)
-    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
-    lines = [sep]
+    sep    = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    lines  = [sep]
     for i, row_cells in enumerate(cells):
-        padded = [_pad(c, w, a) for c, w, a in zip(row_cells, widths, ALIGNS)]
+        padded = [_pad(c, w, a) for c, w, a in zip(row_cells, widths, aligns)]
         lines.append("| " + " | ".join(padded) + " |")
         if i == 0:
             lines.append(sep)
@@ -191,61 +258,63 @@ def render_ascii(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_md(rows: list[dict]) -> str:
-    cells = _cells(rows)
+def render_md(rows: list[dict], schema: tuple) -> str:
+    headers, keys, aligns = schema
+    cells  = _build_cells(rows, headers, keys)
     widths = _col_widths(cells)
-    lines = []
-    # header
-    lines.append("| " + " | ".join(_pad(c, w, a)
-                                   for c, w, a in zip(cells[0], widths, ALIGNS)) + " |")
-    # separator
+    lines  = []
+    lines.append("| " + " | ".join(
+        _pad(c, w, a) for c, w, a in zip(cells[0], widths, aligns)) + " |")
     seps = [("-" * w + ":") if a == "r" else ("-" * (w + 1))
-            for w, a in zip(widths, ALIGNS)]
+            for w, a in zip(widths, aligns)]
     lines.append("|" + "|".join(seps) + "|")
-    # data rows — insert blank separator between micro and composite sections
     prev_kind = None
     for row, row_cells in zip(rows, cells[1:]):
-        kind = "composite" if row["name"].startswith("composite") else "micro"
+        kind = "composite" if _is_composite(row) else "micro"
         if prev_kind is not None and kind != prev_kind:
             lines.append("|" + "|".join(" " + "-" * w + " " for w in widths) + "|")
         prev_kind = kind
-        padded = [_pad(c, w, a) for c, w, a in zip(row_cells, widths, ALIGNS)]
+        padded = [_pad(c, w, a) for c, w, a in zip(row_cells, widths, aligns)]
         lines.append("| " + " | ".join(padded) + " |")
     return "\n".join(lines)
 
 
-def render_latex(rows: list[dict]) -> str:
-    col_spec = "".join(ALIGNS)
-    header = " & ".join(f"\\textbf{{{h}}}" for h in HEADERS) + r" \\"
+def render_latex(rows: list[dict], schema: tuple) -> str:
+    headers, keys, aligns = schema
+    col_spec   = "".join(aligns)
+    header_row = " & ".join(f"\\textbf{{{h}}}" for h in headers) + r" \\"
     lines = [
         r"\begin{tabular}{" + col_spec + "}",
         r"\toprule",
-        header,
+        header_row,
         r"\midrule",
     ]
     prev_kind = None
     for row in rows:
-        kind = "composite" if row["name"].startswith("composite") else "micro"
+        kind = "composite" if _is_composite(row) else "micro"
         if prev_kind is not None and kind != prev_kind:
             lines.append(r"\midrule")
         prev_kind = kind
         name_tex = row["name"].replace("_", r"\_")
-        cells = [name_tex] + [str(row[k]) for k in KEYS[1:]]
+        cells = [name_tex] + [str(row[k]) for k in keys[1:]]
         lines.append(" & ".join(cells) + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}"]
     return "\n".join(lines)
 
 
-def render_csv(rows: list[dict]) -> str:
+def render_csv(rows: list[dict], schema: tuple) -> str:
+    headers, keys, _ = schema
+
     def q(s: str) -> str:
         return f'"{s}"' if "," in s or '"' in s else s
-    lines = [",".join(HEADERS)]
+
+    lines = [",".join(headers)]
     for row in rows:
-        lines.append(",".join(q(str(row[k])) for k in KEYS))
+        lines.append(",".join(q(str(row[k])) for k in keys))
     return "\n".join(lines)
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -257,8 +326,11 @@ def main() -> None:
     fmt.add_argument("--md",    action="store_true", help="GitHub-Flavored Markdown table")
     fmt.add_argument("--latex", action="store_true", help="LaTeX tabular block (booktabs)")
     fmt.add_argument("--csv",   action="store_true", help="CSV with header row")
-    parser.add_argument("--all", action="store_true",
-                        help="print all formats (ASCII + Markdown + LaTeX)")
+    parser.add_argument("--all",    action="store_true",
+                        help="print ASCII + Markdown + LaTeX together")
+    parser.add_argument("--optoff", action="store_true",
+                        help="also run with -optoff; appends Warnings*, Left OOB*, "
+                             "Right OOB*, Time* and Speedup columns (* = no-opt run)")
     parser.add_argument("--dir", default=BENCH_DIR_DEFAULT, metavar="DIR",
                         help=f"benchmark directory (default: {BENCH_DIR_DEFAULT})")
     parser.add_argument("--bin", default=BINARY_DEFAULT, metavar="PATH",
@@ -273,28 +345,33 @@ def main() -> None:
         print(f"error: benchmark directory not found: {args.dir}", file=sys.stderr)
         sys.exit(1)
 
+    schema = _SCHEMA_OPTOFF if args.optoff else _SCHEMA_BASE
+
     print(f"Analyzer : {args.bin}", file=sys.stderr)
     print(f"Directory: {args.dir}/", file=sys.stderr)
+    if args.optoff:
+        print("Mode     : opt vs no-opt comparison  (* columns = -optoff run)",
+              file=sys.stderr)
     print(file=sys.stderr)
 
-    rows = collect_rows(args.bin, args.dir)
+    rows = collect_rows(args.bin, args.dir, with_optoff=args.optoff)
     print(file=sys.stderr)
 
     if args.all:
         print("=== ASCII ===")
-        print(render_ascii(rows))
+        print(render_ascii(rows, schema))
         print("\n=== Markdown ===")
-        print(render_md(rows))
+        print(render_md(rows, schema))
         print("\n=== LaTeX ===")
-        print(render_latex(rows))
+        print(render_latex(rows, schema))
     elif args.latex:
-        print(render_latex(rows))
+        print(render_latex(rows, schema))
     elif args.csv:
-        print(render_csv(rows))
+        print(render_csv(rows, schema))
     elif args.md:
-        print(render_md(rows))
+        print(render_md(rows, schema))
     else:
-        print(render_ascii(rows))
+        print(render_ascii(rows, schema))
 
 
 if __name__ == "__main__":
