@@ -236,6 +236,44 @@ main {
   assert_loc_value "compiled handler should preserve &X value"
     (Abs_dom.Abs_Loc.get "X") addr
 
+let has_handler_pp iid pps =
+  Abs_dom.PPSet.exists
+    (function
+      | Domain.ProgramPoint.Label (Syntax.Exp.Lbl.Handler (iid', _)) ->
+          iid = iid'
+      | _ -> false)
+    pps
+
+let test_bop_index_propagates_handler_provenance () =
+  let pgm =
+    parse
+      {|
+init {
+  X := 0;
+  Y := 1;
+  A := malloc(1, 0);
+
+  handler 0 {
+    X := 1
+  }
+}
+
+main {
+  *A[X = Y] := 7
+}
+|}
+  in
+  let _asem, errs = Analyzer.abs_analyze pgm in
+  let matching =
+    Abs_dom.ErrorSet.filter
+      (fun (e : Abs_dom.Error.t) ->
+        e.handler_caused && has_handler_pp 0 e.offset_pp)
+      errs
+  in
+  if Abs_dom.ErrorSet.is_empty matching then
+    failwith
+      "direct Bop index should keep handler provenance in offset_pp"
+
 let () =
   test_heap_strong_singleton_write ();
   test_heap_interval_write_updates_overlapping_cells ();
@@ -246,4 +284,5 @@ let () =
   test_analyzer_compares_address_of ();
   test_compiled_handler_preserves_address_of_array_write ();
   test_compiled_handler_preserves_address_of_scalar_assignment ();
-  test_nonzero_offset_through_address_of_raises ()
+  test_nonzero_offset_through_address_of_raises ();
+  test_bop_index_propagates_handler_provenance ()

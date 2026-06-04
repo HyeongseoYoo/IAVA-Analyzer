@@ -430,29 +430,29 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         | Eq ->
             ( {
                 avalue = abs_int (equal_check r1.avalue r2.avalue);
-                app = PPSet.empty;
+                app = PPSet.union r1.app r2.app;
               },
               c2 )
         | Lt ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.lt v1 v2); app = PPSet.empty }, c2)
+            ({ avalue = abs_int (Itv.lt v1 v2); app = PPSet.union r1.app r2.app }, c2)
         | Gt ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.gt v1 v2); app = PPSet.empty }, c2)
+            ({ avalue = abs_int (Itv.gt v1 v2); app = PPSet.union r1.app r2.app }, c2)
         | Ne ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.ne v1 v2); app = PPSet.empty }, c2)
+            ({ avalue = abs_int (Itv.ne v1 v2); app = PPSet.union r1.app r2.app }, c2)
         | Le ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.le v1 v2); app = PPSet.empty }, c2)
+            ({ avalue = abs_int (Itv.le v1 v2); app = PPSet.union r1.app r2.app }, c2)
         | Ge ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.ge v1 v2); app = PPSet.empty }, c2)
+            ({ avalue = abs_int (Itv.ge v1 v2); app = PPSet.union r1.app r2.app }, c2)
         | Plus ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
@@ -474,11 +474,11 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         | And ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.and_ v1 v2); app = PPSet.empty }, c2)
+            ({ avalue = abs_int (Itv.and_ v1 v2); app = PPSet.union r1.app r2.app }, c2)
         | Or ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.or_ v1 v2); app = PPSet.empty }, c2))
+            ({ avalue = abs_int (Itv.or_ v1 v2); app = PPSet.union r1.app r2.app }, c2))
     | Assign (e1, e2) ->
         let r1, c1 = self ~lvalue:true c e1 in
         let r2, c2 = self c1 e2 in
