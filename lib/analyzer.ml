@@ -60,6 +60,7 @@ let compiled_fp : compiled_fixpoint ref =
 let use_compiled_fp : bool ref = ref false
 let asem : Abs_Sem.t ref = ref Abs_Sem.bot
 let errs : ErrorSet.t ref = ref ErrorSet.empty
+let in_handler_exec : bool ref = ref false
 
 (* forward ref, set to apply_fixpoint_to_conf below *)
 let post_steps_fn : (abs_conf -> abs_conf) ref = ref (fun c -> c)
@@ -69,7 +70,8 @@ let reset_outputs () =
   asem := Abs_Sem.bot;
   errs := ErrorSet.empty;
   aenv := Abs_Env.empty;
-  aenv0 := Abs_Env.empty
+  aenv0 := Abs_Env.empty;
+  in_handler_exec := false
 
 let join_res r1 r2 =
   { avalue = Abs_Val.join r1.avalue r2.avalue; app = PPSet.union r1.app r2.app }
@@ -342,8 +344,20 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     | Int n -> ({ r with avalue = abs_int (Itv.alpha n) }, c)
     | Var x -> (
         if lvalue then
-          let l = Abs_Loc.get x in
-          aenv := Abs_Env.write !aenv x l;
+          let l =
+            if !in_handler_exec then
+              match Abs_Env.find !aenv x with
+              | Some existing -> existing
+              | None ->
+                  let loc = Abs_Loc.get (x ^ "#") in
+                  aenv := Abs_Env.write !aenv x loc;
+                  loc
+            else begin
+              let l = Abs_Loc.get x in
+              aenv := Abs_Env.write !aenv x l;
+              l
+            end
+          in
           ({ r with avalue = abs_loc l }, c)
         else
           let loc =
@@ -588,6 +602,7 @@ let apply_atom (atom : summary_atom) (c : abs_conf) : abs_conf =
 let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf =
   let saved_env = !aenv in
   aenv := !aenv0;
+  in_handler_exec := true;
   let result =
     match summary with
     | Compiled atoms ->
@@ -596,6 +611,7 @@ let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf 
         let _r, c' = eval_no_post c body in
         c'
   in
+  in_handler_exec := false;
   aenv := saved_env;
   result
 
@@ -702,7 +718,7 @@ let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
   let get_loc0 name =
     match Abs_Env.find !aenv0 name with
     | Some l -> l
-    | None -> Abs_Loc.get name
+    | None -> Abs_Loc.get (name ^ "#")
   in
   let resolve_ptr_lbl name =
     let loc = get_loc0 name in
@@ -733,7 +749,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
   let get_loc0 name =
     match Abs_Env.find !aenv0 name with
     | Some l -> l
-    | None -> Abs_Loc.get name
+    | None -> Abs_Loc.get (name ^ "#")
   in
   match atom.lhs.exp with
   | Var x ->
