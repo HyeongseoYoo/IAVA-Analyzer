@@ -979,7 +979,13 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
 
 (* Use compiled fixpoint if all handlers compiled; otherwise fall back to iterative. *)
 let apply_fixpoint_to_conf (c : abs_conf) : abs_conf =
-  if !use_compiled_fp then apply_compiled_fixpoint !compiled_fp c
+  if !use_compiled_fp then begin
+    let saved_env = !aenv in
+    aenv := !aenv0;
+    let result = apply_compiled_fixpoint !compiled_fp c in
+    aenv := saved_env;
+    result
+  end
   else post_steps_summary c
 
 (* Wire up forward reference. *)
