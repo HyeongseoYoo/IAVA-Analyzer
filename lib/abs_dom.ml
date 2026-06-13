@@ -164,6 +164,8 @@ module Abs_Env = struct
   type t = Abs_Loc.t Var.Map.t
 
   let bot : t = Var.Map.empty
+
+  let empty : t = bot
   let compare (e1 : t) (e2 : t) : int = Var.Map.compare Abs_Loc.compare e1 e2
 
   let alpha (env : Env.t) : t =

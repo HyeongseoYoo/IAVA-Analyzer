@@ -50,6 +50,8 @@ type compiled_fixpoint = {
   fp_arrays  : fp_array_write list;
 }
 
+let aenv : Abs_Env.t ref = ref Abs_Env.empty
+let aenv0 : Abs_Env.t ref = ref Abs_Env.empty
 let size_tbl : Itv.t LblMap.t ref = ref LblMap.empty
 let handler_summaries : handler_summary HandlerStore.IidMap.t ref =
   ref HandlerStore.IidMap.empty
@@ -65,7 +67,9 @@ let widen_cnt = 3
 
 let reset_outputs () =
   asem := Abs_Sem.bot;
-  errs := ErrorSet.empty
+  errs := ErrorSet.empty;
+  aenv := Abs_Env.empty;
+  aenv0 := Abs_Env.empty
 
 let join_res r1 r2 =
   { avalue = Abs_Val.join r1.avalue r2.avalue; app = PPSet.union r1.app r2.app }
@@ -166,20 +170,24 @@ let get_itv_from_exp (e : Exp.t) (amem : Abs_Mem.t) : Itv.t =
   match e with
   | Int n -> Itv.alpha n
   | Var x -> (
-      let loc = Abs_Loc.get x in
-      match Abs_Mem.LocMap.find_opt loc amem with
-      | Some ((itv, _, _), _) -> itv
-      | None -> Itv.bot)
+      match Abs_Env.find !aenv x with
+      | None -> Itv.bot
+      | Some loc ->
+          match Abs_Mem.LocMap.find_opt loc amem with
+          | Some ((itv, _, _), _) -> itv
+          | None -> Itv.bot)
   | _ -> Itv.top
 
 let narrow_var_in_amem (x : string) (bop : Exp.bop) (other_itv : Itv.t)
     (amem : Abs_Mem.t) : Abs_Mem.t =
-  let loc = Abs_Loc.get x in
-  match Abs_Mem.LocMap.find_opt loc amem with
+  match Abs_Env.find !aenv x with
   | None -> amem
-  | Some ((curr_itv, u, l), pp) ->
-      let narrowed = narrow_left bop curr_itv other_itv in
-      Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem
+  | Some loc ->
+      match Abs_Mem.LocMap.find_opt loc amem with
+      | None -> amem
+      | Some ((curr_itv, u, l), pp) ->
+          let narrowed = narrow_left bop curr_itv other_itv in
+          Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem
 
 (* Narrow x in amem assuming guard = Some(bop, Bop(_, Var x, rhs)) is true. *)
 let refine_amem_by_guard (guard : (Exp.bop * Exp.lbl_t) option)
@@ -205,15 +213,17 @@ let refine_amem (cond_exp : Exp.lbl_t) (branch : bool) (amem : Abs_Mem.t) :
       | Var x -> narrow_var_in_amem x (flip_bop actual_bop) v_lhs amem1
       | _ -> amem1)
   | Var x -> (
-      let loc = Abs_Loc.get x in
-      match Abs_Mem.LocMap.find_opt loc amem with
+      match Abs_Env.find !aenv x with
       | None -> amem
-      | Some ((curr_itv, u, l), pp) ->
-          (* false branch: narrow x to 0; true branch: no refinement *)
-          if branch then amem
-          else
-            let narrowed = Itv.meet curr_itv (Itv.alpha 0) in
-            Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem)
+      | Some loc ->
+          match Abs_Mem.LocMap.find_opt loc amem with
+          | None -> amem
+          | Some ((curr_itv, u, l), pp) ->
+              (* false branch: narrow x to 0; true branch: no refinement *)
+              if branch then amem
+              else
+                let narrowed = Itv.meet curr_itv (Itv.alpha 0) in
+                Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem)
   | _ -> amem
 
 let abs_unit () : Abs_Val.t = (Itv.bot, Abs_Unit.Unit, Abs_Loc.bot)
@@ -331,14 +341,23 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     | Unit -> ({ r with avalue = abs_unit () }, c)
     | Int n -> ({ r with avalue = abs_int (Itv.alpha n) }, c)
     | Var x -> (
-        let l = Abs_Loc.get x in
-        if lvalue then ({ r with avalue = abs_loc l }, c)
+        if lvalue then
+          let l = Abs_Loc.get x in
+          aenv := Abs_Env.write !aenv x l;
+          ({ r with avalue = abs_loc l }, c)
         else
-          match Abs_Mem.LocMap.find_opt l amem with
-          | Some (v, p') -> ({ avalue = v; app = p' }, c)
-          | None ->
-              raise (Runtime_error ("[Abs_Mem] Variable " ^ x ^ " not found")))
-    | AddrOf x -> ({ r with avalue = abs_loc (Abs_Loc.get x) }, c)
+          let loc =
+            match Abs_Env.find !aenv x with
+            | Some l -> l
+            | None -> raise (Runtime_error ("[Abs_Env] " ^ x ^ " not declared"))
+          in
+          (match Abs_Mem.LocMap.find_opt loc amem with
+           | Some (v, p') -> ({ avalue = v; app = p' }, c)
+           | None -> raise (Runtime_error ("[Abs_Mem] " ^ x ^ " not initialized"))))
+    | AddrOf x -> (
+        match Abs_Env.find !aenv x with
+        | Some loc -> ({ r with avalue = abs_loc loc }, c)
+        | None -> raise (Runtime_error ("[Abs_Env] AddrOf: " ^ x ^ " not declared")))
     | Enable ->
         ({ r with avalue = abs_unit () }, { c with aimode = Interrupt.Enabled })
     | Disable ->
@@ -564,15 +583,21 @@ let apply_atom (atom : summary_atom) (c : abs_conf) : abs_conf =
       { c2 with amem = amem' }
 
 (* Apply handler summary (aimode must be Disabled).
-   Compiled: apply atoms in sequence; Fallback: evaluate body with eval_no_post. *)
-let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf
-    =
-  match summary with
-  | Compiled atoms ->
-      List.fold_left (fun acc_c atom -> apply_atom atom acc_c) c atoms
-  | Fallback body ->
-      let _r, c' = eval_no_post c body in
-      c'
+   Compiled: apply atoms in sequence; Fallback: evaluate body with eval_no_post.
+   aenv is saved, reset to aenv0 for the handler's local scope, then restored. *)
+let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf =
+  let saved_env = !aenv in
+  aenv := !aenv0;
+  let result =
+    match summary with
+    | Compiled atoms ->
+        List.fold_left (fun acc_c atom -> apply_atom atom acc_c) c atoms
+    | Fallback body ->
+        let _r, c' = eval_no_post c body in
+        c'
+  in
+  aenv := saved_env;
+  result
 
 (* One step of the handler fixpoint using precompiled summaries. *)
 let post_step_summary (c : abs_conf) : abs_conf =
@@ -674,8 +699,13 @@ let apply_fp_scalar (fps : fp_scalar) (((itv, u, l) as v) : Abs_Val.t) :
 let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
     (string, Exp.Lbl.t) Hashtbl.t =
   let tbl : (string, Exp.Lbl.t) Hashtbl.t = Hashtbl.create 4 in
+  let get_loc0 name =
+    match Abs_Env.find !aenv0 name with
+    | Some l -> l
+    | None -> Abs_Loc.get name
+  in
   let resolve_ptr_lbl name =
-    let loc = Abs_Loc.get name in
+    let loc = get_loc0 name in
     match Abs_Mem.LocMap.find_opt loc init_amem with
     | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) -> Some lbl
     | _ -> Hashtbl.find_opt tbl name
@@ -700,21 +730,26 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
     (local_ptr_map : (string, Exp.Lbl.t) Hashtbl.t)
     (scalar_tbl : (Abs_Loc.t, fp_scalar * PPSet.t) Hashtbl.t)
     (array_writes : fp_array_write list ref) : unit =
+  let get_loc0 name =
+    match Abs_Env.find !aenv0 name with
+    | Some l -> l
+    | None -> Abs_Loc.get name
+  in
   match atom.lhs.exp with
   | Var x ->
-      let loc = Abs_Loc.get x in
+      let loc = get_loc0 x in
       let fps =
         match atom.rhs.exp with
         | Int n -> FPS_JoinConsts (Itv.alpha n)
-        | AddrOf y -> FPS_JoinVal (abs_loc (Abs_Loc.get y))
+        | AddrOf y -> FPS_JoinVal (abs_loc (get_loc0 y))
         | Bop (Plus, { exp = Var y; _ }, { exp = Int n; _ })
-          when String.equal x y ->
+          when Abs_Loc.compare loc (get_loc0 y) = 0 ->
             if n > 0 then FPS_Inc else if n < 0 then FPS_Dec else FPS_Unchanged
         | Bop (Plus, { exp = Int n; _ }, { exp = Var y; _ })
-          when String.equal x y ->
+          when Abs_Loc.compare loc (get_loc0 y) = 0 ->
             if n > 0 then FPS_Inc else if n < 0 then FPS_Dec else FPS_Unchanged
         | Bop (Minus, { exp = Var y; _ }, { exp = Int n; _ })
-          when String.equal x y ->
+          when Abs_Loc.compare loc (get_loc0 y) = 0 ->
             if n > 0 then FPS_Dec else if n < 0 then FPS_Inc else FPS_Unchanged
         | Var y when is_const_name y ->
             (match Hashtbl.find_opt const_map y with
@@ -732,7 +767,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
         (combine_fp_scalar old_fps fps, PPSet.add handler_pp old_pps)
   | Deref ({ exp = Var arr_name; _ }, idx_e) ->
       (* Resolve target heap block: check init_amem first, then local_ptr_map. *)
-      let arr_var_loc = Abs_Loc.get arr_name in
+      let arr_var_loc = get_loc0 arr_name in
       let heap_lbl_opt =
         match Abs_Mem.LocMap.find_opt arr_var_loc init_amem with
         | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) -> Some lbl
@@ -743,14 +778,14 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
           let fpa_idx =
             match idx_e.exp with
             | Int n -> `Const (Itv.alpha n)
-            | Var idx_name -> `Var (Abs_Loc.get idx_name)
+            | Var idx_name -> `Var (get_loc0 idx_name)
             | _ -> `Const Itv.top
           in
           let fpa_rhs =
             match atom.rhs.exp with
             | Int n -> `Const (abs_int (Itv.alpha n))
-            | AddrOf x -> `Const (abs_loc (Abs_Loc.get x))
-            | Var v -> `Var (Abs_Loc.get v)
+            | AddrOf x -> `Const (abs_loc (get_loc0 x))
+            | Var v -> `Var (get_loc0 v)
             | _ -> `Const Abs_Val.top
           in
           let fpa_at = ProgramPoint.Label atom.assign_lbl in
@@ -1017,6 +1052,7 @@ let init_confa (pgm : Program.t) : abs_conf =
   reset_outputs ();
   let c0 = { amem = Abs_Mem.bot; aimode = Interrupt.Disabled } in
   let _, c_globals = evalA c0 pgm.global in
+  aenv0 := !aenv;
   let hs', iset' =
     List.fold_left
       (fun (hs, iset) (d : Handler.t) ->
