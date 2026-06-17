@@ -46,7 +46,7 @@ type fp_array_write = {
 }
 
 type compiled_fixpoint = {
-  fp_scalars : (Abs_Loc.t * fp_scalar * PPSet.t) list;
+  fp_scalars : (Abs_Loc.t * (fp_scalar * PPSet.t) list) list;
   fp_arrays  : fp_array_write list;
 }
 
@@ -672,21 +672,6 @@ let build_const_map (init_amem : Abs_Mem.t) : (string, int) Hashtbl.t =
     init_amem ();
   tbl
 
-let combine_fp_scalar (a : fp_scalar) (b : fp_scalar) : fp_scalar =
-  match (a, b) with
-  | FPS_Top, _ | _, FPS_Top -> FPS_Top
-  | FPS_Unchanged, x | x, FPS_Unchanged -> x
-  | FPS_Inc, FPS_Inc -> FPS_Inc
-  | FPS_Dec, FPS_Dec -> FPS_Dec
-  | FPS_Inc, FPS_Dec | FPS_Dec, FPS_Inc -> FPS_Top
-  | FPS_Inc, FPS_JoinVal _ | FPS_JoinVal _, FPS_Inc -> FPS_Top
-  | FPS_Dec, FPS_JoinVal _ | FPS_JoinVal _, FPS_Dec -> FPS_Top
-  | FPS_Inc, FPS_JoinConsts _ | FPS_JoinConsts _, FPS_Inc -> FPS_Inc
-  | FPS_Dec, FPS_JoinConsts _ | FPS_JoinConsts _, FPS_Dec -> FPS_Dec
-  | FPS_JoinConsts c, FPS_JoinVal v | FPS_JoinVal v, FPS_JoinConsts c ->
-      FPS_JoinVal (Abs_Val.join (abs_int c) v)
-  | FPS_JoinConsts c1, FPS_JoinConsts c2 -> FPS_JoinConsts (Itv.join c1 c2)
-  | FPS_JoinVal v1, FPS_JoinVal v2 -> FPS_JoinVal (Abs_Val.join v1 v2)
 
 (* Apply a pre-compiled scalar fixpoint effect to an abstract value *)
 let apply_fp_scalar (fps : fp_scalar) (((itv, u, l) as v) : Abs_Val.t) :
@@ -710,6 +695,20 @@ let apply_fp_scalar (fps : fp_scalar) (((itv, u, l) as v) : Abs_Val.t) :
   | FPS_JoinConsts c -> Abs_Val.join v (abs_int c)
   | FPS_JoinVal v' -> Abs_Val.join v v'
   | FPS_Top -> (Itv.top, u, l)
+
+let apply_scalar_effects (effects : (fp_scalar * PPSet.t) list)
+    (v : Abs_Val.t) (existing_pps : PPSet.t) : Abs_Val.t * PPSet.t =
+  let all_pps =
+    List.fold_left (fun acc (_, pps) -> PPSet.union acc pps) existing_pps effects
+  in
+  let has_top = List.exists (fun (fps, _) -> fps = FPS_Top) effects in
+  let has_inc = List.exists (fun (fps, _) -> fps = FPS_Inc) effects in
+  let has_dec = List.exists (fun (fps, _) -> fps = FPS_Dec) effects in
+  if has_top || (has_inc && has_dec) then
+    (Abs_Val.top, all_pps)
+  else
+    let v' = List.fold_left (fun acc (fps, _) -> apply_fp_scalar fps acc) v effects in
+    (v', all_pps)
 
 (* Map handler-local pointer variables to heap labels, handling simple aliases. *)
 let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
@@ -744,7 +743,7 @@ let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
 let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
     (const_map : (string, int) Hashtbl.t)
     (local_ptr_map : (string, Exp.Lbl.t) Hashtbl.t)
-    (scalar_tbl : (Abs_Loc.t, fp_scalar * PPSet.t) Hashtbl.t)
+    (scalar_tbl : (Abs_Loc.t, (fp_scalar * PPSet.t) list) Hashtbl.t)
     (array_writes : fp_array_write list ref) : unit =
   let get_loc0 name =
     match Abs_Env.find !aenv0 name with
@@ -773,14 +772,15 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
             | None -> FPS_Top)
         | _ -> FPS_Top
       in
-      let handler_pp = ProgramPoint.Label atom.assign_lbl in
-      let old_fps, old_pps =
-        match Hashtbl.find_opt scalar_tbl loc with
-        | None -> (FPS_Unchanged, PPSet.empty)
-        | Some (f, pps) -> (f, pps)
-      in
-      Hashtbl.replace scalar_tbl loc
-        (combine_fp_scalar old_fps fps, PPSet.add handler_pp old_pps)
+      if fps <> FPS_Unchanged then begin
+        let handler_pp = ProgramPoint.Label atom.assign_lbl in
+        let old_effects =
+          match Hashtbl.find_opt scalar_tbl loc with
+          | None -> []
+          | Some effects -> effects
+        in
+        Hashtbl.replace scalar_tbl loc ((fps, PPSet.singleton handler_pp) :: old_effects)
+      end
   | Deref ({ exp = Var arr_name; _ }, idx_e) ->
       (* Resolve target heap block: check init_amem first, then local_ptr_map. *)
       let arr_var_loc = get_loc0 arr_name in
@@ -817,7 +817,7 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
 (* Build compiled_fixpoint from all Compiled handler summaries. *)
 let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
   let const_map = build_const_map init_amem in
-  let scalar_tbl : (Abs_Loc.t, fp_scalar * PPSet.t) Hashtbl.t = Hashtbl.create 16 in
+  let scalar_tbl : (Abs_Loc.t, (fp_scalar * PPSet.t) list) Hashtbl.t = Hashtbl.create 16 in
   let array_writes : fp_array_write list ref = ref [] in
   HandlerStore.IidMap.iter
     (fun _iid summary ->
@@ -831,7 +831,7 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
       | Fallback _ -> ())
     !handler_summaries;
   let fp_scalars =
-    Hashtbl.fold (fun loc (fps, pps) acc -> (loc, fps, pps) :: acc) scalar_tbl []
+    Hashtbl.fold (fun loc effects acc -> (loc, effects) :: acc) scalar_tbl []
   in
   compiled_fp := { fp_scalars; fp_arrays = !array_writes };
   let has_fallback =
@@ -846,16 +846,15 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   (* Pass 1: scalar effects *)
   let amem1 =
     List.fold_left
-      (fun amem (loc, fps, handler_pps) ->
-        match fps with
-        | FPS_Unchanged -> amem
-        | _ -> (
-            match Abs_Mem.LocMap.find_opt loc amem with
-            | None -> amem
-            | Some (v, existing_pps) ->
-                let v' = apply_fp_scalar fps v in
-                let new_pps = PPSet.union existing_pps handler_pps in
-                Abs_Mem.LocMap.add loc (v', new_pps) amem))
+      (fun amem (loc, effects) ->
+        let active = List.filter (fun (fps, _) -> fps <> FPS_Unchanged) effects in
+        if active = [] then amem
+        else
+          match Abs_Mem.LocMap.find_opt loc amem with
+          | None -> amem
+          | Some (v, existing_pps) ->
+              let v', new_pps = apply_scalar_effects active v existing_pps in
+              Abs_Mem.LocMap.add loc (v', new_pps) amem)
       c.amem fp.fp_scalars
   in
   (* Pass 2: array write effects *)
@@ -910,34 +909,40 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   (* Pass 3: synthesize asem snapshots for handler scalar assignments (for provenance). *)
   let asem3 =
     List.fold_left
-      (fun asem (loc, fps, handler_pps) ->
-        match fps with
-        | FPS_Unchanged -> asem
-        | _ ->
-            let contributed_itv =
-              match fps with
-              | FPS_JoinConsts c -> c
-              | FPS_JoinVal (itv, _, _) -> itv
-              | _ -> Itv.top
-            in
-            let contributed_val =
-              match fps with
-              | FPS_JoinVal v -> v
-              | _ -> (contributed_itv, Abs_Unit.bot, Abs_Loc.bot)
-            in
-            PPSet.fold
-              (fun pp asem' ->
-                let snapshot =
-                  Abs_Mem.write Abs_Mem.bot loc contributed_val pp
+      (fun asem (loc, effects) ->
+        List.fold_left
+          (fun asem' (fps, handler_pps) ->
+            match fps with
+            | FPS_Unchanged -> asem'
+            | _ ->
+                let contributed_itv =
+                  match fps with
+                  | FPS_JoinConsts c -> c
+                  | FPS_JoinVal (itv, _, _) -> itv
+                  | _ -> Itv.top
                 in
-                Abs_Sem.weak_write asem' pp snapshot)
-              handler_pps asem)
+                let contributed_val =
+                  match fps with
+                  | FPS_JoinVal v -> v
+                  | _ -> (contributed_itv, Abs_Unit.bot, Abs_Loc.bot)
+                in
+                PPSet.fold
+                  (fun pp asem'' ->
+                    let snapshot = Abs_Mem.write Abs_Mem.bot loc contributed_val pp in
+                    Abs_Sem.weak_write asem'' pp snapshot)
+                  handler_pps asem')
+          asem effects)
       !asem fp.fp_scalars
   in
   (* Pass 4: synthesize asem snapshots for handler array writes (for provenance). *)
   let scalar_pps_map =
     List.fold_left
-      (fun m (loc, _, pps) -> Abs_Mem.LocMap.add loc pps m)
+      (fun m (loc, effects) ->
+        let all_pps =
+          List.fold_left (fun acc (_, pps) -> PPSet.union acc pps) PPSet.empty effects
+        in
+        if PPSet.is_empty all_pps then m
+        else Abs_Mem.LocMap.add loc all_pps m)
       Abs_Mem.LocMap.empty fp.fp_scalars
   in
   let asem4 =
