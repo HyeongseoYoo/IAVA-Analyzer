@@ -44,7 +44,7 @@ entries.
 
 | | Expected |
 |---|---|
-| Buggy | 1 warning — `[caused by interrupt: handler 0]`, right OOB `[8, 255]` |
+| Buggy | 1 warning — `interrupt influence: handler 0`, right OOB `[8, 255]` |
 | Fixed | 0 warnings |
 
 **Fix strategy:** wrap the entire `if` in `disable/enable`:
@@ -54,7 +54,7 @@ is stable and the write is provably safe.
 
 ---
 
-### micro2_alias1_buggy.si / micro2_alias1_fixed.si ��� Pattern 2: 1-depth alias
+### micro2_alias1_buggy.si / micro2_alias1_fixed.si — Pattern 2: 1-depth alias
 
 **Bug site:** `*PrpList[*NvmeCtrl[REG_PRPPTR]]` (line 72 of buggy file)
 
@@ -68,7 +68,7 @@ value is unbounded; the analyzer reports right OOB `[8, ∞]`.
 
 | | Expected |
 |---|---|
-| Buggy | 1 warning ��� `[caused by interrupt: handler 1]`, right OOB `[8, ∞]` |
+| Buggy | 1 warning — `interrupt influence: handler 1`, right OOB `[8, ∞]` |
 | Fixed | 0 warnings |
 
 **Fix strategy:** inside the loop body, capture the value atomically before use:
@@ -100,7 +100,7 @@ and the `then`-branch, corrupting `DmaConf[REG_PRPPTR]` to 255.
 
 | | Expected |
 |---|---|
-| Buggy | 1 warning — `[caused by interrupt: handler 2]`, right OOB `[8, 255]` |
+| Buggy | 1 warning — `interrupt influence: handler 2`, right OOB `[8, 255]` |
 | Fixed | 0 warnings |
 
 **Fix strategy:** snapshot via `disable; SafePrp2 := *EngRef[REG_PRPPTR]; enable`
@@ -118,7 +118,7 @@ at `TxIdx` ∈ {8, 9} access `TxBuf` out of bounds.  No handler writes `TxIdx` o
 
 | | Expected |
 |---|---|
-| Only version | OOB reported, right OOB `[8, 9]`, **no** `[caused by interrupt: ...]` line |
+| Only version | right OOB `[8, 9]` internally, but **0 warnings** under `-prov` (non-handler-caused, filtered out of the report entirely) |
 
 This is a **precision test**: the analyzer should correctly attribute the OOB to
 main alone, not to any handler.
@@ -178,8 +178,8 @@ handler-caused OOBs to exactly the three documented bugs.  The `SafeSlot`
 capture pattern inside Phase 5 protects all other array accesses in each
 dispatch iteration.
 
-**Expected:** 4 bugs — Bug-1/2/3 carry `[caused by interrupt: handler N]`;
-the true-negative does not.
+**Expected:** 4 bugs in total; Bug-1/2/3 show `interrupt influence: handler N` in the
+`-prov` report, while the true-negative is filtered out of that report entirely.
 
 ---
 
@@ -236,8 +236,8 @@ the re-read heap cell cannot narrow a heap value, only a variable.  The fix
 captures the descriptor value into `DmaPage` first, then guards `DmaPage` — a
 plain variable no handler writes — which the if-check can narrow stably.
 
-**Expected:** 4 bugs — Bug-1/2/3 carry `[caused by interrupt: handler N]`;
-the true-negative does not.
+**Expected:** 4 bugs in total; Bug-1/2/3 show `interrupt influence: handler N` in the
+`-prov` report, while the true-negative is filtered out of that report entirely.
 
 ---
 

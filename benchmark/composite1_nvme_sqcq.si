@@ -952,7 +952,7 @@ main {
   // StatIdx is only written by main; no handler touches StatIdx or StatBuf.
   // STAT_TOTAL (9) > MAX_CMDS (8): iteration at StatIdx=8 writes StatBuf[8],
   // which is right OOB for a size-8 array.
-  // Expected: OOB reported WITHOUT "[caused by interrupt: ...]".
+  // Expected: 0 warnings under -prov (non-handler-caused OOB is filtered out entirely).
   StatIdx := 0;
   while StatIdx < STAT_TOTAL do (
     *StatBuf[StatIdx] := StatIdx;   // [TRUE-NEG] OOB at StatIdx=8; not handler-caused

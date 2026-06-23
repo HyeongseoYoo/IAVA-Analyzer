@@ -1,0 +1,11 @@
+init {
+MAXSLOTS := 8;
+sqBuf := malloc(MAXSLOTS, 0);
+slotIdx := 0;
+handler 0 { slotIdx := 255 }
+}
+main {
+if slotIdx < MAXSLOTS
+then *sqBuf[slotIdx] := 0
+else unit
+}

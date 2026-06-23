@@ -1,6 +1,6 @@
 // micro1_direct_buggy.si — Pattern 1: direct shared scalar variable (BUGGY)
 // Bug: handler 0 corrupts SlotIdx after if-check -> OOB on SqBuf[8]
-// Expected: 1 interrupt warning, [caused by interrupt: handler 0]
+// Expected: 1 interrupt warning, interrupt influence: handler 0
 // Fix: see micro1_direct_fixed.si — wrap SqBuf write in disable/enable
 //
 init {

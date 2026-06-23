@@ -1,7 +1,7 @@
 
 (library
  (name variable_analysis)
- (modules syntax parser lexer analyzer interp domain itv abs_dom provenance reporter)
+ (modules syntax parser lexer analyzer interp domain itv abs_dom provenance trace reporter)
  (libraries unix))
 
 (menhir

@@ -111,28 +111,29 @@ def parse_output(stdout: str, stderr: str) -> dict:
       left_oobs  list[str]  — left-OOB range per bug  (e.g. "⟂", "[-∞,-1]")
       right_oobs list[str]  — right-OOB range per bug (e.g. "[8,255]", "⟂")
       abs_time   float      — abs_analyze wall seconds
-      prov_time  float      — prov_analyze wall seconds
+      trace_time float      — trace_analyze wall seconds
     """
-    m = re.search(r"Provenance Report: (\d+) bugs? found", stdout)
+    m = re.search(r"Trace Warning Report: (\d+) warnings?", stdout)
     bugs = int(m.group(1)) if m else 0
 
     handlers, left_oobs, right_oobs = [], [], []
-    for block in re.split(r"--- Bug #\d+ ---", stdout)[1:]:
-        hm = re.search(r"\[caused by interrupt: handler (\d+)\]", block)
-        if hm:
-            handlers.append(int(hm.group(1)))
-        # "left OOB: ⟂  |  right OOB: [8,255]"
-        lm = re.search(r"left OOB:\s*(\S+)", block)
-        rm = re.search(r"right OOB:\s*(\S+)", block)
+    for block in re.split(r"--- Warning #\d+ ---", stdout)[1:]:
+        # "access: Write, kind: right OOB, interrupt influence: handler 0, handler 1"
+        im = re.search(r"interrupt influence:\s*(.+)", block)
+        if im:
+            handlers.extend(int(h) for h in re.findall(r"handler (\d+)", im.group(1)))
+        # "safe=[0,7] left=⟂ right=[8,255]"
+        lm = re.search(r"left=(\S+)", block)
+        rm = re.search(r"right=(\S+)", block)
         left_oobs.append(lm.group(1) if lm else "?")
         right_oobs.append(rm.group(1) if rm else "?")
 
-    abs_time = prov_time = 0.0
+    abs_time = trace_time = 0.0
     for line in stderr.splitlines():
         if m2 := re.search(r"\[time\] abs_analyze\s*:\s*([\d.]+)s", line):
             abs_time = float(m2.group(1))
-        if m2 := re.search(r"\[time\] prov_analyze\s*:\s*([\d.]+)s", line):
-            prov_time = float(m2.group(1))
+        if m2 := re.search(r"\[time\] trace_analyze\s*:\s*([\d.]+)s", line):
+            trace_time = float(m2.group(1))
 
     return {
         "bugs":      bugs,
@@ -140,7 +141,7 @@ def parse_output(stdout: str, stderr: str) -> dict:
         "left_oobs": left_oobs,
         "right_oobs": right_oobs,
         "abs_time":  abs_time,
-        "prov_time": prov_time,
+        "trace_time": trace_time,
     }
 
 
@@ -185,7 +186,7 @@ def collect_rows(binary: str, bench_dir: str, with_optoff: bool = False) -> list
         stdout, stderr = run_analyzer(binary, path, optoff=False)
         wall = time.perf_counter() - t0
         p = parse_output(stdout, stderr)
-        t_opt = p["abs_time"] + p["prov_time"]
+        t_opt = p["abs_time"] + p["trace_time"]
         print(f"{wall:.1f}s", file=sys.stderr)
 
         loc = sum(1 for _ in open(path))
@@ -206,7 +207,7 @@ def collect_rows(binary: str, bench_dir: str, with_optoff: bool = False) -> list
             stdout2, stderr2 = run_analyzer(binary, path, optoff=True)
             wall2 = time.perf_counter() - t0
             p2 = parse_output(stdout2, stderr2)
-            t_noopt = p2["abs_time"] + p2["prov_time"]
+            t_noopt = p2["abs_time"] + p2["trace_time"]
             print(f"{wall2:.1f}s", file=sys.stderr)
 
             row["bugs2"]      = p2["bugs"]

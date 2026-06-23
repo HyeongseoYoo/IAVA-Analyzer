@@ -118,19 +118,16 @@ let main () =
      let t0 = Unix.gettimeofday () in
      let asem, errs = Analyzer.abs_analyze ~use_opt:(not !opt_optoff) pgm in
      let t1 = Unix.gettimeofday () in
-     let chains =
-       Provenance.analyze errs asem pgm
-       |> List.filter (fun (c : Provenance.chain) -> c.error.handler_caused)
-     in
+     let trace_chains = Trace.trace_warnings errs asem pgm in
      let t2 = Unix.gettimeofday () in
      Printf.eprintf "[time] abs_analyze : %.3fs\n" (t1 -. t0);
-     Printf.eprintf "[time] prov_analyze : %.3fs\n" (t2 -. t1);
+     Printf.eprintf "[time] trace_analyze: %.3fs\n" (t2 -. t1);
      if !opt_prov then
-       print_endline (Provenance.string_of_report chains);
+       print_endline (Trace.string_of_report trace_chains);
      if !opt_report then
        let path = Option.value !report_out ~default:(default_report_path ()) in
        let t3 = Unix.gettimeofday () in
-       let markdown = Reporter.explain ~source_code chains in
+       let markdown = Reporter.explain ~source_code trace_chains in
        let t4 = Unix.gettimeofday () in
        Printf.eprintf "[time] codex_exec  : %.3fs\n" (t4 -. t3);
        write_all path markdown;

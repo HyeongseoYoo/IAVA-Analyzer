@@ -1,13 +1,13 @@
-open Provenance
+open Trace
 
 (* ===== Prompt builder ===== *)
 
-let prompt_of_context ~(prov_report : string) ~(source_code : string) : string =
-  {|You are an expert in embedded systems and static analysis.
-Below are analysis results for an interrupt-driven embedded program in a toy language.
-The analyzer uses abstract interpretation and provenance tracing.
+let prompt_of_context ~(trace_report : string) ~(source_code : string) : string =
+  {|You are an expert in SSD Firmware systems and static analysis.
+Below are analysis results for an interrupt-driven embedded program in a target language.
+The analyzer uses abstract interpretation and backward tracing.
 
-The toy language has:
+The target language has:
 - `init { ... }` for global initialization and interrupt registration
 - `main { ... }` for the main program
 - `handler N { ... }` for interrupt handler N
@@ -15,18 +15,19 @@ The toy language has:
 - `malloc(n, v)` for heap allocation
 - `*base[offset]` for heap array read/write
 
-Explain the bug report for a developer.
-For each bug:
-1. State the main reason in plain English
-2. Trace how the bad value or pointer reaches the bug, using line numbers and expressions
-3. Name the interrupt handler if it is part of the cause
-4. Suggest a concrete fix
+Write a developer-facing bug explanation.
+For each bug, explain it in this flow:
+1. Interrupt interleaving point: identify where an interrupt handler can run or where the handler-updated value enters the main flow. Name the handler and cite the relevant line/expression.
+2. Failure point: identify where the unsafe memory access can happen after that interrupt influence. Cite the line/expression and say whether it is a read or write OOB.
+3. Trace: describe the backward trace from the failure point to the interrupt influence, using the base/index provenance in the trace report. Mention line numbers and expressions.
+4. Impact: summarize the concrete unsafe value or pointer range in plain English.
 
-Be concise and easy to understand. Do not dump raw interval notation unless it is needed to explain the trace.
+Use wording like: "If handler N runs at/after ..., then ... can become ..., so the access at ... may go out of bounds."
+Be concise and easy to understand. Do not dump raw interval notation unless it directly helps explain the trace.
 
-=== Provenance Report (-prov output) ===
+=== Trace Report (-prov output) ===
 |}
-  ^ prov_report
+  ^ trace_report
   ^ {|
 
 === Example Code ===
@@ -157,10 +158,12 @@ let call_codex_exec (prompt : string) : string =
 
 (* ===== Public entry point ===== *)
 
-let explain ~(source_code : string) (chains : chain list) : string =
+let explain ~(source_code : string) (chains : trace_chain list) : string =
   if chains = [] then "# Codex Bug Report\n\nNo bugs detected - nothing to explain.\n"
   else
-    let prov_report = string_of_report chains in
-    let prompt = prompt_of_context ~prov_report ~source_code in
+    let trace_report = string_of_report chains in
+    let prompt = prompt_of_context ~trace_report ~source_code in
     let response = call_codex_exec prompt in
-    Printf.sprintf "# Codex Bug Report\n\n%s\n" response
+    Printf.sprintf
+      "# Codex Bug Report\n\n## Explanation\n\n%s\n\n## Trace Evidence\n\n```text\n%s\n```\n"
+      response trace_report

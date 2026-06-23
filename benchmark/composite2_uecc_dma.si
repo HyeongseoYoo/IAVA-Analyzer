@@ -957,7 +957,7 @@ main {
   // RetryIdx is only written by main (reset to 0 above); no handler touches RetryIdx or RetryLog.
   // RETRY_TOTAL (9) > MAX_PAGES (8): iteration at RetryIdx=8 writes RetryLog[8],
   // which is right OOB for a size-8 array.
-  // Expected: OOB reported WITHOUT "[caused by interrupt: ...]".
+  // Expected: 0 warnings under -prov (non-handler-caused OOB is filtered out entirely).
   RetryIdx := 0;
   while RetryIdx < RETRY_TOTAL do (
     *RetryLog[RetryIdx] := RetryIdx;   // [TRUE-NEG] OOB at RetryIdx=8; not handler-caused

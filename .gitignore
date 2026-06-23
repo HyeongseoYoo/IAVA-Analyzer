@@ -69,3 +69,8 @@ Makefile
 
 compile_commands.json
 
+# ========================
+# Notes / reports
+# ========================
+*_notes.md
+*.report.md

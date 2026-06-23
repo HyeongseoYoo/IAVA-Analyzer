@@ -1,7 +1,7 @@
 // micro4_nonhandler_oob.si — Precision test: non-handler-caused OOB (no fixed version)
 // Bug: main loops TX_TOTAL (10) times on TxBuf[MAX_SLOTS=8] -> OOB at TxIdx in [8,9]
 // No handler touches TxIdx or TxBuf -> handler_caused = false
-// Expected: OOB reported WITHOUT "[caused by interrupt: ...]" annotation
+// Expected: 0 warnings under -prov (non-handler-caused OOB is filtered out entirely)
 //
 init {
   // === Array sizes ===
@@ -66,7 +66,7 @@ init {
 main {
   // TX_TOTAL (10) > MAX_SLOTS (8): iterations at TxIdx=8 and TxIdx=9 are OOB.
   // No handler writes TxIdx or TxBuf, so handler_caused = false for this access.
-  // The analyzer should report the OOB but omit "[caused by interrupt: ...]".
+  // Under -prov, this OOB is filtered out entirely (non-handler-caused).
   TxIdx := 0;
   while TxIdx < TX_TOTAL do (
     *TxBuf[TxIdx] := TxIdx;   // [OOB-4] TxIdx in [8,9] > MAX_SLOTS-1; not handler-caused

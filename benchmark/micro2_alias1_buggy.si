@@ -1,6 +1,6 @@
 // micro2_alias1_buggy.si — Pattern 2: 1-depth pointer alias (BUGGY)
 // Bug: handler 1 corrupts RegFile[REG_PRPPTR] between while-check and body re-read.
-// Expected: 1 interrupt warning, [caused by interrupt: handler 1]
+// Expected: 1 interrupt warning, interrupt influence: handler 1
 // Fix: see micro2_alias1_fixed.si — snapshot the value inside disable/enable
 //
 init {
