@@ -13,6 +13,7 @@ init {
 
   // === OOB sentinel ===
   ABORT_SLOT := 255;
+  LEFT_ABORT_SLOT := -1;
 
   // === Register field indices ===
   REG_STATUS := 0;
@@ -48,7 +49,7 @@ init {
     // NVME_ERR_EVT: corrupts SlotIdx (direct scalar) — bug source for micro1
     ErrCode  := ERR_INVAL;
     ErrCount := ErrCount + 1;
-    SlotIdx  := ABORT_SLOT
+    SlotIdx  := LEFT_ABORT_SLOT
   };
 
   handler 1 {

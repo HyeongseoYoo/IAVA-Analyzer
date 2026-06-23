@@ -15,14 +15,15 @@ Only the `main` block differs. The shared init declares:
 | `MAX_SLOTS` | 8 | SqBuf, PrpList, PrpList2, TxBuf sizes |
 | `PRP_SZ` | 8 | valid index range for PrpList/PrpList2 |
 | `TX_TOTAL` | 10 | loop bound for micro4 (> MAX_SLOTS → OOB) |
-| `ABORT_SLOT` | 255 | out-of-bounds sentinel written by handlers |
+| `ABORT_SLOT` | 255 | right-OOB sentinel written by handlers 1 and 2 |
+| `LEFT_ABORT_SLOT` | -1 | left-OOB sentinel written by handler 0 |
 | `REG_PRPPTR` | 1 | field index written/read through aliases |
 
 Handler assignments:
 
 | Handler | Event | Effect | Bug source for |
 |---|---|---|---|
-| 0 | `NVME_ERR_EVT` | `SlotIdx := ABORT_SLOT` | micro1 |
+| 0 | `NVME_ERR_EVT` | `SlotIdx := LEFT_ABORT_SLOT` | micro1 |
 | 1 | `TIMEOUT_EVT` | `*RegFile[REG_PRPPTR] := ABORT_SLOT` | micro2 |
 | 2 | `CQ_FULL_EVT` | `DmaPtr := DmaConf; *DmaPtr[REG_PRPPTR] := ABORT_SLOT` | micro3 |
 
@@ -34,23 +35,32 @@ No handler writes `TxIdx`, `TxBuf`, or `DiagBuf`, so micro4's OOB is non-handler
 
 ### micro1_direct_buggy.si / micro1_direct_fixed.si — Pattern 1: direct scalar
 
-**Bug site:** `*SqBuf[SlotIdx]` (line 70 of buggy file)
+**Bug site:** `*SqBuf[SlotIdx]` (line 74 of buggy file)
 
-`SlotIdx` is checked in the `if SlotIdx < MAX_SLOTS` condition, but handler 0
-can fire at the yield point between the check and the `then`-branch body,
-overwriting `SlotIdx` with `ABORT_SLOT` (255) before the `SqBuf` write.  At
-the access site the abstract value of `SlotIdx` is `[0, 255]`; `SqBuf` has 8
-entries.
+`SlotIdx` is checked against both bounds (`LEFT_ABORT_SLOT < SlotIdx` and
+`SlotIdx < MAX_SLOTS`), but handler 0 can fire at the yield point between the
+inner check and the `then`-branch body, overwriting `SlotIdx` with
+`LEFT_ABORT_SLOT` (-1) before the `SqBuf` write. This benchmark is the suite's
+left-OOB micro case.
 
 | | Expected |
 |---|---|
-| Buggy | 1 warning — `interrupt influence: handler 0`, right OOB `[8, 255]` |
+| Buggy | 1 warning — `interrupt influence: handler 0`, left OOB `[-1, -1]` |
 | Fixed | 0 warnings |
 
-**Fix strategy:** wrap the entire `if` in `disable/enable`:
-`disable; if SlotIdx < MAX_SLOTS then *SqBuf[SlotIdx] := ERR_NONE else unit; enable`.
-Inside the critical section no handler can fire, so the check on `SlotIdx`
-is stable and the write is provably safe.
+**Fix strategy:** wrap the bounds checks and write in `disable/enable`, and
+check both sides of the interval:
+```
+disable;
+if SlotIdx < MAX_SLOTS
+then (
+  if LEFT_ABORT_SLOT < SlotIdx then *SqBuf[SlotIdx] := ERR_NONE else unit
+)
+else unit;
+enable
+```
+Inside the critical section no handler can fire, so the checks on `SlotIdx`
+are stable and the write is provably safe.
 
 ---
 
@@ -127,18 +137,22 @@ main alone, not to any handler.
 
 ## Composite benchmarks
 
-Both composites contain all three interrupt bug patterns and one non-handler OOB
-in a single realistic scenario, testing detection and precision together.
-Line counts: composite1 ≈ 961, composite2 ≈ 966.
+The buggy composites contain all three interrupt bug patterns and one
+non-handler OOB in a single realistic scenario, testing detection and precision
+together. Each has a matching `_fixed` version that should report no
+interrupt-caused warnings under `-prov`.
+Line counts: composite1 961/957 buggy/fixed, composite2 966/965 buggy/fixed.
 
 ---
 
-### composite1_nvme_sqcq.si — NVMe SQ/CQ Command Processing Pipeline (~961 lines)
+### composite1_nvme_sqcq.si / composite1_nvme_sqcq_fixed.si — NVMe SQ/CQ Command Processing Pipeline
 
 Models a full NVMe HIL pipeline: capability negotiation → namespace enumeration →
 queue init → PRP list construction → 5-opcode command dispatch → CQ entry
 staging → CQ drain → error/abort handling → LBA validation → ring reconciliation →
 event-log aggregation → NS info page → feature-set update → PRP consistency check.
+The base file is the buggy version; `_fixed` preserves the same scenario but
+closes the three interrupt-caused windows.
 
 **Phase map:**
 
@@ -178,12 +192,17 @@ handler-caused OOBs to exactly the three documented bugs.  The `SafeSlot`
 capture pattern inside Phase 5 protects all other array accesses in each
 dispatch iteration.
 
-**Expected:** 4 bugs in total; Bug-1/2/3 show `interrupt influence: handler N` in the
-`-prov` report, while the true-negative is filtered out of that report entirely.
+**Expected for the buggy file:** 3 warnings under `-prov`; Bug-1/2/3 show
+`interrupt influence: handler N`. The true-negative is still an internal OOB,
+but it is filtered out of the provenance report.
+
+**Fixed version:** `composite1_nvme_sqcq_fixed.si` re-checks `CmdSlot` inside
+`disable/enable`, snapshots `NvmeRegs[REG_PRPPTR]` into `SafePrp`, and snapshots
+`DmaConf[REG_PRPPTR]` into `SafePrp2`. Expected under `-prov`: 0 warnings.
 
 ---
 
-### composite2_uecc_dma.si — UECC Error Detection + DMA PRP-List Pipeline (~966 lines)
+### composite2_uecc_dma.si / composite2_uecc_dma_fixed.si — UECC Error Detection + DMA PRP-List Pipeline
 
 Models a full UECC/DMA error-recovery pipeline: ECC engine init → channel/plane
 preflight → page state init → DMA descriptor construction → read-request issue →
@@ -194,6 +213,8 @@ channel recovery → power-state management → syndrome re-scan → error aggre
 
 `FATAL_SLOT = 200` deliberately differs from the micro suite's 255, demonstrating
 that OOB ranges follow the handler's sentinel value.
+The base file is the buggy version; `_fixed` preserves the same scenario but
+closes the three interrupt-caused windows.
 
 **Phase map:**
 
@@ -236,8 +257,13 @@ the re-read heap cell cannot narrow a heap value, only a variable.  The fix
 captures the descriptor value into `DmaPage` first, then guards `DmaPage` — a
 plain variable no handler writes — which the if-check can narrow stably.
 
-**Expected:** 4 bugs in total; Bug-1/2/3 show `interrupt influence: handler N` in the
-`-prov` report, while the true-negative is filtered out of that report entirely.
+**Expected for the buggy file:** 3 warnings under `-prov`; Bug-1/2/3 show
+`interrupt influence: handler N`. The true-negative is still an internal OOB,
+but it is filtered out of the provenance report.
+
+**Fixed version:** `composite2_uecc_dma_fixed.si` re-checks `ErrSlot` inside
+`disable/enable`, snapshots `ErrRegs[REG_PNDPTR]` into `SafePend`, and snapshots
+`EccConf[REG_PNDPTR]` into `SafePend2`. Expected under `-prov`: 0 warnings.
 
 ---
 
@@ -251,14 +277,16 @@ Run with `-prov` flag:
 
 | File | Lines | Expected bugs | Interrupt warnings |
 |---|---|---|---|
-| micro1_direct_buggy.si | 73 | 1 | 1 (handler 0) |
-| micro1_direct_fixed.si | 75 | 0 | 0 |
-| micro2_alias1_buggy.si | 76 | 1 | 1 (handler 1) |
-| micro2_alias1_fixed.si | 82 | 0 | 0 |
-| micro3_aliasmulti_buggy.si | 81 | 1 | 1 (handler 2) |
-| micro3_aliasmulti_fixed.si | 80 | 0 | 0 |
-| micro4_nonhandler_oob.si | 75 | 1 | 0 (true-negative) |
+| micro1_direct_buggy.si | 78 | 1 | 1 (handler 0, left OOB) |
+| micro1_direct_fixed.si | 81 | 0 | 0 |
+| micro2_alias1_buggy.si | 77 | 1 | 1 (handler 1) |
+| micro2_alias1_fixed.si | 83 | 0 | 0 |
+| micro3_aliasmulti_buggy.si | 82 | 1 | 1 (handler 2) |
+| micro3_aliasmulti_fixed.si | 81 | 0 | 0 |
+| micro4_nonhandler_oob.si | 76 | 1 | 0 (true-negative) |
 | composite1_nvme_sqcq.si | 961 | 4 | 3 (one per handler) |
+| composite1_nvme_sqcq_fixed.si | 957 | 1 | 0 (true-negative only) |
 | composite2_uecc_dma.si | 966 | 4 | 3 (one per handler) |
+| composite2_uecc_dma_fixed.si | 965 | 1 | 0 (true-negative only) |
 
 All results confirmed by running the analyzer on the generated files.

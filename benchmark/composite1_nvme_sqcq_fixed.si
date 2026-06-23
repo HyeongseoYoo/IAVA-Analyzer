@@ -1,0 +1,957 @@
+// composite1_nvme_sqcq_fixed.si — NVMe Submission/Completion Queue Command Processing Pipeline (FIXED)
+//
+// Models a realistic NVMe HIL command processing pipeline including:
+//   capability setup, namespace enumeration, SQ/CQ ring management,
+//   PRP list construction, 5-opcode dispatch (READ/WRITE/FLUSH/IDENTIFY/ABORT),
+//   CQ entry building, CQ drain, error/abort handling, and statistics.
+//
+// Interrupt handlers:
+//   handler 0 — NVME_ERR_EVT  : CmdSlot := ABORT_CID  (direct scalar, Bug-1)
+//   handler 1 — TIMEOUT_EVT   : NvmeRegs[REG_PRPPTR] := ABORT_CID  (Bug-2 via NvmeCtrl alias)
+//   handler 2 — CQ_FULL_EVT   : DmaConf[REG_PRPPTR] := ABORT_CID via DmaPtr  (Bug-3 via DescTable chain)
+//
+// Fixed interrupt windows:
+//   Fix-1  *SqBuf[CmdSlot] guarded inside disable/enable
+//   Fix-2  NvmeRegs[REG_PRPPTR] snapshotted into SafePrp
+//   Fix-3  DmaConf[REG_PRPPTR] snapshotted into SafePrp2
+// True-negative:
+//   TN     line ~597  *StatBuf[StatIdx]                  none       OOB [8,8]
+// Expected under -prov: 0 interrupt warnings
+
+init {
+  // === Queue / buffer sizes ===
+  MAX_CMDS    := 8;
+  PRP_SZ      := 8;
+  STAT_TOTAL  := 9;
+  MAX_NS      := 4;
+  MAX_LBA     := 16;
+  MAX_PRP     := 4;
+  MAX_ABORT   := 4;
+  MAX_DATA    := 8;
+  MAX_LOG     := 16;
+  CQ_WRAP     := 8;
+  REG_SZ      := 8;
+  DESC_SZ     := 4;
+
+  // === OOB sentinel ===
+  ABORT_CID   := 255;
+
+  // === NvmeRegs field indices ===
+  REG_STATUS  := 0;
+  REG_PRPPTR  := 1;
+  REG_SQTAIL  := 2;
+  REG_CQHEAD  := 3;
+  REG_ERRCNT  := 4;
+  REG_CCAP    := 5;
+  REG_FEATCAP := 6;
+  REG_DOORBELL := 7;
+
+  // === NVMe opcodes ===
+  OP_READ     := 1;
+  OP_WRITE    := 2;
+  OP_FLUSH    := 3;
+  OP_IDENTIFY := 4;
+  OP_ABORT    := 5;
+
+  // === Completion status codes ===
+  SC_SUCCESS  := 0;
+  SC_INVAL_FIELD := 1;
+  SC_CMD_ABORT := 7;
+  SC_INTERNAL := 8;
+
+  // === Phase tag values ===
+  PHASE_0     := 0;
+  PHASE_1     := 1;
+
+  // === Error / command state codes ===
+  ERR_NONE    := 0;
+  ERR_INVAL   := 1;
+  ERR_TIMEOUT := 2;
+  CMD_FREE    := 0;
+  CMD_PENDING := 1;
+  CMD_ACTIVE  := 2;
+  CMD_DONE    := 3;
+  CMD_ABORT   := 4;
+  CMD_ERROR   := 5;
+
+  // === Feature flags ===
+  FEAT_READ_EN  := 1;
+  FEAT_WRITE_EN := 2;
+  FEAT_FLUSH_EN := 4;
+
+  // === State variables ===
+  CmdSlot    := 0;
+  CqHead     := 0;
+  SqTail     := 0;
+  ErrCode    := 0;
+  ErrCount   := 0;
+  AbortCount := 0;
+  DoneCount  := 0;
+  StatIdx    := 0;
+  NsIdx      := 0;
+  LbaBase    := 0;
+  LbaOff     := 0;
+  PrpIdx     := 0;
+  PhaseTag   := 0;
+  CqWp       := 0;
+  EventHead  := 0;
+  FlushCount := 0;
+  IdentCount := 0;
+  SafeSlot   := 0;
+  SafePrp    := 0;
+  SafePrp2   := 0;
+  Opcode     := 0;
+  TxSlot     := 0;
+  DrainIdx   := 0;
+  AbortIdx   := 0;
+  AbortSlot  := 0;
+  NsCapacity := 0;
+  DmaPage    := 0;
+  ScCode     := 0;
+  QueueDepth := 0;
+  FeatureWord := 0;
+  DoorBellVal := 0;
+
+  // === Arrays ===
+  SqBuf      := malloc(8, 0);
+  CqBuf      := malloc(8, 0);
+  NvmeRegs   := malloc(8, 0);
+  PrpList    := malloc(8, 0);
+  DmaConf    := malloc(8, 0);
+  DescTable  := malloc(4, 0);
+  PrpList2   := malloc(8, 0);
+  StatBuf    := malloc(8, 0);
+  NsBuf      := malloc(4, 0);
+  LbaBuf     := malloc(16, 0);
+  DataBuf    := malloc(8, 0);
+  AbortList  := malloc(4, 0);
+  PrpPage    := malloc(4, 0);
+  EventLog   := malloc(16, 0);
+  CqEntry    := malloc(8, 0);
+
+  // === Initialize NvmeRegs ===
+  *NvmeRegs[REG_STATUS]   := ERR_NONE;
+  *NvmeRegs[REG_PRPPTR]   := 0;
+  *NvmeRegs[REG_SQTAIL]   := 0;
+  *NvmeRegs[REG_CQHEAD]   := 0;
+  *NvmeRegs[REG_ERRCNT]   := 0;
+  *NvmeRegs[REG_CCAP]     := MAX_CMDS;
+  *NvmeRegs[REG_FEATCAP]  := MAX_NS;
+  *NvmeRegs[REG_DOORBELL] := 0;
+
+  // === Initialize DMA descriptor table ===
+  *DescTable[0]         := DmaConf;
+  *DmaConf[REG_PRPPTR]  := 0;
+
+  // === Initialize namespace LBA capacity table ===
+  *NsBuf[0] := 8;
+  *NsBuf[1] := 8;
+  *NsBuf[2] := 8;
+  *NsBuf[3] := 8;
+
+  handler 0 {
+    // NVME_ERR_EVT: NVMe protocol error — corrupts CmdSlot (Bug-1 source)
+    ErrCode    := ERR_INVAL;
+    ErrCount   := ErrCount + 1;
+    CmdSlot    := ABORT_CID;
+    *NvmeRegs[REG_STATUS] := ERR_INVAL;
+    *NvmeRegs[REG_ERRCNT] := ErrCount
+  };
+
+  handler 1 {
+    // TIMEOUT_EVT: command timeout — corrupts NvmeRegs[REG_PRPPTR] (Bug-2 source)
+    ErrCount              := ErrCount + 1;
+    *NvmeRegs[REG_PRPPTR] := ABORT_CID;
+    *NvmeRegs[REG_ERRCNT] := ErrCount
+  };
+
+  handler 2 {
+    // CQ_FULL_EVT: CQ overflow — corrupts DmaConf[REG_PRPPTR] via alias (Bug-3 source)
+    DmaPtr              := DmaConf;
+    *DmaPtr[REG_PRPPTR] := ABORT_CID;
+    CqHead              := CqHead + 1
+  }
+}
+
+main {
+  // ===== Alias setup =====
+  // NvmeCtrl is a 1-depth alias of NvmeRegs (Bug-2 access path).
+  NvmeCtrl := NvmeRegs;
+
+  // 3-level alias chain to DmaConf (Bug-3 access path):
+  //   level 1: SysRef aliases DescTable (var alias)
+  //   level 2: EngRef := *SysRef[0] loads DmaConf pointer from heap
+  //   level 3: *EngRef[REG_PRPPTR] reads DmaConf[REG_PRPPTR]
+  SysRef := DescTable;
+  EngRef := *SysRef[0];
+
+  // ===== Phase 0: Controller capability and feature setup =====
+  // Read controller capabilities, set feature flags, record doorbell stride.
+  // All operations inside disable/enable — no handler can fire here.
+  disable;
+  CapReg    := *NvmeRegs[REG_CCAP];
+  FeatureWord := *NvmeRegs[REG_FEATCAP];
+  if CapReg < MAX_CMDS
+  then QueueDepth := CapReg
+  else QueueDepth := MAX_CMDS;
+  if FeatureWord > 0
+  then (
+    if FeatureWord < MAX_NS
+    then NsCapacity := FeatureWord
+    else NsCapacity := MAX_NS
+  )
+  else NsCapacity := 1;
+  *NvmeRegs[REG_DOORBELL] := 0;
+  DoorBellVal := 0;
+  PhaseTag    := PHASE_1;
+  *EventLog[0] := PhaseTag;
+  *EventLog[1] := QueueDepth;
+  EventHead   := 2;
+  enable;
+
+  // ===== Phase 1: Namespace enumeration and LBA map initialization =====
+  // Scan the namespace table, record per-NS LBA capacity, and zero the LBA map.
+  // NsIdx and LbaBase are not written by any handler — safe to use as indices.
+  disable;
+  NsIdx := 0;
+  while NsIdx < MAX_NS do (
+    NsCapacity := *NsBuf[NsIdx];
+    // Record NS capacity in event log
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := NsIdx;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := NsCapacity;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    // Initialize LBA range for this namespace (4 LBAs per NS)
+    LbaBase := NsIdx * 4;
+    *LbaBuf[LbaBase]     := 0;
+    *LbaBuf[LbaBase + 1] := 0;
+    *LbaBuf[LbaBase + 2] := 0;
+    *LbaBuf[LbaBase + 3] := 0;
+    NsIdx := NsIdx + 1
+  );
+  NsIdx := 0;
+  enable;
+
+  // ===== Phase 2: SQ / CQ ring and CQ-entry buffer initialization =====
+  // Zero every SQ entry, CQ entry, and CQ staging buffer.
+  // SqTail, CqWp start at 0; phase tag = PHASE_1 for the initial ring epoch.
+  disable;
+  CmdSlot := 0;
+  while CmdSlot < MAX_CMDS do (
+    *SqBuf[CmdSlot]  := CMD_FREE;
+    *CqBuf[CmdSlot]  := SC_SUCCESS;
+    *CqEntry[CmdSlot] := SC_SUCCESS;
+    CmdSlot := CmdSlot + 1
+  );
+  CmdSlot  := 0;
+  SqTail   := 0;
+  CqHead   := 0;
+  CqWp     := 0;
+  PhaseTag := PHASE_1;
+  *NvmeRegs[REG_SQTAIL] := SqTail;
+  *NvmeRegs[REG_CQHEAD] := CqHead;
+  enable;
+
+  // ===== Phase 3: PRP list and DMA descriptor table construction =====
+  // Build the PRP scatter-gather descriptor: each PrpPage entry records a
+  // page base address (represented here as the LbaBuf slot offset).
+  // PrpIdx not written by any handler — safe as an array index.
+  disable;
+  PrpIdx := 0;
+  while PrpIdx < MAX_PRP do (
+    *PrpPage[PrpIdx] := PrpIdx * 2;
+    PrpIdx := PrpIdx + 1
+  );
+  PrpIdx := 0;
+  // Write PRP page pointers into the first four DmaConf fields
+  *DmaConf[0] := *PrpPage[0];
+  *DmaConf[1] := 0;
+  *DmaConf[2] := *PrpPage[1];
+  *DmaConf[3] := *PrpPage[2];
+  // Record PRP list base in NvmeRegs
+  *NvmeRegs[REG_PRPPTR] := 0;
+  enable;
+
+  // ===== Phase 4: Command pre-load — fill SQ with a mix of opcodes =====
+  // Load READ (slots 0-3), WRITE (4-5), FLUSH (6), IDENTIFY (7) into SQ.
+  // CmdSlot inside disable/enable — no spurious OOBs from handler 0.
+  disable;
+  *SqBuf[0] := OP_READ;
+  *SqBuf[1] := OP_READ;
+  *SqBuf[2] := OP_READ;
+  *SqBuf[3] := OP_READ;
+  *SqBuf[4] := OP_WRITE;
+  *SqBuf[5] := OP_WRITE;
+  *SqBuf[6] := OP_FLUSH;
+  *SqBuf[7] := OP_IDENTIFY;
+  SqTail := MAX_CMDS;
+  *NvmeRegs[REG_SQTAIL] := SqTail;
+  DoorBellVal := SqTail;
+  *NvmeRegs[REG_DOORBELL] := DoorBellVal;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := SqTail;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 5: Command dispatch loop =====
+  // Interrupts are enabled between protected regions. The former interrupt
+  // windows are fixed by guarding CmdSlot and snapshotting heap indices before
+  // using them as array offsets.
+  CmdSlot    := 0;
+  DoneCount  := 0;
+  AbortCount := 0;
+  FlushCount := 0;
+  IdentCount := 0;
+
+  while CmdSlot < MAX_CMDS do (
+
+    // [FIX-1] Re-check CmdSlot and write SqBuf inside the same critical section.
+    // Handler 0 cannot corrupt CmdSlot between the guard and the array access.
+    disable;
+    if CmdSlot < MAX_CMDS
+    then *SqBuf[CmdSlot] := CMD_ACTIVE
+    else unit;
+    SafeSlot := CmdSlot;
+    enable;
+
+    // All opcode processing uses SafeSlot.  No handler writes SafeSlot,
+    // so the if SafeSlot < MAX_CMDS guard holds across every yield point inside.
+    if SafeSlot < MAX_CMDS
+    then (
+
+      // Decode the opcode for this slot
+      Opcode := *SqBuf[SafeSlot];
+
+      // === READ command ===
+      if Opcode = OP_READ
+      then (
+        // Compute LBA base: SafeSlot * 2 in [0,14]; LbaBuf has 16 entries
+        LbaBase := SafeSlot * 2;
+        if LbaBase < MAX_LBA
+        then (
+          *LbaBuf[LbaBase]     := SafeSlot;
+          *LbaBuf[LbaBase + 1] := DoneCount;
+          *DataBuf[SafeSlot]   := LbaBase
+        )
+        else unit;
+        // Validate LBA against namespace capacity
+        if SafeSlot < MAX_NS
+        then (
+          NsCapacity := *NsBuf[SafeSlot];
+          if LbaBase < NsCapacity
+          then *CqEntry[SafeSlot] := SC_SUCCESS
+          else *CqEntry[SafeSlot] := SC_INVAL_FIELD
+        )
+        else *CqEntry[SafeSlot] := SC_SUCCESS;
+        *NvmeRegs[REG_STATUS] := SC_SUCCESS;
+        DoneCount := DoneCount + 1
+      )
+
+      else (
+      // === WRITE command ===
+      if Opcode = OP_WRITE
+      then (
+        LbaBase := SafeSlot * 2;
+        if LbaBase < MAX_LBA
+        then (
+          *LbaBuf[LbaBase]     := *DataBuf[SafeSlot];
+          *LbaBuf[LbaBase + 1] := SafeSlot
+        )
+        else unit;
+        *CqEntry[SafeSlot]    := SC_SUCCESS;
+        *NvmeRegs[REG_STATUS] := SC_SUCCESS;
+        DoneCount := DoneCount + 1
+      )
+
+      else (
+      // === FLUSH command ===
+      if Opcode = OP_FLUSH
+      then (
+        // Log flush event and slot reference
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := OP_FLUSH;
+          EventHead := EventHead + 1
+        )
+        else unit;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := SafeSlot;
+          EventHead := EventHead + 1
+        )
+        else unit;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := DoneCount;
+          EventHead := EventHead + 1
+        )
+        else unit;
+        *CqEntry[SafeSlot]    := SC_SUCCESS;
+        *NvmeRegs[REG_STATUS] := SC_SUCCESS;
+        FlushCount := FlushCount + 1;
+        DoneCount  := DoneCount  + 1
+      )
+
+      else (
+      // === IDENTIFY command ===
+      if Opcode = OP_IDENTIFY
+      then (
+        // Return namespace capacity for the requested NS ID
+        if SafeSlot < MAX_NS
+        then (
+          *NsBuf[SafeSlot]   := MAX_LBA;
+          *DataBuf[SafeSlot] := MAX_LBA
+        )
+        else (
+          *DataBuf[SafeSlot] := 0
+        );
+        *CqEntry[SafeSlot]    := SC_SUCCESS;
+        *NvmeRegs[REG_STATUS] := SC_SUCCESS;
+        IdentCount := IdentCount + 1;
+        DoneCount  := DoneCount  + 1
+      )
+
+      else (
+      // === ABORT command (or unknown opcode) ===
+        if AbortCount < MAX_ABORT
+        then (
+          *AbortList[AbortCount] := SafeSlot;
+          AbortCount := AbortCount + 1
+        )
+        else unit;
+        *CqEntry[SafeSlot]    := SC_CMD_ABORT;
+        *NvmeRegs[REG_STATUS] := SC_CMD_ABORT
+      )))))
+    else unit;
+
+    // [FIX-2] Snapshot the PRP pointer before checking and indexing PrpList.
+    disable;
+    SafePrp := *NvmeCtrl[REG_PRPPTR];
+    enable;
+    if SafePrp < PRP_SZ
+    then *PrpList[SafePrp] := CmdSlot
+    else *PrpList[0] := CmdSlot;
+
+    // [FIX-3] Snapshot through the descriptor-table alias before indexing PrpList2.
+    disable;
+    SafePrp2 := *EngRef[REG_PRPPTR];
+    enable;
+    if SafePrp2 < PRP_SZ
+    then *PrpList2[SafePrp2] := CmdSlot
+    else unit;
+
+    CmdSlot := CmdSlot + 1
+  );
+
+  // ===== Phase 6: Data buffer preparation from LBA map =====
+  // For each command slot, copy the corresponding LBA entry into DataBuf.
+  // TxSlot not written by any handler — safe as an array index.
+  disable;
+  TxSlot := 0;
+  while TxSlot < MAX_CMDS do (
+    LbaOff := TxSlot * 2;
+    // LbaOff in [0,14]; LbaBuf has 16 entries: safe
+    *DataBuf[TxSlot] := *LbaBuf[LbaOff];
+    TxSlot := TxSlot + 1
+  );
+  // PRP descriptor traversal: read each PRP page and record DMA source offset
+  PrpIdx := 0;
+  while PrpIdx < MAX_PRP do (
+    DmaPage := *PrpPage[PrpIdx];
+    // DmaPage holds a page offset (written as PrpIdx*2 in Phase 3): [0,6]
+    // Write to DataBuf[PrpIdx]: PrpIdx in [0,3], DataBuf has 8 entries: safe
+    *DataBuf[PrpIdx] := DmaPage;
+    PrpIdx := PrpIdx + 1
+  );
+  PrpIdx := 0;
+  enable;
+
+  // ===== Phase 7: CQ entry staging and ring write =====
+  // Build completion entries for each dispatched command and write to CqBuf.
+  // CqWp advances from 0; wrap is handled by the if-check against CQ_WRAP.
+  // DrainIdx not written by any handler — safe.
+  disable;
+  DrainIdx := 0;
+  while DrainIdx < MAX_CMDS do (
+    ScCode := *CqEntry[DrainIdx];
+    // Stamp the CQ entry with slot, status, and phase tag
+    *CqBuf[DrainIdx] := ScCode;
+    // Update the CQ write pointer with wrap-around
+    CqWp := CqWp + 1;
+    if CqWp < CQ_WRAP
+    then *NvmeRegs[REG_CQHEAD] := CqWp
+    else (
+      CqWp := 0;
+      PhaseTag := PHASE_0;
+      *NvmeRegs[REG_CQHEAD] := 0
+    );
+    // Record completion event: slot and status
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := DrainIdx;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := ScCode;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    DrainIdx := DrainIdx + 1
+  );
+  enable;
+
+  // ===== Phase 8: CQ drain — host-side ring advance =====
+  // Walk the completed CQ entries and advance the CQ head pointer.
+  // Update the doorbell register to inform the host adapter of consumed entries.
+  disable;
+  DrainIdx := 0;
+  while DrainIdx < MAX_CMDS do (
+    ScCode := *CqBuf[DrainIdx];
+    if ScCode = SC_SUCCESS
+    then (
+      *CqBuf[DrainIdx]  := CMD_DONE;
+      *CqEntry[DrainIdx] := CMD_DONE;
+      DoneCount := DoneCount + 1
+    )
+    else (
+      if ScCode = SC_CMD_ABORT
+      then (
+        *CqBuf[DrainIdx]  := CMD_ABORT;
+        *CqEntry[DrainIdx] := CMD_ABORT
+      )
+      else (
+        *CqBuf[DrainIdx]  := CMD_ERROR;
+        *CqEntry[DrainIdx] := CMD_ERROR;
+        ErrCount := ErrCount + 1;
+        *NvmeRegs[REG_ERRCNT] := ErrCount
+      )
+    );
+    DrainIdx := DrainIdx + 1
+  );
+  CqHead := 0;
+  *NvmeRegs[REG_CQHEAD] := CqHead;
+  // Advance doorbell by the number of entries consumed
+  DoorBellVal := MAX_CMDS;
+  *NvmeRegs[REG_DOORBELL] := DoorBellVal;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DoneCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 9: Error classification and abort-list processing =====
+  // Map raw error codes to command states and retire aborted commands.
+  // AbortIdx and AbortSlot are not written by any handler.
+  disable;
+  AbortIdx := 0;
+  while AbortIdx < AbortCount do (
+    if AbortIdx < MAX_ABORT
+    then (
+      // Read the aborted slot number stored in Phase 5
+      AbortSlot := *AbortList[AbortIdx];
+      // Guard AbortSlot before using it as a CqEntry index
+      if AbortSlot < MAX_CMDS
+      then (
+        *CqEntry[AbortSlot] := SC_CMD_ABORT;
+        *CqBuf[AbortSlot]   := CMD_ABORT;
+        *SqBuf[AbortSlot]   := CMD_ABORT
+      )
+      else unit
+    )
+    else unit;
+    AbortIdx := AbortIdx + 1
+  );
+  // Classify error codes and update error log
+  if ErrCode = ERR_INVAL
+  then (
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := ERR_INVAL;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    *NvmeRegs[REG_STATUS] := ERR_INVAL
+  )
+  else (
+    if ErrCode = ERR_TIMEOUT
+    then (
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := ERR_TIMEOUT;
+        EventHead := EventHead + 1
+      )
+      else unit;
+      *NvmeRegs[REG_STATUS] := ERR_TIMEOUT
+    )
+    else (
+      *NvmeRegs[REG_STATUS] := ERR_NONE
+    )
+  );
+  // Final NvmeRegs status snapshot
+  *NvmeRegs[REG_ERRCNT]   := ErrCount;
+  *NvmeRegs[REG_SQTAIL]   := SqTail;
+  *NvmeRegs[REG_CQHEAD]   := CqHead;
+  *NvmeRegs[REG_DOORBELL] := DoneCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := ErrCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DoneCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := AbortCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := FlushCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := IdentCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 10: LBA address map validation =====
+  // For each namespace, scan the four LBA slots that belong to it and verify
+  // that each stored value is within the namespace's capacity limit.
+  // Write per-NS valid/invalid counts into DataBuf[0..3] and DataBuf[4..7].
+  // NsIdx and LbaBase are not written by any handler.
+  disable;
+  NsIdx := 0;
+  while NsIdx < MAX_NS do (
+    NsCapacity := *NsBuf[NsIdx];
+    LbaBase    := NsIdx * 4;
+    // LbaBase in [0,12]; LbaBase+3 in [3,15]: LbaBuf[16] is safe throughout
+    if *LbaBuf[LbaBase] < NsCapacity
+    then *DataBuf[NsIdx] := *DataBuf[NsIdx] + 1
+    else unit;
+    if *LbaBuf[LbaBase + 1] < NsCapacity
+    then *DataBuf[NsIdx] := *DataBuf[NsIdx] + 1
+    else unit;
+    if *LbaBuf[LbaBase + 2] < NsCapacity
+    then *DataBuf[NsIdx] := *DataBuf[NsIdx] + 1
+    else unit;
+    if *LbaBuf[LbaBase + 3] < NsCapacity
+    then *DataBuf[NsIdx] := *DataBuf[NsIdx] + 1
+    else unit;
+    // Store boundary marker: NsIdx+4 in [4,7] is within DataBuf[8]
+    *DataBuf[NsIdx + MAX_NS] := LbaBase;
+    NsIdx := NsIdx + 1
+  );
+  NsIdx := 0;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := *DataBuf[0];
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := *DataBuf[1];
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 11: CQ phase-tag management and ring wrap =====
+  // Walk completed CQ entries and toggle the phase tag at the wrap boundary.
+  // CqWp is advanced and the doorbell is updated to reflect consumed entries.
+  // CqIdx not written by any handler.
+  disable;
+  CqIdx := 0;
+  CqWp  := 0;
+  while CqIdx < MAX_CMDS do (
+    ScCode := *CqBuf[CqIdx];
+    // Echo slot status into CqEntry staging area
+    *CqEntry[CqIdx] := ScCode;
+    // Advance CQ write pointer with ring wrap
+    CqWp := CqWp + 1;
+    if CqWp < CQ_WRAP
+    then *NvmeRegs[REG_CQHEAD] := CqWp
+    else (
+      CqWp     := 0;
+      PhaseTag := PHASE_0;
+      *NvmeRegs[REG_CQHEAD] := 0
+    );
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := CqWp;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    CqIdx := CqIdx + 1
+  );
+  CqHead := 0;
+  *NvmeRegs[REG_DOORBELL] := CqWp;
+  DoorBellVal := CqWp;
+  enable;
+
+  // ===== Phase 12: SQ ring pointer reconciliation =====
+  // Walk SqBuf, count CMD_ACTIVE entries, and reconcile the SQ tail pointer
+  // with NvmeRegs[REG_SQTAIL].  Reset CMD_ACTIVE entries to CMD_FREE after
+  // accounting so the ring is ready for a second command round.
+  // RecIdx not written by any handler.
+  disable;
+  RecIdx  := 0;
+  SqTail  := 0;
+  CmdSlot := 0;
+  while RecIdx < MAX_CMDS do (
+    Opcode := *SqBuf[RecIdx];
+    if Opcode = CMD_ACTIVE
+    then (
+      *SqBuf[RecIdx] := CMD_FREE;
+      SqTail := SqTail + 1
+    )
+    else (
+      if Opcode = CMD_DONE
+      then (
+        *SqBuf[RecIdx] := CMD_FREE;
+        DoneCount := DoneCount + 1
+      )
+      else (
+        if Opcode = CMD_ERROR
+        then (
+          *SqBuf[RecIdx] := CMD_FREE;
+          ErrCount := ErrCount + 1
+        )
+        else unit
+      )
+    );
+    RecIdx := RecIdx + 1
+  );
+  *NvmeRegs[REG_SQTAIL] := SqTail;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := SqTail;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DoneCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 13: Event log aggregation and error statistics =====
+  // Scan the EventLog, count non-zero entries (valid events), and record the
+  // aggregate error count.  LogIdx not written by any handler.
+  disable;
+  LogIdx      := 0;
+  EventHead   := 0;
+  while LogIdx < MAX_LOG do (
+    if *EventLog[LogIdx] > 0
+    then EventHead := EventHead + 1
+    else unit;
+    LogIdx := LogIdx + 1
+  );
+  LogIdx := 0;
+  // Write aggregated statistics into DataBuf[4..7]
+  *DataBuf[4] := ErrCount;
+  *DataBuf[5] := DoneCount;
+  *DataBuf[6] := AbortCount;
+  *DataBuf[7] := EventHead;
+  // Record aggregated stats in NvmeRegs
+  *NvmeRegs[REG_ERRCNT]   := ErrCount;
+  *NvmeRegs[REG_CCAP]     := DoneCount;
+  *NvmeRegs[REG_FEATCAP]  := AbortCount;
+  *NvmeRegs[REG_DOORBELL] := EventHead;
+  enable;
+
+  // ===== Phase 14: Abort-list resolution and command state finalization =====
+  // For each CID recorded in the abort list during Phase 5, finalize the SqBuf
+  // and CqBuf entries to CMD_ABORT so a subsequent drain sees them correctly.
+  // AbortIdx and AbortSlot not written by any handler.
+  disable;
+  AbortIdx := 0;
+  while AbortIdx < AbortCount do (
+    if AbortIdx < MAX_ABORT
+    then (
+      AbortSlot := *AbortList[AbortIdx];
+      if AbortSlot < MAX_CMDS
+      then (
+        *SqBuf[AbortSlot]   := CMD_ABORT;
+        *CqBuf[AbortSlot]   := SC_CMD_ABORT;
+        *CqEntry[AbortSlot] := SC_CMD_ABORT
+      )
+      else unit
+    )
+    else unit;
+    AbortIdx := AbortIdx + 1
+  );
+  // Final ring-pointer snapshot into NvmeRegs
+  *NvmeRegs[REG_SQTAIL]   := SqTail;
+  *NvmeRegs[REG_CQHEAD]   := CqHead;
+  *NvmeRegs[REG_STATUS]   := ErrCode;
+  *NvmeRegs[REG_ERRCNT]   := ErrCount;
+  *NvmeRegs[REG_DOORBELL] := DoneCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := ErrCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DoneCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := AbortCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 15: Namespace information page construction =====
+  // Build a structured NS info page in DataBuf: each slot records the NS's
+  // LBA capacity from NsBuf and the corresponding start-LBA from Phase 1.
+  // Used to service a Get Log Page or Identify-NS admin response.
+  // NsIdx not written by any handler.
+  disable;
+  NsIdx := 0;
+  while NsIdx < MAX_NS do (
+    NsCapacity := *NsBuf[NsIdx];
+    // Record NS capacity and LBA start offset
+    *DataBuf[NsIdx] := NsCapacity;
+    // NS start LBA = NsIdx * 4; record in DataBuf[NsIdx + MAX_NS]
+    // NsIdx+MAX_NS in [4,7], DataBuf has 8 entries: safe
+    *DataBuf[NsIdx + MAX_NS] := NsIdx * 4;
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := NsCapacity;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    NsIdx := NsIdx + 1
+  );
+  NsIdx := 0;
+  enable;
+
+  // ===== Phase 16: Feature-set response and NvmeRegs update =====
+  // Apply the feature word decoded in Phase 0 to enable or disable
+  // controller features in the NvmeRegs capability register.
+  // Scalar arithmetic only — no array index depends on a handler-written var.
+  disable;
+  if FeatureWord < FEAT_READ_EN + 1
+  then *NvmeRegs[REG_FEATCAP] := FEAT_READ_EN
+  else (
+    if FeatureWord < FEAT_WRITE_EN + 1
+    then *NvmeRegs[REG_FEATCAP] := FEAT_WRITE_EN
+    else *NvmeRegs[REG_FEATCAP] := FEAT_FLUSH_EN
+  );
+  *NvmeRegs[REG_CCAP]     := QueueDepth;
+  *NvmeRegs[REG_STATUS]   := ERR_NONE;
+  *NvmeRegs[REG_ERRCNT]   := ErrCount;
+  *NvmeRegs[REG_DOORBELL] := DoneCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := FeatureWord;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := QueueDepth;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 17: PrpList consistency check =====
+  // Walk PrpList and PrpList2 to verify no entry exceeds MAX_CMDS.
+  // Entries written in Phase 5 hold CmdSlot values that may include the
+  // ABORT_CID sentinel (255); count how many are valid vs sentinel.
+  // PrpIdx not written by any handler.
+  disable;
+  PrpIdx := 0;
+  while PrpIdx < PRP_SZ do (
+    if *PrpList[PrpIdx] < MAX_CMDS
+    then (
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := *PrpList[PrpIdx];
+        EventHead := EventHead + 1
+      )
+      else unit
+    )
+    else (
+      // PrpList[PrpIdx] is the ABORT_CID sentinel — record as error
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := ABORT_CID;
+        EventHead := EventHead + 1
+      )
+      else unit;
+      ErrCount := ErrCount + 1
+    );
+    PrpIdx := PrpIdx + 1
+  );
+  PrpIdx := 0;
+  while PrpIdx < PRP_SZ do (
+    if *PrpList2[PrpIdx] < MAX_CMDS
+    then (
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := *PrpList2[PrpIdx];
+        EventHead := EventHead + 1
+      )
+      else unit
+    )
+    else (
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := ABORT_CID;
+        EventHead := EventHead + 1
+      )
+      else unit;
+      ErrCount := ErrCount + 1
+    );
+    PrpIdx := PrpIdx + 1
+  );
+  PrpIdx := 0;
+  *NvmeRegs[REG_ERRCNT] := ErrCount;
+  enable;
+
+  // ===== Phase 18: Statistics scan — TRUE NEGATIVE =====
+  // StatIdx is only written by main; no handler touches StatIdx or StatBuf.
+  // STAT_TOTAL (9) > MAX_CMDS (8): iteration at StatIdx=8 writes StatBuf[8],
+  // which is right OOB for a size-8 array.
+  // Expected: 0 warnings under -prov (non-handler-caused OOB is filtered out entirely).
+  StatIdx := 0;
+  while StatIdx < STAT_TOTAL do (
+    *StatBuf[StatIdx] := StatIdx;   // [TRUE-NEG] OOB at StatIdx=8; not handler-caused
+    StatIdx := StatIdx + 1
+  )
+}

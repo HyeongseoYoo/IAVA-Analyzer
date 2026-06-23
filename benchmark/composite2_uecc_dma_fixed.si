@@ -1,0 +1,965 @@
+// composite2_uecc_dma_fixed.si — UECC Error Detection + DMA PRP-List Processing Pipeline (FIXED)
+//
+// Models a realistic SSD firmware UECC error-recovery and DMA engine pipeline:
+//   ECC engine configuration, flash page read with syndrome check, DMA PRP-list
+//   construction and traversal, retry queue management, error log aggregation,
+//   link/channel state management, and power-state bookkeeping.
+//
+// Interrupt handlers:
+//   handler 0 — UECC_EVT      : ErrSlot := FATAL_SLOT  (direct scalar, Bug-1)
+//   handler 1 — DMA_TIMEOUT   : ErrRegs[REG_PNDPTR] := FATAL_SLOT  (Bug-2 via ErrCtrl alias)
+//   handler 2 — RETRY_EVT     : EccConf[REG_PNDPTR] := FATAL_SLOT via EccPtr  (Bug-3 via EccDesc chain)
+//
+// Fixed interrupt windows:
+//   Fix-1  *ErrTable[ErrSlot] guarded inside disable/enable
+//   Fix-2  ErrRegs[REG_PNDPTR] snapshotted into SafePend
+//   Fix-3  EccConf[REG_PNDPTR] snapshotted into SafePend2
+// True-negative:
+//   TN     line ~XXX  *RetryLog[RetryIdx]                  none       OOB [8,8]
+// Expected under -prov: 0 interrupt warnings
+
+init {
+  // === Buffer and table sizes ===
+  MAX_PAGES    := 8;
+  PEND_SZ      := 8;
+  RETRY_TOTAL  := 9;
+  ECC_SZ       := 4;
+  MAX_CHAN      := 4;
+  MAX_PLANE     := 4;
+  MAX_RETRY    := 4;
+  MAX_SYND     := 8;
+  MAX_DMA_DESC := 4;
+  MAX_LOG      := 16;
+  MAX_DATA     := 8;
+  MAX_LINK     := 4;
+  MAX_PWR      := 4;
+
+  // === OOB sentinel ===
+  FATAL_SLOT   := 200;
+
+  // === ErrRegs / EccConf field indices ===
+  REG_STATUS   := 0;
+  REG_PNDPTR   := 1;
+  REG_ERRCNT   := 2;
+  REG_RETRY    := 3;
+
+  // === DMA engine register field indices ===
+  DMA_CTRL     := 0;
+  DMA_STATUS   := 1;
+  DMA_SRCPTR   := 2;
+  DMA_DSTPTR   := 3;
+
+  // === Error and page state codes ===
+  ERR_NONE     := 0;
+  ERR_UECC     := 1;
+  ERR_TIMEOUT  := 2;
+  ERR_RETRY    := 3;
+  ERR_FATAL    := 4;
+  PAGE_FREE    := 0;
+  PAGE_READ    := 1;
+  PAGE_DONE    := 2;
+  PAGE_ERR     := 3;
+  PAGE_RETRY   := 4;
+
+  // === ECC syndrome codes ===
+  SYND_CLEAN   := 0;
+  SYND_SOFT    := 1;
+  SYND_HARD    := 2;
+  SYND_FATAL   := 3;
+
+  // === DMA transfer state ===
+  DMA_IDLE     := 0;
+  DMA_ACTIVE   := 1;
+  DMA_DONE     := 2;
+  DMA_ERROR    := 3;
+
+  // === Link state codes ===
+  LINK_DOWN    := 0;
+  LINK_UP      := 1;
+  LINK_RESET   := 2;
+  LINK_ERROR   := 3;
+
+  // === Power state ===
+  PWR_ACTIVE   := 0;
+  PWR_IDLE     := 1;
+  PWR_SLEEP    := 2;
+  PWR_OFF      := 3;
+
+  // === State variables ===
+  ErrSlot      := 0;
+  RetryIdx     := 0;
+  ErrCode      := 0;
+  ErrCount     := 0;
+  PageIdx      := 0;
+  ChanIdx      := 0;
+  PlaneIdx     := 0;
+  SyndIdx      := 0;
+  DmaIdx       := 0;
+  LogIdx       := 0;
+  RetryCount   := 0;
+  DonePages    := 0;
+  FatalCount   := 0;
+  SafeErrSlot  := 0;
+  SafePend     := 0;
+  SafePend2    := 0;
+  SyndCode     := 0;
+  DmaState     := 0;
+  LinkState    := 0;
+  PwrState     := 0;
+  EventHead    := 0;
+  RecIdx       := 0;
+  AbortSlot    := 0;
+
+  // === Arrays ===
+  ErrTable     := malloc(8, 0);
+  ErrRegs      := malloc(4, 0);
+  PendList     := malloc(8, 0);
+  EccConf      := malloc(4, 0);
+  EccDesc      := malloc(4, 0);
+  PendList2    := malloc(8, 0);
+  RetryLog     := malloc(8, 0);
+  SyndBuf      := malloc(8, 0);
+  ChanMap      := malloc(4, 0);
+  PlaneMap     := malloc(4, 0);
+  DmaDescBuf   := malloc(4, 0);
+  DataBuf      := malloc(8, 0);
+  EventLog     := malloc(16, 0);
+  PageState    := malloc(8, 0);
+  LinkTable    := malloc(4, 0);
+  PwrTable     := malloc(4, 0);
+
+  // === Initialize ErrRegs ===
+  *ErrRegs[REG_STATUS]  := ERR_NONE;
+  *ErrRegs[REG_PNDPTR]  := 0;
+  *ErrRegs[REG_ERRCNT]  := 0;
+  *ErrRegs[REG_RETRY]   := 0;
+
+  // === Initialize EccConf via EccDesc pointer table ===
+  *EccDesc[0]           := EccConf;
+  *EccConf[REG_PNDPTR]  := 0;
+
+  // === Initialize channel and plane maps ===
+  *ChanMap[0]  := LINK_UP;
+  *ChanMap[1]  := LINK_UP;
+  *ChanMap[2]  := LINK_UP;
+  *ChanMap[3]  := LINK_UP;
+  *PlaneMap[0] := PAGE_FREE;
+  *PlaneMap[1] := PAGE_FREE;
+  *PlaneMap[2] := PAGE_FREE;
+  *PlaneMap[3] := PAGE_FREE;
+
+  handler 0 {
+    // UECC_EVT: uncorrectable ECC error — corrupts ErrSlot (Bug-1 source)
+    ErrCode    := ERR_UECC;
+    ErrCount   := ErrCount + 1;
+    FatalCount := FatalCount + 1;
+    ErrSlot    := FATAL_SLOT;
+    *ErrRegs[REG_STATUS]  := ERR_UECC;
+    *ErrRegs[REG_ERRCNT]  := ErrCount
+  };
+
+  handler 1 {
+    // DMA_TIMEOUT: DMA engine stall — corrupts ErrRegs[REG_PNDPTR] (Bug-2 source)
+    ErrCount              := ErrCount + 1;
+    *ErrRegs[REG_PNDPTR]  := FATAL_SLOT;
+    *ErrRegs[REG_ERRCNT]  := ErrCount
+  };
+
+  handler 2 {
+    // RETRY_EVT: retry threshold exceeded — corrupts EccConf[REG_PNDPTR] via alias (Bug-3 source)
+    EccPtr              := EccConf;
+    *EccPtr[REG_PNDPTR] := FATAL_SLOT
+  }
+}
+
+main {
+  // ===== Alias setup =====
+  // ErrCtrl is a 1-depth alias of ErrRegs (Bug-2 access path).
+  ErrCtrl := ErrRegs;
+
+  // 3-level alias chain to EccConf (Bug-3 access path):
+  //   level 1: EngSys aliases EccDesc (var alias)
+  //   level 2: EngPtr := *EngSys[0] loads EccConf pointer from heap
+  //   level 3: *EngPtr[REG_PNDPTR] reads EccConf[REG_PNDPTR]
+  EngSys := EccDesc;
+  EngPtr := *EngSys[0];
+
+  // ===== Phase 0: ECC engine initialisation =====
+  // Configure syndrome table, reset error counters, verify channel readiness.
+  // All operations guarded — no spurious OOBs from handler 0.
+  disable;
+  SyndIdx := 0;
+  while SyndIdx < MAX_SYND do (
+    *SyndBuf[SyndIdx] := SYND_CLEAN;
+    SyndIdx := SyndIdx + 1
+  );
+  SyndIdx := 0;
+  ErrCount   := 0;
+  FatalCount := 0;
+  RetryCount := 0;
+  DonePages  := 0;
+  *ErrRegs[REG_STATUS] := ERR_NONE;
+  *ErrRegs[REG_ERRCNT] := 0;
+  *ErrRegs[REG_RETRY]  := 0;
+  // Record initialisation event
+  *EventLog[0] := ERR_NONE;
+  *EventLog[1] := MAX_PAGES;
+  *EventLog[2] := MAX_RETRY;
+  EventHead    := 3;
+  enable;
+
+  // ===== Phase 1: Channel and plane preflight =====
+  // Verify that each flash channel is LINK_UP and each plane is PAGE_FREE.
+  // Record any faults in EventLog.  ChanIdx and PlaneIdx not written by handlers.
+  disable;
+  ChanIdx := 0;
+  while ChanIdx < MAX_CHAN do (
+    LinkState := *ChanMap[ChanIdx];
+    if LinkState = LINK_UP
+    then (
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := ChanIdx;
+        EventHead := EventHead + 1
+      )
+      else unit
+    )
+    else (
+      // Channel fault — mark as LINK_RESET
+      *ChanMap[ChanIdx] := LINK_RESET;
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := LINK_RESET;
+        EventHead := EventHead + 1
+      )
+      else unit
+    );
+    ChanIdx := ChanIdx + 1
+  );
+  ChanIdx  := 0;
+  PlaneIdx := 0;
+  while PlaneIdx < MAX_PLANE do (
+    if *PlaneMap[PlaneIdx] = PAGE_FREE
+    then unit
+    else *PlaneMap[PlaneIdx] := PAGE_FREE;
+    PlaneIdx := PlaneIdx + 1
+  );
+  PlaneIdx := 0;
+  enable;
+
+  // ===== Phase 2: Page state and error table initialisation =====
+  // Zero every page-state entry and error-table entry for a clean run.
+  // PageIdx not written by any handler.
+  disable;
+  PageIdx := 0;
+  while PageIdx < MAX_PAGES do (
+    *PageState[PageIdx] := PAGE_FREE;
+    *ErrTable[PageIdx]  := ERR_NONE;
+    *DataBuf[PageIdx]   := 0;
+    PageIdx := PageIdx + 1
+  );
+  PageIdx := 0;
+  *ErrRegs[REG_STATUS] := ERR_NONE;
+  enable;
+
+  // ===== Phase 3: DMA descriptor table construction =====
+  // Build a PRP-style DMA descriptor list pointing each descriptor slot at
+  // its corresponding DataBuf page.  DmaIdx not written by any handler.
+  disable;
+  DmaIdx := 0;
+  while DmaIdx < MAX_DMA_DESC do (
+    // Each descriptor records the DataBuf offset for this channel
+    *DmaDescBuf[DmaIdx] := DmaIdx * 2;
+    // Write DMA source pointer into EccConf config slots
+    // DmaIdx in [0,3], EccConf has 4 entries: safe
+    *EccConf[DmaIdx] := DmaIdx;
+    DmaIdx := DmaIdx + 1
+  );
+  DmaIdx := 0;
+  // Reset the pending-pointer register now that descriptors are built
+  *ErrRegs[REG_PNDPTR]  := 0;
+  *EccConf[REG_PNDPTR]  := 0;
+  DmaState := DMA_IDLE;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DMA_IDLE;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 4: Flash page read-request construction =====
+  // Issue read requests using three independent loops — one per structure.
+  // Each index is bounded by its own while-condition; no modular counter is
+  // needed, and the abstract widening stays non-negative throughout.
+  // PageIdx, ChanIdx, PlaneIdx are not written by any handler.
+  disable;
+  PageIdx := 0;
+  while PageIdx < MAX_PAGES do (
+    *PageState[PageIdx] := PAGE_READ;
+    PageIdx := PageIdx + 1
+  );
+  PageIdx := 0;
+  ChanIdx := 0;
+  while ChanIdx < MAX_CHAN do (
+    *ChanMap[ChanIdx] := PAGE_READ;
+    ChanIdx := ChanIdx + 1
+  );
+  ChanIdx := 0;
+  PlaneIdx := 0;
+  while PlaneIdx < MAX_PLANE do (
+    *PlaneMap[PlaneIdx] := PAGE_READ;
+    PlaneIdx := PlaneIdx + 1
+  );
+  PlaneIdx := 0;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := PAGE_READ;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 5: UECC correction loop =====
+  // Interrupts are enabled between protected regions. The former interrupt
+  // windows are fixed by guarding ErrSlot and snapshotting heap indices before
+  // using them as array offsets.
+  ErrSlot    := 0;
+  RetryCount := 0;
+  FatalCount := 0;
+  DonePages  := 0;
+
+  while ErrSlot < MAX_PAGES do (
+
+    // [FIX-1] Re-check ErrSlot and write ErrTable inside the same critical section.
+    // Handler 0 cannot corrupt ErrSlot between the guard and the array access.
+    disable;
+    if ErrSlot < MAX_PAGES
+    then *ErrTable[ErrSlot] := ErrCode
+    else unit;
+    SafeErrSlot := ErrSlot;
+    enable;
+
+    // All per-page processing uses SafeErrSlot.  No handler writes SafeErrSlot,
+    // so the if-check below is stable across every yield point inside.
+    if SafeErrSlot < MAX_PAGES
+    then (
+
+      // Read syndrome for this page
+      SyndCode := *SyndBuf[SafeErrSlot];
+
+      // === CLEAN page ===
+      if SyndCode = SYND_CLEAN
+      then (
+        *PageState[SafeErrSlot] := PAGE_DONE;
+        *DataBuf[SafeErrSlot]   := PAGE_DONE;
+        *ErrTable[SafeErrSlot]  := ERR_NONE;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := SafeErrSlot;
+          EventHead := EventHead + 1
+        )
+        else unit;
+        DonePages := DonePages + 1
+      )
+
+      else (
+      // === SOFT error (correctable) ===
+      if SyndCode = SYND_SOFT
+      then (
+        *SyndBuf[SafeErrSlot]   := SYND_CLEAN;
+        *PageState[SafeErrSlot] := PAGE_DONE;
+        *ErrTable[SafeErrSlot]  := ERR_NONE;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := ERR_UECC;
+          EventHead := EventHead + 1
+        )
+        else unit;
+        DonePages := DonePages + 1
+      )
+
+      else (
+      // === HARD error (retry candidate) ===
+      if SyndCode = SYND_HARD
+      then (
+        *PageState[SafeErrSlot] := PAGE_RETRY;
+        *ErrTable[SafeErrSlot]  := ERR_RETRY;
+        if RetryCount < MAX_RETRY
+        then (
+          *RetryLog[RetryCount] := SafeErrSlot;
+          RetryCount := RetryCount + 1
+        )
+        else unit;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := ERR_RETRY;
+          EventHead := EventHead + 1
+        )
+        else unit
+      )
+
+      else (
+      // === FATAL error ===
+        *PageState[SafeErrSlot] := PAGE_ERR;
+        *ErrTable[SafeErrSlot]  := ERR_FATAL;
+        FatalCount := FatalCount + 1;
+        if SafeErrSlot < MAX_CHAN
+        then *ChanMap[SafeErrSlot] := LINK_ERROR
+        else unit;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := ERR_FATAL;
+          EventHead := EventHead + 1
+        )
+        else unit
+      ))))
+    else unit;
+
+    // [FIX-2] Snapshot the pending pointer before checking and indexing PendList.
+    disable;
+    SafePend := *ErrCtrl[REG_PNDPTR];
+    enable;
+    if SafePend < PEND_SZ
+    then *PendList[SafePend] := ErrSlot
+    else *PendList[0] := ErrSlot;
+
+    // [FIX-3] Snapshot through the descriptor-table alias before indexing PendList2.
+    disable;
+    SafePend2 := *EngPtr[REG_PNDPTR];
+    enable;
+    if SafePend2 < PEND_SZ
+    then *PendList2[SafePend2] := ErrSlot
+    else unit;
+
+    ErrSlot := ErrSlot + 1
+  );
+
+  // ===== Phase 6: DMA PRP-list traversal =====
+  // Walk each DMA descriptor, perform the transfer (DataBuf ← LBA map value),
+  // and update the DMA engine status register.
+  // DmaIdx not written by any handler.
+  disable;
+  DmaIdx   := 0;
+  DmaState := DMA_ACTIVE;
+  while DmaIdx < MAX_DMA_DESC do (
+    // Capture the descriptor offset into DmaPage before the bounds check.
+    // DmaPage is a plain variable; no handler writes it, so the if-check
+    // narrowing is stable and *DataBuf[DmaPage] is provably in [0,7].
+    DmaPage := *DmaDescBuf[DmaIdx];
+    if DmaPage < MAX_DATA
+    then *DataBuf[DmaPage] := DmaIdx
+    else unit;
+    // Update EccConf[DmaIdx] to reflect transfer completion
+    // DmaIdx in [0,3], EccConf has 4 entries: safe
+    *EccConf[DmaIdx] := DMA_DONE;
+    DmaIdx := DmaIdx + 1
+  );
+  DmaIdx   := 0;
+  DmaState := DMA_DONE;
+  *ErrRegs[REG_STATUS] := DMA_DONE;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DMA_DONE;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 7: Retry queue processing =====
+  // Re-read pages that were flagged PAGE_RETRY in Phase 5.
+  // RetryIdx not written by any handler.
+  disable;
+  RetryIdx := 0;
+  while RetryIdx < RetryCount do (
+    if RetryIdx < MAX_RETRY
+    then (
+      AbortSlot := *RetryLog[RetryIdx];
+      if AbortSlot < MAX_PAGES
+      then (
+        // Attempt re-correction: promote SYND_HARD -> SYND_SOFT
+        if *SyndBuf[AbortSlot] = SYND_HARD
+        then *SyndBuf[AbortSlot] := SYND_SOFT
+        else unit;
+        *PageState[AbortSlot] := PAGE_DONE;
+        *ErrTable[AbortSlot]  := ERR_NONE;
+        DonePages := DonePages + 1
+      )
+      else unit
+    )
+    else unit;
+    RetryIdx := RetryIdx + 1
+  );
+  RetryIdx := 0;
+  *ErrRegs[REG_RETRY] := RetryCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := RetryCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 8: Channel state recovery =====
+  // Walk ChanMap and reset any channels still in LINK_ERROR or LINK_RESET
+  // back to LINK_UP so the engine is ready for the next read round.
+  // ChanIdx not written by any handler.
+  disable;
+  ChanIdx := 0;
+  while ChanIdx < MAX_CHAN do (
+    LinkState := *ChanMap[ChanIdx];
+    if LinkState = LINK_ERROR
+    then (
+      *ChanMap[ChanIdx] := LINK_RESET;
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := LINK_RESET;
+        EventHead := EventHead + 1
+      )
+      else unit
+    )
+    else (
+      if LinkState = LINK_RESET
+      then (
+        *ChanMap[ChanIdx] := LINK_UP;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := LINK_UP;
+          EventHead := EventHead + 1
+        )
+        else unit
+      )
+      else unit
+    );
+    ChanIdx := ChanIdx + 1
+  );
+  ChanIdx := 0;
+  enable;
+
+  // ===== Phase 9: Power state management =====
+  // Transition power states based on DonePages and FatalCount.
+  // PwrTable records the power state per channel (0..3).
+  // PlaneIdx not written by any handler.
+  disable;
+  PlaneIdx := 0;
+  while PlaneIdx < MAX_PWR do (
+    if FatalCount > 0
+    then *PwrTable[PlaneIdx] := PWR_IDLE
+    else (
+      if DonePages < MAX_PAGES
+      then *PwrTable[PlaneIdx] := PWR_ACTIVE
+      else *PwrTable[PlaneIdx] := PWR_IDLE
+    );
+    PlaneIdx := PlaneIdx + 1
+  );
+  PlaneIdx := 0;
+  PwrState := PWR_ACTIVE;
+  if FatalCount > 0
+  then (
+    PwrState := PWR_IDLE;
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := PWR_IDLE;
+      EventHead := EventHead + 1
+    )
+    else unit
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 10: Syndrome table re-scan and ErrTable finalization =====
+  // Second pass over SyndBuf: promote any remaining SYND_SOFT to SYND_CLEAN,
+  // and finalize PageState to PAGE_DONE for successfully corrected pages.
+  // SyndIdx not written by any handler.
+  disable;
+  SyndIdx := 0;
+  while SyndIdx < MAX_SYND do (
+    if *SyndBuf[SyndIdx] = SYND_SOFT
+    then (
+      *SyndBuf[SyndIdx]   := SYND_CLEAN;
+      *PageState[SyndIdx] := PAGE_DONE;
+      *ErrTable[SyndIdx]  := ERR_NONE;
+      DonePages := DonePages + 1
+    )
+    else (
+      if *SyndBuf[SyndIdx] = SYND_HARD
+      then (
+        *SyndBuf[SyndIdx]   := SYND_FATAL;
+        *PageState[SyndIdx] := PAGE_ERR;
+        *ErrTable[SyndIdx]  := ERR_FATAL;
+        FatalCount := FatalCount + 1
+      )
+      else unit
+    );
+    SyndIdx := SyndIdx + 1
+  );
+  SyndIdx := 0;
+  enable;
+
+  // ===== Phase 11: Error log aggregation =====
+  // Scan EventLog and count valid (non-zero) events; write summary stats
+  // into ErrRegs and DataBuf.  LogIdx not written by any handler.
+  disable;
+  LogIdx    := 0;
+  ErrCount  := 0;
+  while LogIdx < MAX_LOG do (
+    if *EventLog[LogIdx] > 0
+    then ErrCount := ErrCount + 1
+    else unit;
+    LogIdx := LogIdx + 1
+  );
+  LogIdx := 0;
+  *ErrRegs[REG_ERRCNT] := ErrCount;
+  *ErrRegs[REG_STATUS] := ErrCode;
+  // Aggregate stats into DataBuf[4..7]
+  *DataBuf[4] := ErrCount;
+  *DataBuf[5] := DonePages;
+  *DataBuf[6] := FatalCount;
+  *DataBuf[7] := RetryCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := ErrCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DonePages;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := FatalCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 12: Link table snapshot and soft-reset =====
+  // Copy final channel link states into LinkTable for the host-side status page.
+  // Reset DMA engine to DMA_IDLE for the next operation.
+  // ChanIdx not written by any handler.
+  disable;
+  ChanIdx := 0;
+  while ChanIdx < MAX_LINK do (
+    *LinkTable[ChanIdx] := *ChanMap[ChanIdx];
+    ChanIdx := ChanIdx + 1
+  );
+  ChanIdx  := 0;
+  DmaState := DMA_IDLE;
+  *ErrRegs[REG_STATUS] := ERR_NONE;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DMA_IDLE;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 13: Per-page state reconciliation =====
+  // Walk PageState and ErrTable together.  For pages still in PAGE_RETRY,
+  // mark them PAGE_ERR; for PAGE_READ still pending, mark PAGE_FREE.
+  // RecIdx not written by any handler.
+  disable;
+  RecIdx := 0;
+  while RecIdx < MAX_PAGES do (
+    if *PageState[RecIdx] = PAGE_RETRY
+    then (
+      *PageState[RecIdx] := PAGE_ERR;
+      *ErrTable[RecIdx]  := ERR_FATAL;
+      FatalCount := FatalCount + 1
+    )
+    else (
+      if *PageState[RecIdx] = PAGE_READ
+      then (
+        *PageState[RecIdx] := PAGE_FREE;
+        *ErrTable[RecIdx]  := ERR_NONE
+      )
+      else unit
+    );
+    RecIdx := RecIdx + 1
+  );
+  RecIdx := 0;
+  // Final ErrRegs status snapshot
+  *ErrRegs[REG_STATUS]  := ErrCode;
+  *ErrRegs[REG_ERRCNT]  := ErrCount;
+  *ErrRegs[REG_RETRY]   := RetryCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := RetryCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := FatalCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 14: Channel utilization accounting =====
+  // Walk ChanMap and compute how many channels are LINK_UP vs LINK_ERROR.
+  // Store per-channel status summary in DataBuf[0..3].
+  // ChanIdx not written by any handler; all accesses bounded.
+  disable;
+  ChanIdx := 0;
+  while ChanIdx < MAX_CHAN do (
+    LinkState := *ChanMap[ChanIdx];
+    if LinkState = LINK_UP
+    then (
+      *DataBuf[ChanIdx] := LINK_UP;
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := LINK_UP;
+        EventHead := EventHead + 1
+      )
+      else unit
+    )
+    else (
+      if LinkState = LINK_ERROR
+      then (
+        *DataBuf[ChanIdx] := LINK_ERROR;
+        ErrCount := ErrCount + 1;
+        if EventHead < MAX_LOG
+        then (
+          *EventLog[EventHead] := LINK_ERROR;
+          EventHead := EventHead + 1
+        )
+        else unit
+      )
+      else (
+        *DataBuf[ChanIdx] := LinkState
+      )
+    );
+    ChanIdx := ChanIdx + 1
+  );
+  ChanIdx := 0;
+  *ErrRegs[REG_ERRCNT] := ErrCount;
+  enable;
+
+  // ===== Phase 15: Plane state finalization =====
+  // Sweep PlaneMap: any plane still in PAGE_READ or PAGE_RETRY was not
+  // completed.  Mark it PAGE_ERR and record in the error table.
+  // PlaneIdx not written by any handler.
+  disable;
+  PlaneIdx := 0;
+  while PlaneIdx < MAX_PLANE do (
+    if *PlaneMap[PlaneIdx] = PAGE_READ
+    then (
+      *PlaneMap[PlaneIdx] := PAGE_ERR;
+      if PlaneIdx < MAX_PAGES
+      then *ErrTable[PlaneIdx] := ERR_FATAL
+      else unit;
+      FatalCount := FatalCount + 1
+    )
+    else (
+      if *PlaneMap[PlaneIdx] = PAGE_RETRY
+      then (
+        *PlaneMap[PlaneIdx] := PAGE_ERR;
+        if PlaneIdx < MAX_PAGES
+        then *ErrTable[PlaneIdx] := ERR_RETRY
+        else unit;
+        RetryCount := RetryCount + 1
+      )
+      else unit
+    );
+    PlaneIdx := PlaneIdx + 1
+  );
+  PlaneIdx := 0;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := FatalCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := RetryCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 16: ECC syndrome histogram =====
+  // Compute counts of each syndrome code across SyndBuf.
+  // Store: DataBuf[0]=CLEAN count, [1]=SOFT, [2]=HARD, [3]=FATAL.
+  // SyndIdx not written by any handler.
+  disable;
+  SyndIdx := 0;
+  *DataBuf[0] := 0;
+  *DataBuf[1] := 0;
+  *DataBuf[2] := 0;
+  *DataBuf[3] := 0;
+  while SyndIdx < MAX_SYND do (
+    SyndCode := *SyndBuf[SyndIdx];
+    if SyndCode = SYND_CLEAN
+    then *DataBuf[0] := *DataBuf[0] + 1
+    else (
+      if SyndCode = SYND_SOFT
+      then *DataBuf[1] := *DataBuf[1] + 1
+      else (
+        if SyndCode = SYND_HARD
+        then *DataBuf[2] := *DataBuf[2] + 1
+        else *DataBuf[3] := *DataBuf[3] + 1
+      )
+    );
+    SyndIdx := SyndIdx + 1
+  );
+  SyndIdx := 0;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := *DataBuf[0];
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := *DataBuf[3];
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 17: DMA descriptor teardown =====
+  // Clear DmaDescBuf and EccConf, reset DMA state to DMA_IDLE.
+  // All indices are bounded by their while conditions inside disable.
+  disable;
+  DmaIdx := 0;
+  while DmaIdx < MAX_DMA_DESC do (
+    *DmaDescBuf[DmaIdx] := 0;
+    *EccConf[DmaIdx]    := 0;
+    DmaIdx := DmaIdx + 1
+  );
+  DmaIdx   := 0;
+  DmaState := DMA_IDLE;
+  *ErrRegs[REG_STATUS] := ERR_NONE;
+  *EccConf[REG_PNDPTR] := 0;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DMA_IDLE;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 18: Error budget threshold check =====
+  // Compare FatalCount and RetryCount against budgets stored in DataBuf.
+  // If FatalCount exceeds FATAL_SLOT / MAX_PAGES we record a critical flag.
+  // No array access in the comparison branches — pure scalar arithmetic.
+  disable;
+  if FatalCount > 0
+  then (
+    *ErrRegs[REG_STATUS] := ERR_FATAL;
+    if EventHead < MAX_LOG
+    then (
+      *EventLog[EventHead] := ERR_FATAL;
+      EventHead := EventHead + 1
+    )
+    else unit;
+    PwrState := PWR_IDLE
+  )
+  else (
+    if RetryCount > 0
+    then (
+      *ErrRegs[REG_STATUS] := ERR_RETRY;
+      PwrState := PWR_ACTIVE
+    )
+    else (
+      *ErrRegs[REG_STATUS] := ERR_NONE;
+      PwrState := PWR_ACTIVE
+    )
+  );
+  // Final ErrRegs snapshot
+  *ErrRegs[REG_ERRCNT] := ErrCount;
+  *ErrRegs[REG_RETRY]  := RetryCount;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := ErrCount;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := DonePages;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 19: ECC engine re-arm and pending-list reset =====
+  // Prepare the ECC engine for the next read batch: re-initialize syndrome
+  // tables, clear PendList and PendList2, restore ErrRegs to nominal state,
+  // and re-enable all channels that recovered to LINK_UP.
+  // SyndIdx, ChanIdx not written by any handler.
+  disable;
+  SyndIdx := 0;
+  while SyndIdx < MAX_SYND do (
+    *SyndBuf[SyndIdx] := SYND_CLEAN;
+    SyndIdx := SyndIdx + 1
+  );
+  SyndIdx := 0;
+  // Clear pending lists for the next operation round
+  DmaIdx := 0;
+  while DmaIdx < MAX_DMA_DESC do (
+    if DmaIdx < PEND_SZ
+    then (
+      *PendList[DmaIdx]  := ERR_NONE;
+      *PendList2[DmaIdx] := ERR_NONE
+    )
+    else unit;
+    DmaIdx := DmaIdx + 1
+  );
+  DmaIdx := 0;
+  // Re-enable channels that are LINK_UP
+  ChanIdx := 0;
+  while ChanIdx < MAX_CHAN do (
+    if *ChanMap[ChanIdx] = LINK_UP
+    then (
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := LINK_UP;
+        EventHead := EventHead + 1
+      )
+      else unit
+    )
+    else (
+      *ChanMap[ChanIdx] := LINK_RESET;
+      if EventHead < MAX_LOG
+      then (
+        *EventLog[EventHead] := LINK_RESET;
+        EventHead := EventHead + 1
+      )
+      else unit
+    );
+    ChanIdx := ChanIdx + 1
+  );
+  ChanIdx := 0;
+  *ErrRegs[REG_STATUS]  := ERR_NONE;
+  *ErrRegs[REG_PNDPTR]  := 0;
+  *EccConf[REG_PNDPTR]  := 0;
+  ErrSlot    := 0;
+  RetryIdx   := 0;
+  DonePages  := 0;
+  RetryCount := 0;
+  FatalCount := 0;
+  if EventHead < MAX_LOG
+  then (
+    *EventLog[EventHead] := ERR_NONE;
+    EventHead := EventHead + 1
+  )
+  else unit;
+  enable;
+
+  // ===== Phase 20: Statistics scan — TRUE NEGATIVE =====
+  // RetryIdx is only written by main (reset to 0 above); no handler touches RetryIdx or RetryLog.
+  // RETRY_TOTAL (9) > MAX_PAGES (8): iteration at RetryIdx=8 writes RetryLog[8],
+  // which is right OOB for a size-8 array.
+  // Expected: 0 warnings under -prov (non-handler-caused OOB is filtered out entirely).
+  RetryIdx := 0;
+  while RetryIdx < RETRY_TOTAL do (
+    *RetryLog[RetryIdx] := RetryIdx;   // [TRUE-NEG] OOB at RetryIdx=8; not handler-caused
+    RetryIdx := RetryIdx + 1
+  )
+}

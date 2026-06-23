@@ -54,13 +54,18 @@ _ORDER = [
     "micro3_aliasmulti_buggy",
     "micro3_aliasmulti_fixed",
     "micro4_nonhandler_oob",
-    "composite1",
-    "composite2",
+    "composite1_nvme_sqcq",
+    "composite1_nvme_sqcq_fixed",
+    "composite2_uecc_dma",
+    "composite2_uecc_dma_fixed",
 ]
 
 
 def _rank(path: Path) -> int:
     name = path.stem
+    for i, prefix in enumerate(_ORDER):
+        if name == prefix:
+            return i
     for i, prefix in enumerate(_ORDER):
         if name.startswith(prefix):
             return i

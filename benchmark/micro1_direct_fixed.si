@@ -1,7 +1,8 @@
 // micro1_direct_fixed.si — Pattern 1: direct shared scalar variable (FIXED)
-// Fix: disable before the if-check; no handler can fire in the window.
+// Fix: disable before the bounds check; no handler can fire in the window.
 // Expected: 0 interrupt warnings
-// Safe because: SlotIdx narrowed inside critical section, SqBuf[SlotIdx] in [0,7]
+// Safe because: SlotIdx is checked for both lower and upper bounds inside
+// the critical section, so SqBuf[SlotIdx] is in [0,7]
 //
 init {
   // === Array sizes ===
@@ -12,6 +13,7 @@ init {
 
   // === OOB sentinel ===
   ABORT_SLOT := 255;
+  LEFT_ABORT_SLOT := -1;
 
   // === Register field indices ===
   REG_STATUS := 0;
@@ -47,7 +49,7 @@ init {
     // NVME_ERR_EVT: corrupts SlotIdx (direct scalar) — bug source for micro1
     ErrCode  := ERR_INVAL;
     ErrCount := ErrCount + 1;
-    SlotIdx  := ABORT_SLOT
+    SlotIdx  := LEFT_ABORT_SLOT
   };
 
   handler 1 {
@@ -65,11 +67,15 @@ init {
 
 main {
   SlotIdx := 0;
-  // [FIX-1] Disable interrupts so no handler can fire between the if-check
-  // and the SqBuf access; SlotIdx stays in [0, MAX_SLOTS-1].
+  // [FIX-1] Disable interrupts so no handler can fire between the bounds
+  // checks and the SqBuf access; SlotIdx stays in [0, MAX_SLOTS-1].
   disable;
   if SlotIdx < MAX_SLOTS
-  then *SqBuf[SlotIdx] := ERR_NONE
+  then (
+    if LEFT_ABORT_SLOT < SlotIdx
+    then *SqBuf[SlotIdx] := ERR_NONE
+    else unit
+  )
   else unit;
   enable
 }
