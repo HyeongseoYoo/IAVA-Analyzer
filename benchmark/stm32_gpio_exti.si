@@ -1,0 +1,41 @@
+// stm32_gpio_exti.si — STM32CubeF0 GPIO/GPIO_EXTI model for STM32F072B-Discovery
+// Derived from GPIO_EXTI/Src/main.c, stm32f0xx_it.c, system_stm32f0xx.c, and
+// the STM32F072B-Discovery BSP LED/button helpers.
+// Modeled: EXTI0_1_IRQHandler -> HAL_GPIO_EXTI_IRQHandler(USER_BUTTON_PIN)
+// -> HAL_GPIO_EXTI_Callback(GPIO_PIN_0), toggling LED3.
+// Omitted: clock tree setup, GPIO mode registers, NVIC priority, SysTick, and
+// assert/error loops; none feeds an array index or main/ISR shared data path.
+// Expected -prov: 0 warnings, true negative.
+//
+init {
+  // === BSP constants actually used by the example ===
+  GPIO_PIN_0 := 0;
+  USER_BUTTON_PIN := GPIO_PIN_0;
+  LED3 := 0;
+
+  // === Modeled board state ===
+  LED3_State := 0;
+  ExtiLine0_Configured := 1;
+  GpioCallback_Pin := USER_BUTTON_PIN;
+
+  handler 0 {
+    // EXTI0_1_IRQHandler -> HAL_GPIO_EXTI_IRQHandler(USER_BUTTON_PIN)
+    // -> HAL_GPIO_EXTI_Callback(GPIO_PIN_0) -> BSP_LED_Toggle(LED3)
+    if ExtiLine0_Configured = 1
+    then (
+      GpioCallback_Pin := USER_BUTTON_PIN;
+      if GpioCallback_Pin = GPIO_PIN_0
+      then LED3_State := 1 - LED3_State
+      else unit
+    )
+    else unit
+  }
+}
+
+main {
+  // HAL_Init, BSP_LED_Init(LED3), SystemClock_Config, and GPIO/NVIC setup
+  // are already reflected in init.  The real main loop is empty.
+  while 1 do (
+    unit
+  )
+}

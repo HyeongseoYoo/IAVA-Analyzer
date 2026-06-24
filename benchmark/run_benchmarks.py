@@ -10,28 +10,34 @@ Usage (from project root):
     python3 benchmark/run_benchmarks.py --csv      # CSV
     python3 benchmark/run_benchmarks.py --all      # all three formats at once
 
-    python3 benchmark/run_benchmarks.py --optoff           # side-by-side opt vs no-opt
-    python3 benchmark/run_benchmarks.py --optoff --latex   # same, LaTeX output
+    python3 benchmark/run_benchmarks.py --optoff             # opt vs both optimizations off
+    python3 benchmark/run_benchmarks.py --selectoff          # opt vs selective application off
+    python3 benchmark/run_benchmarks.py --compileoff         # opt vs compiled fixpoint off
+    python3 benchmark/run_benchmarks.py --compare-all --md   # opt vs all three off modes
 
 Options:
     --md        GitHub-Flavored Markdown table
     --latex     LaTeX tabular (requires booktabs)
     --csv       CSV with header row
     --all       print ASCII + Markdown + LaTeX together
-    --optoff    also run each benchmark with -optoff and append result columns
-                (Warnings, Left OOB, Right OOB, Time) for the no-opt run plus
-                a Speedup column — lets you compare correctness and performance
+    --optoff     also run each benchmark with -optoff: both handler optimizations off
+    --selectoff  also run each benchmark with -selectoff: selective yield-point
+                 application off, compiled handler fixpoint still on
+    --compileoff also run each benchmark with -compileoff: compiled handler fixpoint
+                 off, selective yield-point application still on
+    --compare-all enables --optoff, --selectoff, and --compileoff
     --dir DIR   benchmark directory  [default: benchmark/]
     --bin PATH  analyzer binary      [default: ./_build/default/bin/main.exe]
 
 Notes:
-  * The analyzer is run with the -prov flag, which reports only
-    interrupt-caused out-of-bounds accesses.
+  * The analyzer is run with the -prov flag. The Candidates column counts OOB
+    candidates after the trace merge step; Warnings counts the interrupt-caused
+    candidates retained by provenance tracing.
   * micro4_nonhandler_oob and the composite true-negative scans are
     intentionally non-handler-caused; they will show 0 interrupt warnings,
     which is the correct (passing) result.
   * Analysis of composite files can take ~30-40 seconds each.
-  * --optoff doubles the number of runs; composite files take ~30-40 s each pass.
+  * Each comparison mode adds one analyzer run per benchmark.
 """
 
 import argparse
@@ -76,33 +82,57 @@ def _rank(path: Path) -> int:
 # Each schema is (headers, row-keys, alignments).  "l" = left, "r" = right.
 
 _SCHEMA_BASE = (
-    ["Benchmark",  "LOC", "Warnings", "Caused by", "Left OOB",  "Right OOB",  "Time (s)"],
-    ["name",       "loc", "bugs",     "handlers",  "left_oob",  "right_oob",  "time"],
-    ["l",          "r",   "r",        "l",         "l",         "l",          "r"],
+    ["Benchmark",  "LOC", "Candidates", "Warnings", "Caused by", "Left OOB",  "Right OOB",  "Time (s)"],
+    ["name",       "loc", "candidates", "bugs",     "handlers",  "left_oob",  "right_oob",  "time"],
+    ["l",          "r",   "r",          "r",        "l",         "l",         "l",          "r"],
 )
 
-_SCHEMA_OPTOFF = (
-    # opt columns                                                   no-opt columns            compare
-    ["Benchmark",  "LOC",
-     "Warnings",   "Caused by",  "Left OOB",  "Right OOB",  "Time (s)",
-     "Warnings*",  "Left OOB*",  "Right OOB*", "Time* (s)",  "Speedup"],
-    ["name",       "loc",
-     "bugs",       "handlers",   "left_oob",  "right_oob",  "time",
-     "bugs2",      "left_oob2",  "right_oob2", "time2",      "speedup"],
-    ["l",          "r",
-     "r",          "l",          "l",         "l",          "r",
-     "r",          "l",          "l",          "r",          "r"],
-)
-# * columns come from the -optoff (no-opt) run
+COMPARE_MODES = {
+    "optoff": {
+        "label": "NoOpt",
+        "flag": "-optoff",
+        "description": "selective application off + compiled fixpoint off",
+    },
+    "selectoff": {
+        "label": "SelOff",
+        "flag": "-selectoff",
+        "description": "selective yield-point application off",
+    },
+    "compileoff": {
+        "label": "CompOff",
+        "flag": "-compileoff",
+        "description": "compiled handler fixpoint off",
+    },
+}
+
+
+def build_schema(compare_modes: list[str]) -> tuple:
+    headers, keys, aligns = (list(x) for x in _SCHEMA_BASE)
+    for mode in compare_modes:
+        label = COMPARE_MODES[mode]["label"]
+        headers.extend([
+            f"C {label}",
+            f"W {label}",
+            f"T {label}",
+            f"Spd {label}",
+        ])
+        keys.extend([
+            f"candidates_{mode}",
+            f"bugs_{mode}",
+            f"time_{mode}",
+            f"speedup_{mode}",
+        ])
+        aligns.extend(["r", "r", "r", "r"])
+    return headers, keys, aligns
 
 
 # ── running + parsing ──────────────────────────────────────────────────────────
 
-def run_analyzer(binary: str, bench_path: Path, optoff: bool = False) -> tuple[str, str]:
-    """Return (stdout, stderr) from `binary -prov [-optoff] bench_path`."""
+def run_analyzer(binary: str, bench_path: Path, extra_flag: str | None = None) -> tuple[str, str]:
+    """Return (stdout, stderr) from `binary -prov [extra_flag] bench_path`."""
     cmd = [binary, "-prov"]
-    if optoff:
-        cmd.append("-optoff")
+    if extra_flag:
+        cmd.append(extra_flag)
     cmd.append(str(bench_path))
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout, result.stderr
@@ -112,6 +142,7 @@ def parse_output(stdout: str, stderr: str) -> dict:
     """
     Returns:
       bugs       int        — interrupt-caused bugs found
+      candidates int        — OOB candidates after trace merge
       handlers   list[int]  — handler ids that caused a bug (deduplicated)
       left_oobs  list[str]  — left-OOB range per bug  (e.g. "⟂", "[-∞,-1]")
       right_oobs list[str]  — right-OOB range per bug (e.g. "[8,255]", "⟂")
@@ -120,6 +151,7 @@ def parse_output(stdout: str, stderr: str) -> dict:
     """
     m = re.search(r"Trace Warning Report: (\d+) warnings?", stdout)
     bugs = int(m.group(1)) if m else 0
+    candidates = 0
 
     handlers, left_oobs, right_oobs = [], [], []
     for block in re.split(r"--- Warning #\d+ ---", stdout)[1:]:
@@ -135,6 +167,8 @@ def parse_output(stdout: str, stderr: str) -> dict:
 
     abs_time = trace_time = 0.0
     for line in stderr.splitlines():
+        if m2 := re.search(r"\[count\] oob_candidates:\s*(\d+)", line):
+            candidates = int(m2.group(1))
         if m2 := re.search(r"\[time\] abs_analyze\s*:\s*([\d.]+)s", line):
             abs_time = float(m2.group(1))
         if m2 := re.search(r"\[time\] trace_analyze\s*:\s*([\d.]+)s", line):
@@ -142,6 +176,7 @@ def parse_output(stdout: str, stderr: str) -> dict:
 
     return {
         "bugs":      bugs,
+        "candidates": candidates,
         "handlers":  sorted(set(handlers)),
         "left_oobs": left_oobs,
         "right_oobs": right_oobs,
@@ -176,19 +211,19 @@ def _fmt_speedup(t_opt: float, t_noopt: float) -> str:
 
 # ── data collection ────────────────────────────────────────────────────────────
 
-def collect_rows(binary: str, bench_dir: str, with_optoff: bool = False) -> list[dict]:
+def collect_rows(binary: str, bench_dir: str, compare_modes: list[str]) -> list[dict]:
     paths = sorted(Path(bench_dir).glob("*.si"), key=_rank)
     rows = []
     total = len(paths)
 
     for i, path in enumerate(paths, 1):
         label = f"[{i:2d}/{total}] {path.name}"
-        tag   = " (opt)   " if with_optoff else " "
+        tag   = " (opt)   " if compare_modes else " "
 
         # optimized pass
         print(f"  {label}{tag}...", end=" ", flush=True, file=sys.stderr)
         t0 = time.perf_counter()
-        stdout, stderr = run_analyzer(binary, path, optoff=False)
+        stdout, stderr = run_analyzer(binary, path)
         wall = time.perf_counter() - t0
         p = parse_output(stdout, stderr)
         t_opt = p["abs_time"] + p["trace_time"]
@@ -198,6 +233,7 @@ def collect_rows(binary: str, bench_dir: str, with_optoff: bool = False) -> list
         row: dict = {
             "name":      path.stem,
             "loc":       loc,
+            "candidates": p["candidates"],
             "bugs":      p["bugs"],
             "handlers":  _fmt_handlers(p["handlers"]),
             "left_oob":  _fmt_oob(p["left_oobs"]),
@@ -205,21 +241,20 @@ def collect_rows(binary: str, bench_dir: str, with_optoff: bool = False) -> list
             "time":      _fmt_time(t_opt),
         }
 
-        # no-opt pass
-        if with_optoff:
-            print(f"  {label} (no-opt) ...", end=" ", flush=True, file=sys.stderr)
+        for mode in compare_modes:
+            mode_info = COMPARE_MODES[mode]
+            print(f"  {label} ({mode_info['label']}) ...", end=" ", flush=True, file=sys.stderr)
             t0 = time.perf_counter()
-            stdout2, stderr2 = run_analyzer(binary, path, optoff=True)
+            stdout2, stderr2 = run_analyzer(binary, path, extra_flag=mode_info["flag"])
             wall2 = time.perf_counter() - t0
             p2 = parse_output(stdout2, stderr2)
-            t_noopt = p2["abs_time"] + p2["trace_time"]
+            t_mode = p2["abs_time"] + p2["trace_time"]
             print(f"{wall2:.1f}s", file=sys.stderr)
 
-            row["bugs2"]      = p2["bugs"]
-            row["left_oob2"]  = _fmt_oob(p2["left_oobs"])
-            row["right_oob2"] = _fmt_oob(p2["right_oobs"])
-            row["time2"]      = _fmt_time(t_noopt)
-            row["speedup"]    = _fmt_speedup(t_opt, t_noopt)
+            row[f"candidates_{mode}"] = p2["candidates"]
+            row[f"bugs_{mode}"]      = p2["bugs"]
+            row[f"time_{mode}"]      = _fmt_time(t_mode)
+            row[f"speedup_{mode}"]   = _fmt_speedup(t_opt, t_mode)
 
         rows.append(row)
 
@@ -335,8 +370,16 @@ def main() -> None:
     parser.add_argument("--all",    action="store_true",
                         help="print ASCII + Markdown + LaTeX together")
     parser.add_argument("--optoff", action="store_true",
-                        help="also run with -optoff; appends Warnings*, Left OOB*, "
-                             "Right OOB*, Time* and Speedup columns (* = no-opt run)")
+                        help="also run with -optoff: selective application off "
+                             "and compiled fixpoint off")
+    parser.add_argument("--selectoff", action="store_true",
+                        help="also run with -selectoff: selective yield-point "
+                             "application off only")
+    parser.add_argument("--compileoff", action="store_true",
+                        help="also run with -compileoff: compiled handler "
+                             "fixpoint off only")
+    parser.add_argument("--compare-all", action="store_true",
+                        help="enable --optoff, --selectoff, and --compileoff")
     parser.add_argument("--dir", default=BENCH_DIR_DEFAULT, metavar="DIR",
                         help=f"benchmark directory (default: {BENCH_DIR_DEFAULT})")
     parser.add_argument("--bin", default=BINARY_DEFAULT, metavar="PATH",
@@ -351,16 +394,27 @@ def main() -> None:
         print(f"error: benchmark directory not found: {args.dir}", file=sys.stderr)
         sys.exit(1)
 
-    schema = _SCHEMA_OPTOFF if args.optoff else _SCHEMA_BASE
+    compare_modes: list[str] = []
+    if args.compare_all or args.optoff:
+        compare_modes.append("optoff")
+    if args.compare_all or args.selectoff:
+        compare_modes.append("selectoff")
+    if args.compare_all or args.compileoff:
+        compare_modes.append("compileoff")
+
+    schema = build_schema(compare_modes)
 
     print(f"Analyzer : {args.bin}", file=sys.stderr)
     print(f"Directory: {args.dir}/", file=sys.stderr)
-    if args.optoff:
-        print("Mode     : opt vs no-opt comparison  (* columns = -optoff run)",
-              file=sys.stderr)
+    if compare_modes:
+        details = ", ".join(
+            f"{COMPARE_MODES[m]['label']}={COMPARE_MODES[m]['flag']}"
+            for m in compare_modes
+        )
+        print(f"Mode     : opt comparison ({details})", file=sys.stderr)
     print(file=sys.stderr)
 
-    rows = collect_rows(args.bin, args.dir, with_optoff=args.optoff)
+    rows = collect_rows(args.bin, args.dir, compare_modes=compare_modes)
     print(file=sys.stderr)
 
     if args.all:

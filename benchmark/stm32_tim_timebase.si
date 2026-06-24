@@ -1,0 +1,44 @@
+// stm32_tim_timebase.si — STM32CubeF0 TIM/TIM_TimeBase model for STM32F072B-Discovery
+// Derived from TIM_TimeBase/Src/main.c, stm32f0xx_it.c, stm32f0xx_hal_msp.c,
+// system_stm32f0xx.c, and the STM32F072B-Discovery BSP LED helpers.
+// Modeled: TIM2 time-base configuration and TIMx_IRQHandler
+// -> HAL_TIM_IRQHandler(&TimHandle) -> HAL_TIM_PeriodElapsedCallback,
+// toggling LED5 once per update event.
+// Omitted: clock tree setup, GPIO mode registers, TIM register bitfields,
+// NVIC priority, SysTick, and Error_Handler LED3 path; none feeds an array
+// index or main/ISR shared data path in the infinite loop.
+// Expected -prov: 0 warnings, true negative.
+//
+init {
+  // === Constants from main.h/main.c ===
+  LED3 := 0;
+  LED5 := 2;
+  SYSTEM_CORE_CLOCK_HZ := 48000000;
+  TIM_COUNTER_CLOCK_HZ := 10000;
+  TIM_PERIOD := 9999;
+
+  // === Modeled TIM handle fields and board state ===
+  SystemCoreClock := SYSTEM_CORE_CLOCK_HZ;
+  uwPrescalerValue := 4799;
+  TimHandle_Instance_Is_TIM2 := 1;
+  TimHandle_Period := TIM_PERIOD;
+  TimHandle_Prescaler := uwPrescalerValue;
+  TimUpdateInterruptEnabled := 1;
+  LED3_State := 0;
+  LED5_State := 0;
+
+  handler 0 {
+    // TIMx_IRQHandler -> HAL_TIM_IRQHandler(&TimHandle)
+    // -> HAL_TIM_PeriodElapsedCallback -> BSP_LED_Toggle(LED5)
+    if TimUpdateInterruptEnabled = 1
+    then LED5_State := 1 - LED5_State
+    else unit
+  }
+}
+
+main {
+  // The real firmware starts TIM2 in interrupt mode and then spins forever.
+  while 1 do (
+    unit
+  )
+}

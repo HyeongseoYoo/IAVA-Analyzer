@@ -269,14 +269,14 @@ but it is filtered out of the provenance report.
 
 ## Verification
 
-Run with `-prov` flag:
+Run the correctness check with `-prov`:
 
 ```
 ./_build/default/bin/main.exe -prov benchmark/<file>.si
 ```
 
-| File | Lines | Expected bugs | Interrupt warnings |
-|---|---|---|---|
+| File | Lines | OOB candidates | Interrupt warnings |
+|---|---:|---:|---:|
 | micro1_direct_buggy.si | 78 | 1 | 1 (handler 0, left OOB) |
 | micro1_direct_fixed.si | 81 | 0 | 0 |
 | micro2_alias1_buggy.si | 77 | 1 | 1 (handler 1) |
@@ -290,3 +290,42 @@ Run with `-prov` flag:
 | composite2_uecc_dma_fixed.si | 965 | 1 | 0 (true-negative only) |
 
 All results confirmed by running the analyzer on the generated files.
+
+---
+
+## Optimization Comparison
+
+The default analyzer run uses both handler optimizations:
+
+| Analyzer flag | Selective handler application | Compiled handler fixpoint |
+|---|---|---|
+| default | on | on |
+| `-selectoff` | off | on |
+| `-compileoff` | on | off |
+| `-optoff` | off | off |
+
+`-selectoff` disables the yield-point filter, so handlers are applied after
+every enabled expression instead of only at yield points. `-compileoff` disables
+the compiled handler fixpoint and uses the iterative handler-summary path.
+`-optoff` disables both optimizations.
+
+The benchmark runner compares any selected mode against the default optimized
+run:
+
+```
+python3 benchmark/run_benchmarks.py --md
+python3 benchmark/run_benchmarks.py --selectoff --md
+python3 benchmark/run_benchmarks.py --compileoff --md
+python3 benchmark/run_benchmarks.py --optoff --md
+python3 benchmark/run_benchmarks.py --compare-all --md
+```
+
+In benchmark tables, `Candidates` counts OOB candidates after the trace merge
+step, while `Warnings` counts the interrupt-caused candidates retained by
+provenance tracing. The merge step combines repeated observations of the same
+access site, access kind, and base allocation across fixpoint iterations. In
+comparison tables, `C <mode>` and `W <mode>` are the merged candidate and
+warning counts for that optimization mode. `NoOpt` means `-optoff`, `SelOff`
+means `-selectoff`, and `CompOff` means `-compileoff`.
+`Spd <mode>` is `mode_time / opt_time`, so values above `1.00x` mean the
+optimized default is faster.

@@ -12,6 +12,8 @@ let opt_report = ref false
 let report_out = ref None
 let opt_summary = ref false
 let opt_optoff = ref false
+let opt_selectoff = ref false
+let opt_compileoff = ref false
 
 let read_all (ic : in_channel) : string =
   let buf = Buffer.create 4096 in
@@ -64,7 +66,13 @@ let main () =
         "print pre-compiled handler summaries" );
       ( "-optoff",
         Arg.Unit (fun _ -> opt_optoff := true),
-        "disable handler fixpoint optimization (use with -prov or -report)" );
+        "disable all handler optimizations: selective application and compiled fixpoint (use with -prov or -report)" );
+      ( "-selectoff",
+        Arg.Unit (fun _ -> opt_selectoff := true),
+        "disable selective handler application at yield points only (use with -prov or -report)" );
+      ( "-compileoff",
+        Arg.Unit (fun _ -> opt_compileoff := true),
+        "disable compiled handler fixpoint optimization only (use with -prov or -report)" );
     ]
     (fun x -> src := x)
     ("Usage : " ^ Filename.basename Sys.argv.(0) ^ " [-option] [filename] ");
@@ -116,12 +124,19 @@ let main () =
      ());
   (if !opt_prov || !opt_report then begin
      let t0 = Unix.gettimeofday () in
-     let asem, errs = Analyzer.abs_analyze ~use_opt:(not !opt_optoff) pgm in
+     let use_compile_opt = not (!opt_optoff || !opt_compileoff) in
+     let use_selective_opt = not (!opt_optoff || !opt_selectoff) in
+     let asem, errs =
+       Analyzer.abs_analyze ~use_compile_opt ~use_selective_opt pgm
+     in
      let t1 = Unix.gettimeofday () in
-     let trace_chains = Trace.trace_warnings errs asem pgm in
+     let merged_errs = Trace.merge_errors errs in
+     let trace_chains = Trace.trace_warnings merged_errs asem pgm in
      let t2 = Unix.gettimeofday () in
      Printf.eprintf "[time] abs_analyze : %.3fs\n" (t1 -. t0);
      Printf.eprintf "[time] trace_analyze: %.3fs\n" (t2 -. t1);
+     Printf.eprintf "[count] oob_candidates: %d\n" (Abs_dom.ErrorSet.cardinal merged_errs);
+     Printf.eprintf "[count] warnings      : %d\n" (List.length trace_chains);
      if !opt_prov then
        print_endline (Trace.string_of_report trace_chains);
      if !opt_report then

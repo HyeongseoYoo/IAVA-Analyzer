@@ -1,0 +1,187 @@
+// stm32_uart_twoboards_comit.si — STM32CubeF0 UART/UART_TwoBoards_ComIT model
+// for STM32F072B-Discovery, TRANSMITTER_BOARD configuration.
+// Derived from UART_TwoBoards_ComIT/Src/main.c, stm32f0xx_it.c,
+// stm32f0xx_hal_msp.c, system_stm32f0xx.c, Inc/main.h, and the
+// STM32F072B-Discovery BSP LED/button helpers.
+// Modeled: User-button EXTI sets UserButtonStatus; USART1 IRQ advances the
+// active interrupt-driven transmit or receive transfer and invokes the HAL
+// Tx/Rx complete callbacks that set UartReady.  RXBUFFERSIZE/TXBUFFERSIZE is
+// 90, matching COUNTOF(aTxBuffer)-1.  The payload bytes are collapsed to one
+// scalar value; the RX byte store keeps the real dynamic UART receive index so
+// this file can expose analyzer precision limits around handler-local guards.
+// Omitted: UART/GPIO register programming, exact baud/AF bits, clock tree,
+// NVIC priority, HAL_Delay timing, SysTick, and LED-only error side effects
+// that do not affect shared indices or array bounds.
+// Expected -prov today: 1 conservative warning at the RX handler write
+// *aRxBuffer[UartRxIdx].  Ground truth: this is a false alarm, not a real
+// STM32 main/ISR race; the HAL disables the RX interrupt when the transfer
+// completes, but the current analyzer loses enough guard/state correlation
+// during handler fixpoint summarization to widen UartRxIdx beyond RXBUFFERSIZE.
+//
+init {
+  // === Constants ===
+  RESET := 0;
+  SET := 1;
+  LED3 := 0;
+  LED4 := 1;
+  LED5 := 2;
+  LED6 := 3;
+  GPIO_PIN_0 := 0;
+  USER_BUTTON_PIN := GPIO_PIN_0;
+  TXBUFFERSIZE := 90;
+  RXBUFFERSIZE := 90;
+  STATE_READY := 0;
+  STATE_BUSY_TX := 1;
+  STATE_BUSY_RX := 2;
+  PAYLOAD_BYTE := 42;
+
+  // === User-visible shared state ===
+  UartReady := RESET;
+  UserButtonStatus := 0;
+
+  // === Flattened UART handle state ===
+  UartTxState := STATE_READY;
+  UartRxState := STATE_READY;
+  UartTxIrqEnabled := 0;
+  UartRxIrqEnabled := 0;
+  UartTxIdx := 0;
+  UartRxIdx := 0;
+  UartTxCount := 0;
+  UartRxCount := 0;
+
+  // === Buffercmp locals lifted to globals ===
+  CmpIdx := 0;
+  CmpResult := 0;
+
+  // === Board LEDs ===
+  LED3_State := 0;
+  LED4_State := 0;
+  LED5_State := 0;
+  LED6_State := 0;
+
+  // === Arrays ===
+  aTxBuffer := malloc(90, PAYLOAD_BYTE);
+  aRxBuffer := malloc(90, 0);
+
+  // === Interrupt configuration flags ===
+  ButtonExtiConfigured := 1;
+
+  handler 0 {
+    // USARTx_IRQHandler -> HAL_UART_IRQHandler(&UartHandle).
+    // TX and RX IRQ enables model the HAL's peripheral interrupt bits; they
+    // prevent an IRQ from observing half-initialized transfer fields.
+    if UartTxIrqEnabled = 1
+    then (
+      if UartTxState = STATE_BUSY_TX
+      then (
+        if UartTxIdx < TXBUFFERSIZE
+        then (
+          UartTxIdx := UartTxIdx + 1;
+          UartTxCount := UartTxCount - 1;
+          if UartTxIdx = TXBUFFERSIZE
+          then (
+            UartTxIrqEnabled := 0;
+            UartTxState := STATE_READY;
+            UartReady := SET;
+            LED3_State := 1
+          )
+          else unit
+        )
+        else unit
+      )
+      else unit
+    )
+    else (
+      if UartRxIrqEnabled = 1
+      then (
+        if UartRxState = STATE_BUSY_RX
+        then (
+          if UartRxIdx < RXBUFFERSIZE
+          then (
+            *aRxBuffer[UartRxIdx] := *aTxBuffer[UartRxIdx];
+            UartRxIdx := UartRxIdx + 1;
+            UartRxCount := UartRxCount - 1;
+            if UartRxIdx = RXBUFFERSIZE
+            then (
+              UartRxIrqEnabled := 0;
+              UartRxState := STATE_READY;
+              UartReady := SET;
+              LED5_State := 1
+            )
+            else unit
+          )
+          else unit
+        )
+        else unit
+      )
+      else unit
+    )
+  };
+
+  handler 1 {
+    // EXTI0_1_IRQHandler -> HAL_GPIO_EXTI_IRQHandler(USER_BUTTON_PIN)
+    // -> HAL_GPIO_EXTI_Callback(USER_BUTTON_PIN)
+    if ButtonExtiConfigured = 1
+    then UserButtonStatus := 1
+    else unit
+  }
+}
+
+main {
+  // HAL_Init, SystemClock_Config, BSP_LED_Init, HAL_UART_DeInit/Init, and
+  // BSP_PB_Init are represented by initialized state above.
+
+  // Wait for User push-button press while LED4 blinks.
+  while UserButtonStatus = 0 do (
+    LED4_State := 1 - LED4_State
+  );
+  LED4_State := 0;
+
+  // HAL_UART_Transmit_IT(&UartHandle, aTxBuffer, TXBUFFERSIZE).
+  UartReady := RESET;
+  UartTxState := STATE_BUSY_TX;
+  UartTxIdx := 0;
+  UartTxCount := TXBUFFERSIZE;
+  UartTxIrqEnabled := 1;
+
+  // Wait for HAL_UART_TxCpltCallback to set UartReady.
+  while UartReady <> SET do (
+    unit
+  );
+  UartReady := RESET;
+
+  // HAL_UART_Receive_IT(&UartHandle, aRxBuffer, RXBUFFERSIZE).
+  UartRxState := STATE_BUSY_RX;
+  UartRxIdx := 0;
+  UartRxCount := RXBUFFERSIZE;
+  UartRxIrqEnabled := 1;
+
+  // Wait for HAL_UART_RxCpltCallback to set UartReady.
+  while UartReady <> SET do (
+    unit
+  );
+  UartReady := RESET;
+
+  // Buffercmp(aTxBuffer, aRxBuffer, RXBUFFERSIZE).
+  CmpIdx := 0;
+  CmpResult := 0;
+  while CmpIdx < RXBUFFERSIZE do (
+    if *aTxBuffer[CmpIdx] <> *aRxBuffer[CmpIdx]
+    then CmpResult := 1
+    else unit;
+    CmpIdx := CmpIdx + 1
+  );
+
+  if CmpResult <> 0
+  then (
+    LED6_State := 1;
+    while 1 do (
+      unit
+    )
+  )
+  else unit;
+
+  while 1 do (
+    unit
+  )
+}

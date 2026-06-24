@@ -58,6 +58,7 @@ let handler_summaries : handler_summary HandlerStore.IidMap.t ref =
 let compiled_fp : compiled_fixpoint ref =
   ref { fp_scalars = []; fp_arrays = [] }
 let use_compiled_fp : bool ref = ref false
+let use_selective_handler_application : bool ref = ref true
 let asem : Abs_Sem.t ref = ref Abs_Sem.bot
 let errs : ErrorSet.t ref = ref ErrorSet.empty
 let in_handler_exec : bool ref = ref false
@@ -71,7 +72,8 @@ let reset_outputs () =
   errs := ErrorSet.empty;
   aenv := Abs_Env.empty;
   aenv0 := Abs_Env.empty;
-  in_handler_exec := false
+  in_handler_exec := false;
+  use_selective_handler_application := true
 
 let join_res r1 r2 =
   { avalue = Abs_Val.join r1.avalue r2.avalue; app = PPSet.union r1.app r2.app }
@@ -562,11 +564,12 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
       record_sem pp c_after_eval;
       (res, c_after_eval)
   | Enabled ->
-      (* Apply handler effects only at yield points (Assign, Malloc, Var, Deref). *)
+      (* Apply handler effects only at yield points unless selective application
+         is disabled for performance/precision experiments. *)
       let is_yield_point =
         match exp with Assign _ | Malloc _ | Var _ | Deref _ -> true | _ -> false
       in
-      if is_yield_point then begin
+      if (not !use_selective_handler_application) || is_yield_point then begin
         let c_after_post = !post_steps_fn c_after_eval in
         record_sem pp c_after_post;
         (res, c_after_post)
@@ -1120,8 +1123,15 @@ let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let _, _c_final = evalA c_init pgm.main in
   filter_main_sem !asem
 
-let abs_analyze ?(use_opt = true) (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
+let abs_analyze ?(use_compile_opt = true) ?(use_selective_opt = true)
+    ?use_opt (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
   let c_init = init_confa pgm in
-  if not use_opt then use_compiled_fp := false;
+  let use_compile_opt, use_selective_opt =
+    match use_opt with
+    | Some legacy_use_opt -> (legacy_use_opt, legacy_use_opt)
+    | None -> (use_compile_opt, use_selective_opt)
+  in
+  if not use_compile_opt then use_compiled_fp := false;
+  use_selective_handler_application := use_selective_opt;
   let _, _c_final = evalA c_init pgm.main in
   (!asem, !errs)
