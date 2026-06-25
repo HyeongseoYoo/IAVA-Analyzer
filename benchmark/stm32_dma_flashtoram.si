@@ -1,0 +1,124 @@
+// stm32_dma_flashtoram.si — STM32CubeF0 DMA/DMA_FLASHToRAM model for STM32F072B-Discovery
+// Derived from DMA_FLASHToRAM/Src/main.c, stm32f0xx_it.c, system_stm32f0xx.c,
+// Inc/main.h/stm32f0xx_it.h/stm32f0xx_hal_conf.h, STM32F0 HAL DMA public
+// semantics, and the STM32F072B-Discovery BSP LED helpers.
+// Modeled: HAL_DMA_Start_IT setup for DMA1_Channel1, the transfer-complete
+// path of DMA_INSTANCE_IRQHANDLER -> HAL_DMA_IRQHandler -> TransferComplete,
+// and the transfer-error path -> TransferError.  The single real DMA IRQ is
+// split into two logical handlers because .si has no nondeterministic hardware
+// flag input; both handlers guard on the same modeled DMA channel enable bits.
+// BUFFER_SIZE is 32.  Source word values are collapsed to one scalar because
+// main never compares or indexes the destination buffer in this example.
+// Omitted: clock tree setup, GPIO mode registers, NVIC priority, exact DMA
+// bit masks, SysTick, and assert/error infinite-loop details; none creates a
+// main/ISR array-index race.
+// Expected -prov: 0 warnings, true negative.
+//
+init {
+  // === Constants from main.h/BSP ===
+  BUFFER_SIZE := 32;
+  SRC_WORD := 16909060;
+  LED3 := 0;
+  LED4 := 1;
+  LED5 := 2;
+
+  // === DMA state constants ===
+  DMA_STATE_READY := 0;
+  DMA_STATE_BUSY := 1;
+  DMA_ERROR_NONE := 0;
+  DMA_ERROR_TE := 1;
+
+  // === Modeled DMA1_Channel1 register fields ===
+  DMA_REG_EN := 0;
+  DMA_REG_TCIE := 1;
+  DMA_REG_TEIE := 2;
+  DMA_REG_CNDTR := 3;
+
+  // === Board and application state ===
+  LED3_State := 0;
+  LED4_State := 0;
+  LED5_State := 0;
+  transferErrorDetected := 0;
+
+  // === Flattened DMA handle state ===
+  DmaState := DMA_STATE_READY;
+  DmaErrorCode := DMA_ERROR_NONE;
+  DmaCopyIdx := 0;
+  DmaTransferCompleteCallbackRegistered := 1;
+  DmaTransferErrorCallbackRegistered := 1;
+
+  // === Arrays/register files ===
+  aSRC_Const_Buffer := malloc(32, SRC_WORD);
+  aDST_Buffer := malloc(32, 0);
+  DmaChannel := malloc(4, 0);
+
+  // === HAL_DMA_Start_IT(&DmaHandle, &aSRC_Const_Buffer, &aDST_Buffer, 32) ===
+  *DmaChannel[DMA_REG_CNDTR] := BUFFER_SIZE;
+  DmaState := DMA_STATE_BUSY;
+  DmaErrorCode := DMA_ERROR_NONE;
+  DmaCopyIdx := 0;
+  *DmaChannel[DMA_REG_TCIE] := 1;
+  *DmaChannel[DMA_REG_TEIE] := 1;
+  *DmaChannel[DMA_REG_EN] := 1;
+
+  handler 0 {
+    // DMA_INSTANCE_IRQHANDLER -> HAL_DMA_IRQHandler transfer-complete path
+    // -> TransferComplete -> BSP_LED_On(LED3).
+    if *DmaChannel[DMA_REG_EN] = 1
+    then (
+      if *DmaChannel[DMA_REG_TCIE] = 1
+      then (
+        DmaCopyIdx := 0;
+        while DmaCopyIdx < BUFFER_SIZE do (
+          *aDST_Buffer[DmaCopyIdx] := *aSRC_Const_Buffer[DmaCopyIdx];
+          DmaCopyIdx := DmaCopyIdx + 1
+        );
+        *DmaChannel[DMA_REG_TCIE] := 0;
+        *DmaChannel[DMA_REG_TEIE] := 0;
+        *DmaChannel[DMA_REG_EN] := 0;
+        *DmaChannel[DMA_REG_CNDTR] := 0;
+        DmaState := DMA_STATE_READY;
+        if DmaTransferCompleteCallbackRegistered = 1
+        then LED3_State := 1
+        else unit
+      )
+      else unit
+    )
+    else unit
+  };
+
+  handler 1 {
+    // DMA_INSTANCE_IRQHANDLER -> HAL_DMA_IRQHandler transfer-error path
+    // -> TransferError -> transferErrorDetected = 1.
+    if *DmaChannel[DMA_REG_EN] = 1
+    then (
+      if *DmaChannel[DMA_REG_TEIE] = 1
+      then (
+        *DmaChannel[DMA_REG_TCIE] := 0;
+        *DmaChannel[DMA_REG_TEIE] := 0;
+        *DmaChannel[DMA_REG_EN] := 0;
+        DmaErrorCode := DMA_ERROR_TE;
+        DmaState := DMA_STATE_READY;
+        if DmaTransferErrorCallbackRegistered = 1
+        then transferErrorDetected := 1
+        else unit
+      )
+      else unit
+    )
+    else unit
+  }
+}
+
+main {
+  // HAL_Init, SystemClock_Config, BSP_LED_Init(LED3/LED4/LED5), DMA_Config,
+  // callback registration, NVIC enable, and HAL_DMA_Start_IT are represented
+  // in init.  The real infinite loop only reacts to transfer errors.
+  while 1 do (
+    if transferErrorDetected = 1
+    then (
+      LED4_State := 1;
+      transferErrorDetected := 0
+    )
+    else unit
+  )
+}

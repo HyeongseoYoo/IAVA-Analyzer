@@ -35,7 +35,5 @@ init {
 main {
   // HAL_Init, BSP_LED_Init(LED3), SystemClock_Config, and GPIO/NVIC setup
   // are already reflected in init.  The real main loop is empty.
-  while 1 do (
-    unit
-  )
+  // In real - while(1) {}
 }

@@ -7,16 +7,13 @@
 // active interrupt-driven transmit or receive transfer and invokes the HAL
 // Tx/Rx complete callbacks that set UartReady.  RXBUFFERSIZE/TXBUFFERSIZE is
 // 90, matching COUNTOF(aTxBuffer)-1.  The payload bytes are collapsed to one
-// scalar value; the RX byte store keeps the real dynamic UART receive index so
-// this file can expose analyzer precision limits around handler-local guards.
+// scalar value; the RX byte store keeps the real dynamic UART receive index.
 // Omitted: UART/GPIO register programming, exact baud/AF bits, clock tree,
 // NVIC priority, HAL_Delay timing, SysTick, and LED-only error side effects
 // that do not affect shared indices or array bounds.
-// Expected -prov today: 1 conservative warning at the RX handler write
-// *aRxBuffer[UartRxIdx].  Ground truth: this is a false alarm, not a real
-// STM32 main/ISR race; the HAL disables the RX interrupt when the transfer
-// completes, but the current analyzer loses enough guard/state correlation
-// during handler fixpoint summarization to widen UartRxIdx beyond RXBUFFERSIZE.
+// Expected -prov: 0 warnings, true negative.  The handler-local guard
+// UartRxIdx < RXBUFFERSIZE bounds the RX byte store; there is no main/ISR
+// check-then-use race on the UART buffer index.
 //
 init {
   // === Constants ===
@@ -181,7 +178,7 @@ main {
   )
   else unit;
 
-  while 1 do (
-    unit
-  )
+
+// In real - while(1) {}
+
 }

@@ -15,7 +15,7 @@ type summary_atom = {
   lhs : Exp.lbl_t;
   rhs : Exp.lbl_t;
   assign_lbl : Exp.Lbl.t;
-  guard : (Exp.bop * Exp.lbl_t) option;
+  guards : (Exp.bop * Exp.lbl_t) list;
 }
 
 (* Pre-compiled symbolic summary of a handler body *)
@@ -41,7 +41,7 @@ type fp_array_write = {
   fpa_rhs       : [ `Const of Abs_Val.t | `Var of Abs_Loc.t ]; (* value: const or var *)
   fpa_at        : ProgramPoint.t;
   fpa_offset_pp : PPSet.t;
-  fpa_guard     : (Exp.bop * Exp.lbl_t) option; (* branch guard applied before index lookup *)
+  fpa_guards    : (Exp.bop * Exp.lbl_t) list; (* branch guards applied before index lookup *)
   fpa_base_var  : Abs_Loc.t; (* base pointer variable of the array write *)
 }
 
@@ -204,6 +204,12 @@ let refine_amem_by_guard (guard : (Exp.bop * Exp.lbl_t) option)
           let bound_itv = get_itv_from_exp rhs_e.exp amem in
           narrow_var_in_amem guard_var eff_bop bound_itv amem
       | _ -> amem)
+
+let refine_amem_by_guards (guards : (Exp.bop * Exp.lbl_t) list)
+    (amem : Abs_Mem.t) : Abs_Mem.t =
+  List.fold_left
+    (fun acc (bop, cond_e) -> refine_amem_by_guard (Some (bop, cond_e)) acc)
+    amem guards
 
 (* Narrow amem for the true (branch=true) or false (branch=false) branch of cond_exp. *)
 let refine_amem (cond_exp : Exp.lbl_t) (branch : bool) (amem : Abs_Mem.t) :
@@ -589,7 +595,8 @@ let rec eval_no_post ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
 
 (* Apply a single compiled assignment atom without triggering post-step. *)
 let apply_atom (atom : summary_atom) (c : abs_conf) : abs_conf =
-  let r1, c1 = eval_no_post ~lvalue:true c atom.lhs in
+  let c_guarded = { c with amem = refine_amem_by_guards atom.guards c.amem } in
+  let r1, c1 = eval_no_post ~lvalue:true c_guarded atom.lhs in
   let r2, c2 = eval_no_post c1 atom.rhs in
   let l = proj_loc r1.avalue in
   let pp = ProgramPoint.Label atom.assign_lbl in
@@ -808,10 +815,9 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
             | _ -> `Const Abs_Val.top
           in
           let fpa_at = ProgramPoint.Label atom.assign_lbl in
-          let fpa_guard = atom.guard in
           array_writes :=
             { fpa_lbl = lbl; fpa_idx; fpa_rhs; fpa_at;
-              fpa_offset_pp = PPSet.singleton fpa_at; fpa_guard;
+              fpa_offset_pp = PPSet.singleton fpa_at; fpa_guards = atom.guards;
               fpa_base_var = arr_var_loc }
             :: !array_writes
       | None -> ())
@@ -864,7 +870,7 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   let amem2 =
     List.fold_left
       (fun (amem, errs) (fpa : fp_array_write) ->
-        let amem_for_idx = refine_amem_by_guard fpa.fpa_guard amem in
+        let amem_for_idx = refine_amem_by_guards fpa.fpa_guards amem in
         let offset_itv =
           match fpa.fpa_idx with
           | `Const itv -> itv
@@ -881,12 +887,17 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
         let in_bounds_write_loc =
           Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = in_itv }
         in
+        let base_pp =
+          match Abs_Mem.LocMap.find_opt fpa.fpa_base_var amem with
+          | Some (_, pps) -> pps
+          | None -> PPSet.empty
+        in
         let errs' =
           if left_oob = Itv.bot && right_oob = Itv.bot then errs
           else
             let err =
               Error.make ~at:fpa.fpa_at ~access:Error.Write ~base:write_loc
-                ~in_itv ~left_oob ~right_oob ~base_pp:PPSet.empty
+                ~in_itv ~left_oob ~right_oob ~base_pp
                 ~offset_pp:fpa.fpa_offset_pp ~handler_caused:true
             in
             ErrorSet.add err errs
@@ -1040,18 +1051,29 @@ let print_handler_summaries () : unit =
     !handler_summaries;
   print_endline "========================="
 
-(* Extract branch guards for "Var < rhs" conditions: returns (then_guard, else_guard). *)
+let is_comparison_bop (bop : Exp.bop) =
+  match bop with
+  | Eq | Ne | Lt | Le | Gt | Ge -> true
+  | _ -> false
+
+(* Extract branch guards for simple "Var cmp rhs" conditions:
+   returns (then_guard, else_guard). *)
 let extract_branch_guards (cond_e : Exp.lbl_t)
     : (Exp.bop * Exp.lbl_t) option * (Exp.bop * Exp.lbl_t) option =
   match cond_e.exp with
-  | Bop (Lt, { exp = Var _; _ }, _) ->
-      (Some (Lt, cond_e), Some (Ge, cond_e))
+  | Bop (bop, { exp = Var _; _ }, _) when is_comparison_bop bop ->
+      (Some (bop, cond_e), Some (negate_bop bop, cond_e))
   | _ -> (None, None)
 
 let attach_guard (g : (Exp.bop * Exp.lbl_t) option) (s : handler_summary)
     : handler_summary =
   match s with
-  | Compiled atoms -> Compiled (List.map (fun a -> { a with guard = g }) atoms)
+  | Compiled atoms ->
+      Compiled
+        (List.map
+           (fun a ->
+             match g with None -> a | Some guard -> { a with guards = guard :: a.guards })
+           atoms)
   | Fallback _ -> s
 
 (* Compile handler body to a summary: assigns → atoms, if-branches flattened, loops/malloc → Fallback. *)
@@ -1060,7 +1082,7 @@ let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
   | Assign (lhs, rhs) ->
       let assign_lbl = lbl_exp.lbl in
       (match lhs.exp with
-      | Var _ | Deref _ -> Compiled [ { lhs; rhs; assign_lbl; guard = None } ]
+      | Var _ | Deref _ -> Compiled [ { lhs; rhs; assign_lbl; guards = [] } ]
       | _ -> Fallback lbl_exp)
   | Seq (e1, e2) -> (
       match (compile_handler e1, compile_handler e2) with
