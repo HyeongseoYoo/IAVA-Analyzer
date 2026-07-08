@@ -7,7 +7,29 @@
 // Omitted: clock tree setup, GPIO mode registers, TIM register bitfields,
 // NVIC priority, SysTick, and Error_Handler LED3 path; none feeds an array
 // index or main/ISR shared data path in the infinite loop.
-// Expected -prov: 0 warnings, true negative.
+// The faithful translation above is a true negative: handler 0 never
+// touches an array index.
+//
+// [INJECTED] Since the faithful translation never gives the analyzer an
+// OOB to find, a synthetic main task and a matching ISR-side corruption
+// were added on top of it. This part is NOT in the original TIM_TimeBase
+// example. TIM_TimeBase is one of the shorter translated examples, so it
+// carries exactly one injected bug (see stm32_dma_flashtoram.si and
+// stm32_uart_twoboards_comit.si for the longer examples, which each carry
+// two).
+// Task role: command-timeout poll. Many embedded/SSD firmwares scan a
+// fixed-size pending-command table one slot per main pass (instead of
+// rescanning the whole table every pass) using a round-robin cursor that
+// a periodic timer ISR also drives forward. A new register field
+// (TIM_REG_SLOT) on a small TimRegs register file holds that cursor,
+// recorded by the period-elapsed handler.
+// Bug pattern: Pattern 2 (1-depth alias) — same shape as
+// benchmark/micro2_alias1_buggy.si. TimCtrl is a 1-depth alias of
+// TimRegs; main checks TimRegs[TIM_REG_SLOT] through TimCtrl, but
+// handler 0 (TIM2 period-elapsed) can fire before the second (unguarded)
+// re-read used as the array index, corrupting the same heap cell via the
+// original TimRegs name.
+// Expected -prov: 1 warning — interrupt influence: handler 0, right OOB.
 //
 init {
   // === Constants from main.h/main.c ===
@@ -16,6 +38,11 @@ init {
   SYSTEM_CORE_CLOCK_HZ := 48000000;
   TIM_COUNTER_CLOCK_HZ := 10000;
   TIM_PERIOD := 9999;
+
+  // === [INJECTED] command-timeout poll task constants ===
+  TIM_SLOT_COUNT := 8;
+  TIM_SLOT_ABORT := 255;
+  TIM_REG_SLOT := 0;
 
   // === Modeled TIM handle fields and board state ===
   SystemCoreClock := SYSTEM_CORE_CLOCK_HZ;
@@ -27,17 +54,47 @@ init {
   LED3_State := 0;
   LED5_State := 0;
 
+  // === [INJECTED] command-timeout poll task state ===
+  TimRegs := malloc(1, 0);
+  TimSlotTable := malloc(8, 0);
+  *TimRegs[TIM_REG_SLOT] := 0;
+
   handler 0 {
     // TIMx_IRQHandler -> HAL_TIM_IRQHandler(&TimHandle)
     // -> HAL_TIM_PeriodElapsedCallback -> BSP_LED_Toggle(LED5)
     if TimUpdateInterruptEnabled = 1
-    then LED5_State := 1 - LED5_State
+    then (
+      LED5_State := 1 - LED5_State;
+      // [INJECTED BUG] Models the round-robin scan-cursor advance for the
+      // command-timeout poll table (see main). Every period-elapsed event
+      // overwrites TimRegs[TIM_REG_SLOT] with the out-of-range sentinel
+      // TIM_SLOT_ABORT instead of a valid next slot. Written through the
+      // original TimRegs name, not the TimCtrl alias main uses.
+      *TimRegs[TIM_REG_SLOT] := TIM_SLOT_ABORT
+    )
     else unit
   }
 }
 
 main {
   // The real firmware starts TIM2 in interrupt mode and then spins forever.
-  unit;
   // In real - while(1) {}
+
+  // === [INJECTED] Alias setup ===
+  // TimCtrl is a 1-depth alias of TimRegs — the same register file
+  // handler 0 corrupts via TIM_REG_SLOT (mirrors
+  // benchmark/micro2_alias1_buggy.si's NvmeCtrl/RegFile alias).
+  TimCtrl := TimRegs;
+
+  // [INJECTED TASK] Command-timeout poll: scan one slot of TimSlotTable
+  // per task instance, the slot pointed to by TimRegs[TIM_REG_SLOT]. TIM2's
+  // period-elapsed handler (handler 0) also drives this cursor, modeling
+  // a shared scan-cursor race between the ISR and this main task.
+  // [INJECTED BUG] Pattern 2 (1-depth alias): the check reads
+  // TimRegs[TIM_REG_SLOT] through the TimCtrl alias; handler 0 can fire
+  // between this check and the second (unguarded) read used as the array
+  // index, corrupting the same heap cell via the original TimRegs name.
+  if *TimCtrl[TIM_REG_SLOT] < TIM_SLOT_COUNT
+  then *TimSlotTable[*TimCtrl[TIM_REG_SLOT]] := *TimCtrl[TIM_REG_SLOT]
+  else unit
 }

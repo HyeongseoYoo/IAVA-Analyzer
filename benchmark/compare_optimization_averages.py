@@ -168,7 +168,7 @@ def main() -> None:
     parser.add_argument("--bin", default=run_benchmarks.BINARY_DEFAULT, metavar="PATH")
     parser.add_argument(
         "--out",
-        default="benchmark/optimization_performance_5run.md",
+        default="benchmark/optimization_performance_allrun.md",
         metavar="PATH",
         help="Markdown output path",
     )

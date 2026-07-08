@@ -95,7 +95,7 @@ benchmark suite with expected analysis results.
 
 | Directory    | Contents                                                           |
 | ------------ | ------------------------------------------------------------------ |
-| `benchmark/` | Micro and composite benchmark suite with expected warnings         |
+| `benchmark/` | Micro, composite, and STM32 benchmark suite with expected warnings |
 | `examples/`  | Miscellaneous development examples used while testing the analyzer |
 
 ### Benchmark suite (`benchmark/`)
@@ -121,7 +121,19 @@ programs.
 | `composite1_nvme_sqcq.si` | NVMe SQ/CQ command pipeline | 3 interrupt-related warnings + 1 non-handler OOB |
 | `composite2_uecc_dma.si`  | UECC error recovery and DMA | 3 interrupt-related warnings + 1 non-handler OOB |
 
-See `benchmark/README.md` for per-bug line numbers and expected OOB ranges.
+Four **STM32 benchmarks** are translated from official STM32CubeF0 HAL examples
+and include clearly marked synthetic OOB injections on top of faithful
+true-negative translations.
+
+| File                                | Injected patterns              | Expected                                      |
+| ----------------------------------- | ------------------------------ | --------------------------------------------- |
+| `stm32_gpio_exti.si`                | Pattern 1                      | 1 interrupt-related warning                   |
+| `stm32_tim_timebase.si`             | Pattern 2                      | 1 interrupt-related warning                   |
+| `stm32_dma_flashtoram.si`           | Pattern 2 + Pattern 4          | 1 warning + 1 non-handler OOB filtered by provenance |
+| `stm32_uart_twoboards_comit.si`     | Pattern 3 + Pattern 4          | 1 warning + 1 non-handler OOB filtered by provenance |
+
+See `benchmark/README.md` for per-bug line numbers, STM32 injection notes, and
+expected OOB ranges.
 
 
 ## Project structure

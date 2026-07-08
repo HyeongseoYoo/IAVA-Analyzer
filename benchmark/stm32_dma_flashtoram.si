@@ -12,7 +12,35 @@
 // Omitted: clock tree setup, GPIO mode registers, NVIC priority, exact DMA
 // bit masks, SysTick, and assert/error infinite-loop details; none creates a
 // main/ISR array-index race.
-// Expected -prov: 0 warnings, true negative.
+// The faithful translation above is a true negative.
+//
+// [INJECTED] Since the faithful translation never gives the analyzer an
+// OOB to find, two synthetic main tasks were added on top of it. This
+// part is NOT in the original DMA_FLASHToRAM example. DMA_FLASHToRAM is
+// one of the longer translated examples, so it carries two injected
+// bugs: one interrupt-race pattern plus one non-handler precision test
+// (compare to stm32_tim_timebase.si / stm32_gpio_exti.si, the shorter
+// examples, which each carry exactly one).
+//
+// Bug 1 — error-recovery salvage task (Pattern 2: 1-depth alias).
+// Real DMA error recovery often re-validates/re-copies the destination
+// slot that was in flight when a transfer error fired, instead of
+// discarding the whole buffer. A new register field (DMA_REG_SALVAGE) on
+// the existing DmaChannel register file holds that cursor, recorded by
+// the transfer-error handler. Same shape as
+// benchmark/micro2_alias1_buggy.si: DmaCtrl is a 1-depth alias of
+// DmaChannel; main checks DmaChannel[DMA_REG_SALVAGE] through DmaCtrl,
+// but handler 1 (transfer-error) can fire before the second (unguarded)
+// re-read used as the array index, corrupting the same heap cell via the
+// original DmaChannel name.
+// Expected -prov: 1 warning — interrupt influence: handler 1, right OOB.
+//
+// Bug 2 — transfer-log sample-history task (Pattern 4: precision test,
+// non-handler OOB). Same shape as benchmark/micro4_nonhandler_oob.si:
+// DMA_LOG_SAMPLES (10) > DMA_LOG_SIZE (8); DmaLogIdx is local to main and
+// never written by any handler, so the OOB at DmaLogIdx in [8,9] is
+// entirely main's own loop-bound mismatch, not an interrupt race. This
+// candidate must NOT appear in the -prov warning count.
 //
 init {
   // === Constants from main.h/BSP ===
@@ -21,6 +49,13 @@ init {
   LED3 := 0;
   LED4 := 1;
   LED5 := 2;
+
+  // === [INJECTED] error-recovery salvage task constants ===
+  DMA_SALVAGE_ABORT := 255;
+
+  // === [INJECTED] transfer-log sample-history task constants ===
+  DMA_LOG_SAMPLES := 10;
+  DMA_LOG_SIZE := 8;
 
   // === DMA state constants ===
   DMA_STATE_READY := 0;
@@ -33,6 +68,8 @@ init {
   DMA_REG_TCIE := 1;
   DMA_REG_TEIE := 2;
   DMA_REG_CNDTR := 3;
+  // [INJECTED] error-recovery salvage cursor field
+  DMA_REG_SALVAGE := 4;
 
   // === Board and application state ===
   LED3_State := 0;
@@ -50,7 +87,7 @@ init {
   // === Arrays/register files ===
   aSRC_Const_Buffer := malloc(32, SRC_WORD);
   aDST_Buffer := malloc(32, 0);
-  DmaChannel := malloc(4, 0);
+  DmaChannel := malloc(5, 0);
 
   // === HAL_DMA_Start_IT(&DmaHandle, &aSRC_Const_Buffer, &aDST_Buffer, 32) ===
   *DmaChannel[DMA_REG_CNDTR] := BUFFER_SIZE;
@@ -60,6 +97,11 @@ init {
   *DmaChannel[DMA_REG_TCIE] := 1;
   *DmaChannel[DMA_REG_TEIE] := 1;
   *DmaChannel[DMA_REG_EN] := 1;
+  // === [INJECTED] error-recovery salvage task state ===
+  *DmaChannel[DMA_REG_SALVAGE] := 0;
+
+  // === [INJECTED] transfer-log sample-history task array ===
+  DmaXferLog := malloc(8, 0);
 
   handler 0 {
     // DMA_INSTANCE_IRQHANDLER -> HAL_DMA_IRQHandler transfer-complete path
@@ -101,7 +143,13 @@ init {
         DmaState := DMA_STATE_READY;
         if DmaTransferErrorCallbackRegistered = 1
         then transferErrorDetected := 1
-        else unit
+        else unit;
+        // [INJECTED BUG] Models the error-path recovery bookkeeping: real
+        // error recovery records which destination slot to re-validate
+        // first; here it is corrupted to an out-of-range sentinel instead
+        // of a valid slot. Written through the original DmaChannel name,
+        // not the DmaCtrl alias main uses (see main).
+        *DmaChannel[DMA_REG_SALVAGE] := DMA_SALVAGE_ABORT
       )
       else unit
     )
@@ -113,12 +161,47 @@ main {
   // HAL_Init, SystemClock_Config, BSP_LED_Init(LED3/LED4/LED5), DMA_Config,
   // callback registration, NVIC enable, and HAL_DMA_Start_IT are represented
   // in init.  The real infinite loop only reacts to transfer errors.
+
+  // === [INJECTED] Alias setup ===
+  // DmaCtrl is a 1-depth alias of DmaChannel — the same register file
+  // handler 1 corrupts via DMA_REG_SALVAGE (mirrors
+  // benchmark/micro2_alias1_buggy.si's NvmeCtrl/RegFile alias).
+  DmaCtrl := DmaChannel;
+
+  // [INJECTED TASK] Transfer-log sample-history task: record this task
+  // instance's DMA_LOG_SAMPLES transfer-status snapshots into a
+  // fixed-size ring before entering the steady-state error-monitoring
+  // loop, the way firmware keeps a short transfer-history log per batch.
+  // [INJECTED BUG] Pattern 4 (precision test, non-handler OOB): mirrors
+  // benchmark/micro4_nonhandler_oob.si. DMA_LOG_SAMPLES (10) >
+  // DMA_LOG_SIZE (8), so DmaLogIdx in [8,9] writes past the end of
+  // DmaXferLog. DmaLogIdx is local to main and no handler ever writes it
+  // or DmaXferLog, so this OOB must NOT be attributed to handler 0/1
+  // under -prov.
+  DmaLogIdx := 0;
+  while DmaLogIdx < DMA_LOG_SAMPLES do (
+    *DmaXferLog[DmaLogIdx] := DmaLogIdx;
+    DmaLogIdx := DmaLogIdx + 1
+  );
+
   while 1 do (
     if transferErrorDetected = 1
     then (
       LED4_State := 1;
       transferErrorDetected := 0
     )
+    else unit;
+
+    // [INJECTED TASK] Error-recovery salvage task: each pass, re-validate
+    // the destination slot recorded for a (possibly pending) transfer
+    // error before continuing, instead of unconditionally trusting it.
+    // [INJECTED BUG] Pattern 2 (1-depth alias): the check reads
+    // DmaChannel[DMA_REG_SALVAGE] through the DmaCtrl alias; handler 1
+    // (transfer-error) can fire between this check and the second
+    // (unguarded) read used as the array index, corrupting the same heap
+    // cell via the original DmaChannel name.
+    if *DmaCtrl[DMA_REG_SALVAGE] < BUFFER_SIZE
+    then *aDST_Buffer[*DmaCtrl[DMA_REG_SALVAGE]] := *DmaCtrl[DMA_REG_SALVAGE]
     else unit
   )
 }

@@ -64,6 +64,10 @@ _ORDER = [
     "composite1_nvme_sqcq_fixed",
     "composite2_uecc_dma",
     "composite2_uecc_dma_fixed",
+    "stm32_gpio_exti",
+    "stm32_tim_timebase",
+    "stm32_dma_flashtoram",
+    "stm32_uart_twoboards_comit",
 ]
 
 

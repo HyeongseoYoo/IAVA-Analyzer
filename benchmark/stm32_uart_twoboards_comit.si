@@ -11,9 +11,37 @@
 // Omitted: UART/GPIO register programming, exact baud/AF bits, clock tree,
 // NVIC priority, HAL_Delay timing, SysTick, and LED-only error side effects
 // that do not affect shared indices or array bounds.
-// Expected -prov: 0 warnings, true negative.  The handler-local guard
-// UartRxIdx < RXBUFFERSIZE bounds the RX byte store; there is no main/ISR
-// check-then-use race on the UART buffer index.
+// The handler-local guard UartRxIdx < RXBUFFERSIZE bounds the RX byte
+// store; there is no main/ISR check-then-use race on the UART buffer
+// index, so the faithful translation above is a true negative.
+//
+// [INJECTED] Since the faithful translation never gives the analyzer an
+// OOB to find, two synthetic main tasks were added on top of it. This
+// part is NOT in the original UART_TwoBoards_ComIT example.
+// UART_TwoBoards_ComIT is one of the longer translated examples, so it
+// carries two injected bugs: one interrupt-race pattern plus one
+// non-handler precision test (compare to stm32_tim_timebase.si /
+// stm32_gpio_exti.si, the shorter examples, which each carry exactly
+// one).
+//
+// Bug 1 — command-slot log task (Pattern 3: multi-depth heap alias).
+// Firmware that dispatches/logs each TX/RX command cycle by a rotating
+// slot number is a common pattern; a new UartCmdRegs[CMD_REG_SLOT] cell
+// models that slot, tagged once per task instance before the
+// button-wait/TX/RX sequence runs. Same shape as
+// benchmark/micro3_aliasmulti_buggy.si: main reaches UartCmdRegs through
+// a heap-stored pointer (UartDescTable[0]) rather than a direct variable
+// assignment; handler 1 (EXTI button press) can corrupt
+// UartCmdRegs[CMD_REG_SLOT] via a separate 2-level path (UartCmdPtr)
+// between main's if-check and the then-branch.
+// Expected -prov: 1 warning — interrupt influence: handler 1, right OOB.
+//
+// Bug 2 — diagnostic sample-history task (Pattern 4: precision test,
+// non-handler OOB). Same shape as benchmark/micro4_nonhandler_oob.si:
+// UART_DIAG_SAMPLES (10) > UART_DIAG_SIZE (8); UartDiagIdx is local to
+// main and never written by any handler, so the OOB at UartDiagIdx in
+// [8,9] is entirely main's own loop-bound mismatch, not an interrupt
+// race. This candidate must NOT appear in the -prov warning count.
 //
 init {
   // === Constants ===
@@ -31,6 +59,15 @@ init {
   STATE_BUSY_TX := 1;
   STATE_BUSY_RX := 2;
   PAYLOAD_BYTE := 42;
+
+  // === [INJECTED] command-slot log task constants ===
+  UART_CMD_SLOTS := 4;
+  UART_CMD_ABORT := 255;
+  CMD_REG_SLOT := 0;
+
+  // === [INJECTED] diagnostic sample-history task constants ===
+  UART_DIAG_SAMPLES := 10;
+  UART_DIAG_SIZE := 8;
 
   // === User-visible shared state ===
   UartReady := RESET;
@@ -59,6 +96,18 @@ init {
   // === Arrays ===
   aTxBuffer := malloc(90, PAYLOAD_BYTE);
   aRxBuffer := malloc(90, 0);
+
+  // === [INJECTED] command-slot log task state/arrays ===
+  // UartDescTable[0] holds a heap pointer to UartCmdRegs (mirrors
+  // benchmark/micro3_aliasmulti_buggy.si's DescTable/DmaConf pair).
+  UartCmdRegs := malloc(1, 0);
+  UartDescTable := malloc(1, 0);
+  UartCmdLog := malloc(4, 0);
+  *UartDescTable[0] := UartCmdRegs;
+  *UartCmdRegs[CMD_REG_SLOT] := 0;
+
+  // === [INJECTED] diagnostic sample-history task array ===
+  UartDiagLog := malloc(8, 0);
 
   // === Interrupt configuration flags ===
   ButtonExtiConfigured := 1;
@@ -119,7 +168,17 @@ init {
     // EXTI0_1_IRQHandler -> HAL_GPIO_EXTI_IRQHandler(USER_BUTTON_PIN)
     // -> HAL_GPIO_EXTI_Callback(USER_BUTTON_PIN)
     if ButtonExtiConfigured = 1
-    then UserButtonStatus := 1
+    then (
+      UserButtonStatus := 1;
+      // [INJECTED BUG] Models an abort/cancel side effect of the button
+      // press: pressing the button while a command-slot tag is in
+      // progress should reset UartCmdRegs[CMD_REG_SLOT] to a valid
+      // rotating value, but the (injected) reset writes the invalid
+      // sentinel UART_CMD_ABORT. Reached via a 2-level path (UartCmdPtr),
+      // separate from main's UartDescTable-based chain (see main).
+      UartCmdPtr := UartCmdRegs;
+      *UartCmdPtr[CMD_REG_SLOT] := UART_CMD_ABORT
+    )
     else unit
   }
 }
@@ -127,6 +186,48 @@ init {
 main {
   // HAL_Init, SystemClock_Config, BSP_LED_Init, HAL_UART_DeInit/Init, and
   // BSP_PB_Init are represented by initialized state above.
+
+  // === [INJECTED] Alias setup ===
+  // 3-level alias chain to UartCmdRegs (mirrors
+  // benchmark/micro3_aliasmulti_buggy.si's SysRef/EngRef/DmaConf chain):
+  //   level 1: UartSysRef is a var alias to UartDescTable
+  //   level 2: UartEngRef is loaded by dereferencing UartDescTable[0], so
+  //            it aliases UartCmdRegs
+  //   level 3: *UartEngRef[CMD_REG_SLOT] reads UartCmdRegs[CMD_REG_SLOT]
+  // Handler 1's 2-level chain (UartCmdPtr := UartCmdRegs) reaches the same
+  // cell directly. The aliasing is hidden from main's perspective: main
+  // reaches UartCmdRegs through a heap-stored pointer, not a direct
+  // variable assignment.
+  UartSysRef := UartDescTable;
+  UartEngRef := *UartSysRef[0];
+
+  // [INJECTED TASK] Command-slot log task: tag this task instance into a
+  // small rotating per-command log before waiting on the user button, the
+  // way firmware logs/dispatches a command-processing cycle by slot
+  // number.
+  // [INJECTED BUG] Pattern 3 (multi-depth heap alias): handler 1 (EXTI
+  // button press) can corrupt UartCmdRegs[CMD_REG_SLOT] via UartCmdPtr
+  // between this if-check and the then-branch, turning the bounds guard
+  // into a false guarantee.
+  if *UartEngRef[CMD_REG_SLOT] < UART_CMD_SLOTS
+  then *UartCmdLog[*UartEngRef[CMD_REG_SLOT]] := *UartEngRef[CMD_REG_SLOT]
+  else unit;
+
+  // [INJECTED TASK] Diagnostic sample-history task: record this task
+  // instance's UART_DIAG_SAMPLES diagnostic samples into a fixed-size
+  // ring before waiting on the user button, the way firmware keeps a
+  // short pre-flight diagnostic log per cycle.
+  // [INJECTED BUG] Pattern 4 (precision test, non-handler OOB): mirrors
+  // benchmark/micro4_nonhandler_oob.si. UART_DIAG_SAMPLES (10) >
+  // UART_DIAG_SIZE (8), so UartDiagIdx in [8,9] writes past the end of
+  // UartDiagLog. UartDiagIdx is local to main and no handler ever writes
+  // it or UartDiagLog, so this OOB must NOT be attributed to handler
+  // 0/1 under -prov.
+  UartDiagIdx := 0;
+  while UartDiagIdx < UART_DIAG_SAMPLES do (
+    *UartDiagLog[UartDiagIdx] := UartDiagIdx;
+    UartDiagIdx := UartDiagIdx + 1
+  );
 
   // Wait for User push-button press while LED4 blinks.
   while UserButtonStatus = 0 do (

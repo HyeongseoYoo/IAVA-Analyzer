@@ -267,6 +267,142 @@ but it is filtered out of the provenance report.
 
 ---
 
+## STM32 benchmarks (real-firmware translations + injected bugs)
+
+Four files derived from official STM32CubeF0 HAL examples (see
+`benchmark/stm32_conversion_prompt.md` for the conversion methodology).
+Each file models one *task* instance of a larger always-on firmware
+(SSD-style: an infinite loop dispatching queued tasks) rather than the
+literal `while(1)` forever-loop — consistent with how every other
+benchmark in this suite is a single bounded task execution, not the loop
+itself.
+
+A faithful translation of each official example is, on its own, a true
+negative — the real ST example code has no main/ISR array-index race for
+the analyzer to find. To give the analyzer a real target, each file has
+one or more synthetic main tasks and matching ISR-side corruptions added
+on top of the faithful translation, clearly marked `[INJECTED]` in the
+source. `stm32_gpio_exti.si` and `stm32_tim_timebase.si` are the shorter
+translated examples and each carry exactly **one** injected bug.
+`stm32_dma_flashtoram.si` and `stm32_uart_twoboards_comit.si` are longer
+and each carry **two**: one interrupt-race pattern plus one non-handler
+precision test, mirroring how the composite benchmarks above combine
+multiple patterns in one realistic scenario. Across all four files, every
+one of the suite's four bug patterns appears at least once.
+
+| File | Real example | Bugs | Patterns | Expected `-prov` |
+|---|---|---|---|---|
+| `stm32_gpio_exti.si` | GPIO/GPIO_EXTI | 1 | 1: direct scalar | 1 warning, left OOB |
+| `stm32_tim_timebase.si` | TIM/TIM_TimeBase | 1 | 2: 1-depth alias | 1 warning, right OOB |
+| `stm32_dma_flashtoram.si` | DMA/DMA_FLASHToRAM | 2 | 2: 1-depth alias + 4: precision test | 1 warning, right OOB (+1 filtered candidate) |
+| `stm32_uart_twoboards_comit.si` | UART/UART_TwoBoards_ComIT | 2 | 3: multi-depth heap alias + 4: precision test | 1 warning, right OOB (+1 filtered candidate) |
+
+### stm32_gpio_exti.si — Pattern 1: direct scalar
+
+Mirrors `micro1_direct_buggy.si`. Task role: per-line EXTI event-count
+task. EXTI0_1_IRQHandler is, by name, a shared vector for two physical
+lines (EXTI0/EXTI1); this model only wires up line 0, but the injected
+main task keeps a small per-line event counter table (`PinEventTable`)
+indexed by `GpioCallback_Pin` (the dispatch pin recorded by handler 0).
+Handler 0 (faithfully toggling LED3) also overwrites `GpioCallback_Pin`
+with the sentinel `EXTI_PIN_ABORT` (-1) on every firing — modeling the
+"other" multiplexed line that this translation never wires up. Handler 0
+can fire at the yield point between main's bounds checks and the
+`PinEventTable` write.
+
+**Bug site:** `*PinEventTable[GpioCallback_Pin]`
+
+| | Expected |
+|---|---|
+| `-prov` | 1 warning — `interrupt influence: handler 0`, left OOB `[-1, -1]` |
+
+### stm32_tim_timebase.si — Pattern 2: 1-depth alias
+
+Mirrors `micro2_alias1_buggy.si`. Task role: command-timeout poll. Many
+embedded/SSD firmwares scan a fixed-size pending-command table one slot
+per main pass using a round-robin cursor that a periodic timer ISR also
+drives forward. A new register field `TIM_REG_SLOT` on a small `TimRegs`
+register file holds that cursor. The injected main task creates
+`TimCtrl := TimRegs` (a 1-depth alias) and checks `*TimCtrl[TIM_REG_SLOT]`
+before re-reading it as the index into `TimSlotTable`. Handler 0 (TIM2
+period-elapsed, faithfully toggling LED5) can fire between the check and
+the re-read, corrupting the same heap cell through the original
+`TimRegs` name with the sentinel `TIM_SLOT_ABORT` (255).
+
+**Bug site:** `*TimSlotTable[*TimCtrl[TIM_REG_SLOT]]`
+
+| | Expected |
+|---|---|
+| `-prov` | 1 warning — `interrupt influence: handler 0`, right OOB `[8, 255]` |
+
+### stm32_dma_flashtoram.si — Pattern 2 + Pattern 4
+
+**Bug 1 (Pattern 2: 1-depth alias).** Task role: error-recovery salvage.
+A new register field `DMA_REG_SALVAGE` on the existing `DmaChannel`
+register file models a salvage cursor recorded on a transfer error. The
+injected main task creates `DmaCtrl := DmaChannel` (a 1-depth alias) and
+checks `*DmaCtrl[DMA_REG_SALVAGE]` before re-reading it as the index into
+`aDST_Buffer`. Handler 1 (the faithfully modeled transfer-error path) can
+fire between the check and the re-read, corrupting the same heap cell
+through the original `DmaChannel` name with the sentinel
+`DMA_SALVAGE_ABORT` (255).
+
+**Bug site:** `*aDST_Buffer[*DmaCtrl[DMA_REG_SALVAGE]]`
+
+| | Expected |
+|---|---|
+| `-prov` | 1 warning — `interrupt influence: handler 1`, right OOB `[32, 255]` |
+
+**Bug 2 (Pattern 4: precision test, non-handler OOB).** Mirrors
+`micro4_nonhandler_oob.si`. Task role: transfer-log sample-history.
+`DMA_LOG_SAMPLES` (10) > `DMA_LOG_SIZE` (8); the injected main task fills
+`DmaXferLog[DmaLogIdx]` for `DmaLogIdx` in `[0, 9]`, so `[8, 9]` is
+out-of-bounds. `DmaLogIdx` is local to main and no handler ever writes it
+or `DmaXferLog`, so this OOB is entirely main's own loop-bound mismatch.
+
+**Bug site:** `*DmaXferLog[DmaLogIdx]`
+
+| | Expected |
+|---|---|
+| `-prov` | right OOB `[8, 9]` internally, but **filtered out** (non-handler-caused) |
+
+### stm32_uart_twoboards_comit.si — Pattern 3 + Pattern 4
+
+**Bug 1 (Pattern 3: multi-depth heap alias).** Task role: command-slot
+log. Firmware that dispatches/logs each TX/RX command cycle by a
+rotating slot number is a common pattern; a new `UartCmdRegs[CMD_REG_SLOT]`
+cell models that slot. The injected main task builds a 3-level access
+chain entirely through a heap-stored pointer: `UartSysRef :=
+UartDescTable; UartEngRef := *UartSysRef[0]`. Handler 1 (EXTI button
+press, faithfully setting `UserButtonStatus`) reaches the same cell
+through a separate 2-level path (`UartCmdPtr := UartCmdRegs`) and writes
+the sentinel `UART_CMD_ABORT` (255) — an injected abort/cancel side
+effect of the button press. The pre-existing, faithfully translated
+`UartRxIdx`-guarded RX byte store is untouched and remains a true
+negative (the handler-local bound is still sound).
+
+**Bug site:** `*UartCmdLog[*UartEngRef[CMD_REG_SLOT]]`
+
+| | Expected |
+|---|---|
+| `-prov` | 1 warning — `interrupt influence: handler 1`, right OOB `[4, 255]` |
+
+**Bug 2 (Pattern 4: precision test, non-handler OOB).** Mirrors
+`micro4_nonhandler_oob.si`. Task role: diagnostic sample-history.
+`UART_DIAG_SAMPLES` (10) > `UART_DIAG_SIZE` (8); the injected main task
+fills `UartDiagLog[UartDiagIdx]` for `UartDiagIdx` in `[0, 9]`, so
+`[8, 9]` is out-of-bounds. `UartDiagIdx` is local to main and no handler
+ever writes it or `UartDiagLog`, so this OOB is entirely main's own
+loop-bound mismatch.
+
+**Bug site:** `*UartDiagLog[UartDiagIdx]`
+
+| | Expected |
+|---|---|
+| `-prov` | right OOB `[8, 9]` internally, but **filtered out** (non-handler-caused) |
+
+---
+
 ## Verification
 
 Run the correctness check with `-prov`:
@@ -288,6 +424,10 @@ Run the correctness check with `-prov`:
 | composite1_nvme_sqcq_fixed.si | 957 | 1 | 0 (true-negative only) |
 | composite2_uecc_dma.si | 966 | 4 | 3 (one per handler) |
 | composite2_uecc_dma_fixed.si | 965 | 1 | 0 (true-negative only) |
+| stm32_gpio_exti.si | 85 | 1 | 1 (handler 0, left OOB) |
+| stm32_tim_timebase.si | 100 | 1 | 1 (handler 0, right OOB) |
+| stm32_dma_flashtoram.si | 207 | 2 | 1 (handler 1, right OOB; 1 non-handler-caused, filtered) |
+| stm32_uart_twoboards_comit.si | 285 | 2 | 1 (handler 1, right OOB; 1 non-handler-caused, filtered) |
 
 All results confirmed by running the analyzer on the generated files.
 

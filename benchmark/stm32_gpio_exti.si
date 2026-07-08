@@ -5,7 +5,26 @@
 // -> HAL_GPIO_EXTI_Callback(GPIO_PIN_0), toggling LED3.
 // Omitted: clock tree setup, GPIO mode registers, NVIC priority, SysTick, and
 // assert/error loops; none feeds an array index or main/ISR shared data path.
-// Expected -prov: 0 warnings, true negative.
+// The faithful translation above is a true negative: handler 0 never
+// touches an array index.
+//
+// [INJECTED] Since the faithful translation never gives the analyzer an
+// OOB to find, a synthetic main task and a matching ISR-side corruption
+// were added on top of it. This part is NOT in the original GPIO_EXTI
+// example. GPIO_EXTI is one of the shorter translated examples, so it
+// carries exactly one injected bug (see stm32_dma_flashtoram.si and
+// stm32_uart_twoboards_comit.si for the longer examples, which each carry
+// two).
+// Task role: per-line EXTI event-count task. EXTI0_1_IRQHandler is, by
+// name, a shared vector for two physical lines (EXTI0/EXTI1); this model
+// only wires up line 0, but main keeps a small per-line debounce/event
+// counter table indexed by GpioCallback_Pin (the dispatch pin recorded by
+// handler 0), the way firmware servicing a shared multi-line vector would.
+// Bug pattern: Pattern 1 (direct scalar) — same shape as
+// benchmark/micro1_direct_buggy.si. Handler 0 can fire at the yield point
+// between main's bounds checks on GpioCallback_Pin and the PinEventTable
+// access, overwriting GpioCallback_Pin with the sentinel EXTI_PIN_ABORT.
+// Expected -prov: 1 warning — interrupt influence: handler 0, left OOB.
 //
 init {
   // === BSP constants actually used by the example ===
@@ -13,10 +32,17 @@ init {
   USER_BUTTON_PIN := GPIO_PIN_0;
   LED3 := 0;
 
+  // === [INJECTED] per-line EXTI event-count task constants ===
+  EXTI_PIN_COUNT := 2;
+  EXTI_PIN_ABORT := -1;
+
   // === Modeled board state ===
   LED3_State := 0;
   ExtiLine0_Configured := 1;
   GpioCallback_Pin := USER_BUTTON_PIN;
+
+  // === [INJECTED] per-line EXTI event-count task state ===
+  PinEventTable := malloc(2, 0);
 
   handler 0 {
     // EXTI0_1_IRQHandler -> HAL_GPIO_EXTI_IRQHandler(USER_BUTTON_PIN)
@@ -26,7 +52,12 @@ init {
       GpioCallback_Pin := USER_BUTTON_PIN;
       if GpioCallback_Pin = GPIO_PIN_0
       then LED3_State := 1 - LED3_State
-      else unit
+      else unit;
+      // [INJECTED BUG] Models the "other" multiplexed EXTI line that the
+      // real EXTI0_1 vector also services but this translation never
+      // wires up: instead of dispatching a valid GPIO_PIN_1, the
+      // (unmodeled) second-line path corrupts the dispatch pin index.
+      GpioCallback_Pin := EXTI_PIN_ABORT
     )
     else unit
   }
@@ -36,4 +67,19 @@ main {
   // HAL_Init, BSP_LED_Init(LED3), SystemClock_Config, and GPIO/NVIC setup
   // are already reflected in init.  The real main loop is empty.
   // In real - while(1) {}
+
+  // [INJECTED TASK] Per-line EXTI event-count task: bump the event
+  // counter for whichever line last fired, indexed by GpioCallback_Pin
+  // (set by handler 0).
+  // [INJECTED BUG] Pattern 1 (direct scalar): handler 0 can fire at the
+  // yield point between these bounds checks and the PinEventTable write,
+  // overwriting GpioCallback_Pin with EXTI_PIN_ABORT. The write then uses
+  // the corrupted index without re-checking it.
+  if EXTI_PIN_ABORT < GpioCallback_Pin
+  then (
+    if GpioCallback_Pin < EXTI_PIN_COUNT
+    then *PinEventTable[GpioCallback_Pin] := GpioCallback_Pin
+    else unit
+  )
+  else unit
 }
