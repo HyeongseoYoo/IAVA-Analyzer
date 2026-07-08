@@ -3,11 +3,7 @@ open Domain
 open Abs_dom
 open Interp
 
-type abs_conf = {
-  amem : Abs_Mem.t;
-  aimode : Interrupt.t;
-}
-
+type abs_conf = { amem : Abs_Mem.t; aimode : Interrupt.t }
 type abs_res = { avalue : Abs_Val.t; app : PPSet.t }
 
 (* A single memory-modifying effect compiled from a handler body *)
@@ -19,44 +15,49 @@ type summary_atom = {
 }
 
 (* Pre-compiled symbolic summary of a handler body *)
-type handler_summary =
-  | Compiled of summary_atom list
-  | Fallback of Exp.lbl_t
+type handler_summary = Compiled of summary_atom list | Fallback of Exp.lbl_t
 
 (* Pre-compiled fixpoint types *)
 
 (* Fixpoint effect of all handlers combined on a single scalar location *)
 type fp_scalar =
-  | FPS_Unchanged           (* no handler writes here *)
-  | FPS_Inc                 (* x := x + c (c>0): fixpoint sets upper → +∞ *)
-  | FPS_Dec                 (* x := x - c (c>0): fixpoint sets lower → -∞ *)
-  | FPS_JoinConsts of Itv.t (* x := constant: join current value with this itv *)
+  | FPS_Unchanged (* no handler writes here *)
+  | FPS_Inc (* x := x + c (c>0): fixpoint sets upper → +∞ *)
+  | FPS_Dec (* x := x - c (c>0): fixpoint sets lower → -∞ *)
+  | FPS_JoinConsts of
+      Itv.t (* x := constant: join current value with this itv *)
   | FPS_JoinVal of Abs_Val.t (* x := abstract constant, such as &y *)
-  | FPS_Top                 (* complex write: widen to top *)
+  | FPS_Top (* complex write: widen to top *)
 
 (* A single heap-array write effect extracted from handler bodies *)
 type fp_array_write = {
-  fpa_lbl       : Exp.Lbl.t;                              (* heap alloc label *)
-  fpa_idx       : [ `Const of Itv.t | `Var of Abs_Loc.t ]; (* index: constant or var *)
-  fpa_rhs       : [ `Const of Abs_Val.t | `Var of Abs_Loc.t ]; (* value: const or var *)
-  fpa_at        : ProgramPoint.t;
+  fpa_lbl : Exp.Lbl.t; (* heap alloc label *)
+  fpa_idx : [ `Const of Itv.t | `Var of Abs_Loc.t ];
+      (* index: constant or var *)
+  fpa_rhs : [ `Const of Abs_Val.t | `Var of Abs_Loc.t ];
+      (* value: const or var *)
+  fpa_at : ProgramPoint.t;
   fpa_offset_pp : PPSet.t;
-  fpa_guards    : (Exp.bop * Exp.lbl_t) list; (* branch guards applied before index lookup *)
-  fpa_base_var  : Abs_Loc.t; (* base pointer variable of the array write *)
+  fpa_guards : (Exp.bop * Exp.lbl_t) list;
+      (* branch guards applied before index lookup *)
+  fpa_base_var : Abs_Loc.t; (* base pointer variable of the array write *)
 }
 
 type compiled_fixpoint = {
   fp_scalars : (Abs_Loc.t * (fp_scalar * PPSet.t) list) list;
-  fp_arrays  : fp_array_write list;
+  fp_arrays : fp_array_write list;
 }
 
 let aenv : Abs_Env.t ref = ref Abs_Env.empty
 let aenv0 : Abs_Env.t ref = ref Abs_Env.empty
 let size_tbl : Itv.t LblMap.t ref = ref LblMap.empty
+
 let handler_summaries : handler_summary HandlerStore.IidMap.t ref =
   ref HandlerStore.IidMap.empty
+
 let compiled_fp : compiled_fixpoint ref =
   ref { fp_scalars = []; fp_arrays = [] }
+
 let use_compiled_fp : bool ref = ref false
 let use_selective_handler_application : bool ref = ref true
 let asem : Abs_Sem.t ref = ref Abs_Sem.bot
@@ -176,22 +177,22 @@ let get_itv_from_exp (e : Exp.t) (amem : Abs_Mem.t) : Itv.t =
   | Var x -> (
       match Abs_Env.find !aenv x with
       | None -> Itv.bot
-      | Some loc ->
+      | Some loc -> (
           match Abs_Mem.LocMap.find_opt loc amem with
-          | Some ((itv, _, _), _) -> itv
-          | None -> Itv.bot)
+          | Some ((itv, _), _) -> itv
+          | None -> Itv.bot))
   | _ -> Itv.top
 
 let narrow_var_in_amem (x : string) (bop : Exp.bop) (other_itv : Itv.t)
     (amem : Abs_Mem.t) : Abs_Mem.t =
   match Abs_Env.find !aenv x with
   | None -> amem
-  | Some loc ->
+  | Some loc -> (
       match Abs_Mem.LocMap.find_opt loc amem with
       | None -> amem
-      | Some ((curr_itv, u, l), pp) ->
+      | Some ((curr_itv, l), pp) ->
           let narrowed = narrow_left bop curr_itv other_itv in
-          Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem
+          Abs_Mem.LocMap.add loc ((narrowed, l), pp) amem)
 
 (* Narrow x in amem assuming guard = Some(bop, Bop(_, Var x, rhs)) is true. *)
 let refine_amem_by_guard (guard : (Exp.bop * Exp.lbl_t) option)
@@ -211,7 +212,8 @@ let refine_amem_by_guards (guards : (Exp.bop * Exp.lbl_t) list)
     (fun acc (bop, cond_e) -> refine_amem_by_guard (Some (bop, cond_e)) acc)
     amem guards
 
-(* Narrow amem for the true (branch=true) or false (branch=false) branch of cond_exp. *)
+(* Narrow amem for the true (branch=true) or false (branch=false) branch of
+   cond_exp. *)
 let refine_amem (cond_exp : Exp.lbl_t) (branch : bool) (amem : Abs_Mem.t) :
     Abs_Mem.t =
   match cond_exp.exp with
@@ -225,27 +227,27 @@ let refine_amem (cond_exp : Exp.lbl_t) (branch : bool) (amem : Abs_Mem.t) :
   | Var x -> (
       match Abs_Env.find !aenv x with
       | None -> amem
-      | Some loc ->
+      | Some loc -> (
           match Abs_Mem.LocMap.find_opt loc amem with
           | None -> amem
-          | Some ((curr_itv, u, l), pp) ->
+          | Some ((curr_itv, l), pp) ->
               (* false branch: narrow x to 0; true branch: no refinement *)
               if branch then amem
               else
                 let narrowed = Itv.meet curr_itv (Itv.alpha 0) in
-                Abs_Mem.LocMap.add loc ((narrowed, u, l), pp) amem)
+                Abs_Mem.LocMap.add loc ((narrowed, l), pp) amem))
   | _ -> amem
 
-let abs_unit () : Abs_Val.t = (Itv.bot, Abs_Unit.Unit, Abs_Loc.bot)
-let abs_int (itv : Itv.t) : Abs_Val.t = (itv, Abs_Unit.bot, Abs_Loc.bot)
-let abs_loc (l : Abs_Loc.t) : Abs_Val.t = (Itv.bot, Abs_Unit.bot, l)
+let abs_zero () : Abs_Val.t = (Itv.alpha 0, Abs_LocSet.bot)
+let abs_int (itv : Itv.t) : Abs_Val.t = (itv, Abs_LocSet.bot)
+let abs_loc (l : Abs_Loc.t) : Abs_Val.t = (Itv.bot, Abs_LocSet.singleton l)
 
 let proj_int (v : Abs_Val.t) : Itv.t =
-  let i, _u, _l = v in
+  let i, _l = v in
   i
 
-let proj_loc (v : Abs_Val.t) : Abs_Loc.t =
-  let _i, _u, l = v in
+let proj_loc (v : Abs_Val.t) : Abs_LocSet.t =
+  let _i, l = v in
   l
 
 let get_offset (itv : Itv.t) : Itv.t =
@@ -285,15 +287,15 @@ let itv_overlap (loc : Abs_Loc.t) : Itv.t * Itv.t * Itv.t =
           (in_itv, left_oob, right_oob))
 
 let equal_check (v1 : Abs_Val.t) (v2 : Abs_Val.t) : Itv.t =
-  let itv1, _u1, loc1 = v1 in
-  let itv2, _u2, loc2 = v2 in
+  let itv1, loc1 = v1 in
+  let itv2, loc2 = v2 in
   let has_int1 = itv1 <> Itv.bot in
   let has_int2 = itv2 <> Itv.bot in
-  let has_loc1 = loc1 <> Abs_Loc.bot in
-  let has_loc2 = loc2 <> Abs_Loc.bot in
+  let has_loc1 = not (Abs_LocSet.is_bot loc1) in
+  let has_loc2 = not (Abs_LocSet.is_bot loc2) in
   (* Return definite answer only when both int and loc components agree. *)
   let int_answer =
-    if not has_int1 && not has_int2 then None
+    if (not has_int1) && not has_int2 then None
     else if has_int1 && has_int2 then
       if Itv.single_eq itv1 itv2 then Some Itv.Bool.true_
       else if not (Itv.is_overlap itv1 itv2) then Some Itv.Bool.false_
@@ -301,18 +303,17 @@ let equal_check (v1 : Abs_Val.t) (v2 : Abs_Val.t) : Itv.t =
     else Some Itv.Bool.false_
   in
   let loc_answer =
-    if not has_loc1 && not has_loc2 then None
+    if (not has_loc1) && not has_loc2 then None
     else if has_loc1 && has_loc2 then
-      if Abs_Loc.single_eq loc1 loc2 then Some Itv.Bool.true_
-      else if not (loc_overlap loc1 loc2) then Some Itv.Bool.false_
+      if Abs_LocSet.single_eq loc1 loc2 then Some Itv.Bool.true_
+      else if not (Abs_LocSet.overlap loc1 loc2) then Some Itv.Bool.false_
       else Some Itv.Bool.top
     else Some Itv.Bool.false_
   in
   match (int_answer, loc_answer) with
   | None, None -> Itv.Bool.false_
   | Some a, None | None, Some a -> a
-  | Some a, Some b ->
-      if a = b then a else Itv.Bool.top
+  | Some a, Some b -> if a = b then a else Itv.Bool.top
 
 let is_pp_handler (pp : ProgramPoint.t) : bool =
   match pp with ProgramPoint.Label (Exp.Lbl.Handler _) -> true | _ -> false
@@ -338,6 +339,59 @@ let add_deref_oob_errors ~(at : ProgramPoint.t) ~(access : Error.access)
         errs := ErrorSet.add err !errs;
         c
 
+let write_locs (m : Abs_Mem.t) (locs : Abs_LocSet.t) (v : Abs_Val.t)
+    (pp : ProgramPoint.t) : Abs_Mem.t =
+  if Abs_LocSet.compare locs Abs_LocSet.top = 0 then
+    Abs_Mem.weak_write_all m v pp
+  else if Abs_LocSet.is_singleton locs then
+    Abs_LocSet.fold (fun l acc -> Abs_Mem.write acc l v pp) locs m
+  else Abs_LocSet.fold (fun l acc -> Abs_Mem.weak_write acc l v pp) locs m
+
+let read_locs (m : Abs_Mem.t) (locs : Abs_LocSet.t) : Abs_Val.t * PPSet.t =
+  if Abs_LocSet.compare locs Abs_LocSet.top = 0 then (Abs_Val.top, PPSet.empty)
+  else
+    Abs_LocSet.fold
+      (fun access_loc (acc_v, acc_pps) ->
+        Abs_Mem.fold
+          (fun (k : Abs_Loc.t) ((v, pps) : Abs_Val.t * PPSet.t)
+               (inner_v, inner_pps) ->
+            if loc_overlap access_loc k then
+              (Abs_Val.join inner_v v, PPSet.union inner_pps pps)
+            else (inner_v, inner_pps))
+          m (acc_v, acc_pps))
+      locs (Abs_Val.bot, PPSet.empty)
+
+let safe_deref_targets ~(at : ProgramPoint.t) ~(access : Error.access)
+    ~(base_pp : PPSet.t) ~(offset_pp : PPSet.t) (shifted_locs : Abs_LocSet.t)
+    (c : abs_conf) : Abs_LocSet.t * abs_conf =
+  Abs_LocSet.fold
+    (fun shifted_loc (acc_locs, acc_c) ->
+      let safe_itv, left_oob, right_oob =
+        match shifted_loc with
+        | Abs_Loc.AHeapLoc _ -> itv_overlap shifted_loc
+        | Abs_Loc.AVarLoc { offset; _ } ->
+            if Itv.leq offset (Itv.alpha 0) then (Itv.alpha 0, Itv.bot, Itv.bot)
+            else
+              raise
+                (Runtime_error
+                   "[Deref] Variable-address dereference only supports offset 0")
+        | Abs_Loc.Bot -> (Itv.bot, Itv.bot, Itv.bot)
+        | Abs_Loc.Top -> (Itv.top, Itv.top, Itv.top)
+      in
+      let access_loc =
+        match shifted_loc with
+        | Abs_Loc.AHeapLoc { lbl; _ } ->
+            Abs_Loc.AHeapLoc { lbl; offset = safe_itv }
+        | Abs_Loc.AVarLoc _ -> shifted_loc
+        | Abs_Loc.Bot -> Abs_Loc.Bot
+        | Abs_Loc.Top -> Abs_Loc.Top
+      in
+      let acc_c =
+        add_deref_oob_errors ~at ~access ~base:shifted_loc ~in_itv:safe_itv
+          ~left_oob ~right_oob ~base_pp ~offset_pp acc_c
+      in
+      (Abs_LocSet.join acc_locs (Abs_LocSet.singleton access_loc), acc_c))
+    shifted_locs (Abs_LocSet.bot, c)
 
 let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
     ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) : abs_res * abs_conf
@@ -348,18 +402,18 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
   let pp = ProgramPoint.Label lbl in
   let res, c_after_eval =
     match exp with
-    | Unit -> ({ r with avalue = abs_unit () }, c)
+    | Unit -> ({ r with avalue = abs_zero () }, c)
     | Int n -> ({ r with avalue = abs_int (Itv.alpha n) }, c)
     | Var x -> (
         if lvalue then
           let l =
-            if !in_handler_exec then
+            if !in_handler_exec then (
               match Abs_Env.find !aenv x with
               | Some existing -> existing
               | None ->
                   let loc = Abs_Loc.get (x ^ "#") in
                   aenv := Abs_Env.write !aenv x loc;
-                  loc
+                  loc)
             else begin
               let l = Abs_Loc.get x in
               aenv := Abs_Env.write !aenv x l;
@@ -373,17 +427,20 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
             | Some l -> l
             | None -> raise (Runtime_error ("[Abs_Env] " ^ x ^ " not declared"))
           in
-          (match Abs_Mem.LocMap.find_opt loc amem with
-           | Some (v, p') -> ({ avalue = v; app = p' }, c)
-           | None -> raise (Runtime_error ("[Abs_Mem] " ^ x ^ " not initialized"))))
+          match Abs_Mem.LocMap.find_opt loc amem with
+          | Some (v, p') -> ({ avalue = v; app = p' }, c)
+          | None ->
+              raise (Runtime_error ("[Abs_Mem] " ^ x ^ " not initialized")))
     | AddrOf x -> (
         match Abs_Env.find !aenv x with
         | Some loc -> ({ r with avalue = abs_loc loc }, c)
-        | None -> raise (Runtime_error ("[Abs_Env] AddrOf: " ^ x ^ " not declared")))
+        | None ->
+            raise (Runtime_error ("[Abs_Env] AddrOf: " ^ x ^ " not declared")))
     | Enable ->
-        ({ r with avalue = abs_unit () }, { c with aimode = Interrupt.Enabled })
+        ( { r with avalue = abs_int (Itv.alpha 1) },
+          { c with aimode = Interrupt.Enabled } )
     | Disable ->
-        ({ r with avalue = abs_unit () }, { c with aimode = Interrupt.Disabled })
+        ({ r with avalue = abs_zero () }, { c with aimode = Interrupt.Disabled })
     | Malloc (e1, e2) -> (
         let r1, c1 = self c e1 in
         let r2, c2 = self c1 e2 in
@@ -409,61 +466,24 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
                 c2.amem heap_cells
             in
             ({ r with avalue = abs_loc base_l }, { c2 with amem = amem' }))
-    | Deref (e1, e2) -> (
+    | Deref (e1, e2) ->
         let r1, c1 = self c e1 in
         let r2, c2 = self c1 e2 in
-        let base_loc = proj_loc r1.avalue in
+        let base_locs = proj_loc r1.avalue in
         let offset_itv = proj_int r2.avalue in
-        let shifted_loc = Abs_Loc.offset_add base_loc offset_itv in
-        (* Clip dereference targets to in-bounds offsets before memory access. *)
-        let safe_itv, left_oob, right_oob =
-          match base_loc with
-          | Abs_Loc.AHeapLoc _ -> itv_overlap shifted_loc
-          | Abs_Loc.AVarLoc _ ->
-              (* TODO: only offset 0 is valid for variable addresses. *)
-              if Itv.leq offset_itv (Itv.alpha 0) then
-                (Itv.alpha 0, Itv.bot, Itv.bot)
-              else
-                raise
-                  (Runtime_error
-                     "[Deref] Variable-address dereference only supports offset 0")
-          | Abs_Loc.Bot -> (Itv.bot, Itv.bot, Itv.bot)
-          | Abs_Loc.Top -> (Itv.top, Itv.top, Itv.top)
-        in
-
-        let access_loc =
-          match shifted_loc with
-          | Abs_Loc.AHeapLoc { lbl; _ } ->
-              Abs_Loc.AHeapLoc { lbl; offset = safe_itv }
-          | Abs_Loc.AVarLoc _ -> shifted_loc
-          | Abs_Loc.Bot -> Abs_Loc.Bot
-          | Abs_Loc.Top -> Abs_Loc.Top
-        in
-
+        let shifted_locs = Abs_LocSet.offset_add base_locs offset_itv in
         let access = if lvalue then Error.Write else Error.Read in
-        let c2_err =
-          add_deref_oob_errors ~at:pp ~access ~base:shifted_loc ~in_itv:safe_itv
-            ~left_oob ~right_oob ~base_pp:r1.app ~offset_pp:r2.app c2
+        let access_locs, c2_err =
+          safe_deref_targets ~at:pp ~access ~base_pp:r1.app ~offset_pp:r2.app
+            shifted_locs c2
         in
         if lvalue then
-          match access_loc with
-          | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
-          | _ -> ({ r with avalue = abs_loc access_loc }, c2_err)
+          if Abs_LocSet.is_bot access_locs then
+            ({ r with avalue = Abs_Val.bot }, c2_err)
+          else ({ r with avalue = (Itv.bot, access_locs) }, c2_err)
         else
-          match access_loc with
-          | Abs_Loc.Bot -> ({ r with avalue = Abs_Val.bot }, c2_err)
-          | Abs_Loc.Top -> ({ r with avalue = Abs_Val.top }, c2_err)
-          | Abs_Loc.AVarLoc _ | Abs_Loc.AHeapLoc _ ->
-              let v_join, pp_join =
-                Abs_Mem.fold
-                  (fun (k : Abs_Loc.t) ((v, pps) : Abs_Val.t * PPSet.t)
-                       (acc_v, acc_pps) ->
-                    if loc_overlap access_loc k then
-                      (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
-                    else (acc_v, acc_pps))
-                  c2.amem (Abs_Val.bot, PPSet.empty)
-              in
-              ({ avalue = v_join; app = pp_join }, c2_err))
+          let v_join, pp_join = read_locs c2.amem access_locs in
+          ({ avalue = v_join; app = pp_join }, c2_err)
     | Bop (bop, e1, e2) -> (
         let r1, c1 = self c e1 in
         let r2, c2 = self c1 e2 in
@@ -477,23 +497,43 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         | Lt ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.lt v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.lt v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | Gt ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.gt v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.gt v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | Ne ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.ne v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.ne v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | Le ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.le v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.le v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | Ge ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.ge v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.ge v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | Plus ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
@@ -515,24 +555,32 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
         | And ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.and_ v1 v2); app = PPSet.union r1.app r2.app }, c2)
+            ( {
+                avalue = abs_int (Itv.and_ v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 )
         | Or ->
             let v1 = proj_int r1.avalue in
             let v2 = proj_int r2.avalue in
-            ({ avalue = abs_int (Itv.or_ v1 v2); app = PPSet.union r1.app r2.app }, c2))
+            ( {
+                avalue = abs_int (Itv.or_ v1 v2);
+                app = PPSet.union r1.app r2.app;
+              },
+              c2 ))
     | Assign (e1, e2) ->
         let r1, c1 = self ~lvalue:true c e1 in
         let r2, c2 = self c1 e2 in
-        let l = proj_loc r1.avalue in
-        let amem' = Abs_Mem.write c2.amem l r2.avalue pp in
-        ({ avalue = abs_unit (); app = PPSet.empty }, { c2 with amem = amem' })
+        let locs = proj_loc r1.avalue in
+        let amem' = write_locs c2.amem locs r2.avalue pp in
+        ({ avalue = r2.avalue; app = PPSet.empty }, { c2 with amem = amem' })
     | Seq (e1, e2) ->
         let _, c1 = self c e1 in
         self c1 e2
     | If (e1, e2, e3) ->
         let r1, c1 = self c e1 in
         let v1 = proj_int r1.avalue in
-        let c1_true  = { c1 with amem = refine_amem e1 true  c1.amem } in
+        let c1_true = { c1 with amem = refine_amem e1 true c1.amem } in
         let c1_false = { c1 with amem = refine_amem e1 false c1.amem } in
         if v1 = Itv.Bool.true_ then
           let r2, c2 = self c1_true e2 in
@@ -551,7 +599,9 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           if cond_itv = Itv.Bool.false_ then
             { ccond with amem = refine_amem econd false ccond.amem }
           else begin
-            let ccond_true = { ccond with amem = refine_amem econd true ccond.amem } in
+            let ccond_true =
+              { ccond with amem = refine_amem econd true ccond.amem }
+            in
             let _rbody, cbody = self ccond_true ebody in
             let next =
               if cond_itv = Itv.Bool.top then join_conf ccond cbody else cbody
@@ -563,7 +613,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           end
         in
         let output = iterate 0 c in
-        ({ avalue = abs_unit (); app = PPSet.empty }, output)
+        ({ avalue = abs_zero (); app = PPSet.empty }, output)
   in
   match c.aimode with
   | Disabled ->
@@ -573,13 +623,16 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
       (* Apply handler effects only at yield points unless selective application
          is disabled for performance/precision experiments. *)
       let is_yield_point =
-        match exp with Assign _ | Malloc _ | Var _ | Deref _ -> true | _ -> false
+        match exp with
+        | Assign _ | Malloc _ | Var _ | Deref _ -> true
+        | _ -> false
       in
       if (not !use_selective_handler_application) || is_yield_point then begin
         let c_after_post = !post_steps_fn c_after_eval in
         record_sem pp c_after_post;
         (res, c_after_post)
-      end else begin
+      end
+      else begin
         record_sem pp c_after_eval;
         (res, c_after_eval)
       end
@@ -598,18 +651,18 @@ let apply_atom (atom : summary_atom) (c : abs_conf) : abs_conf =
   let c_guarded = { c with amem = refine_amem_by_guards atom.guards c.amem } in
   let r1, c1 = eval_no_post ~lvalue:true c_guarded atom.lhs in
   let r2, c2 = eval_no_post c1 atom.rhs in
-  let l = proj_loc r1.avalue in
+  let locs = proj_loc r1.avalue in
   let pp = ProgramPoint.Label atom.assign_lbl in
-  match l with
-  | Abs_Loc.Bot -> c2
-  | _ ->
-      let amem' = Abs_Mem.write c2.amem l r2.avalue pp in
-      { c2 with amem = amem' }
+  if Abs_LocSet.is_bot locs then c2
+  else
+    let amem' = write_locs c2.amem locs r2.avalue pp in
+    { c2 with amem = amem' }
 
-(* Apply handler summary (aimode must be Disabled).
-   Compiled: apply atoms in sequence; Fallback: evaluate body with eval_no_post.
-   aenv is saved, reset to aenv0 for the handler's local scope, then restored. *)
-let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf =
+(* Apply handler summary (aimode must be Disabled). Compiled: apply atoms in
+   sequence; Fallback: evaluate body with eval_no_post. aenv is saved, reset to
+   aenv0 for the handler's local scope, then restored. *)
+let apply_handler_summary (summary : handler_summary) (c : abs_conf) : abs_conf
+    =
   let saved_env = !aenv in
   aenv := !aenv0;
   in_handler_exec := true;
@@ -638,7 +691,8 @@ let post_step_summary (c : abs_conf) : abs_conf =
         | Some summary ->
             let c' = apply_handler_summary summary input_clean in
             join_conf acc c')
-      !iset { input_clean with aimode = c.aimode }
+      !iset
+      { input_clean with aimode = c.aimode }
   in
   let handler_asem = !asem in
   asem := Abs_Sem.join saved_asem handler_asem;
@@ -658,23 +712,26 @@ let post_steps_summary (c0 : abs_conf) : abs_conf =
 
 (* Fixpoint classification helpers *)
 
-(* All-uppercase variable names are treated as compile-time integer constants. *)
+(* All-uppercase variable names are treated as compile-time integer
+   constants. *)
 let is_const_name (s : string) : bool =
   String.length s > 0
   && String.for_all
        (fun c -> (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_')
        s
 
-(* Map all-uppercase singleton-valued scalars in init_amem to their integer value. *)
+(* Map all-uppercase singleton-valued scalars in init_amem to their integer
+   value. *)
 let build_const_map (init_amem : Abs_Mem.t) : (string, int) Hashtbl.t =
   let tbl = Hashtbl.create 64 in
   Abs_Mem.fold
     (fun loc (v, _) () ->
       match loc with
-      | Abs_Loc.AVarLoc { id = x; offset = Itv.Itv (Itv.Bound.Z 0, Itv.Bound.Z 0) }
-        when is_const_name x ->
-          let (itv, _, _) = v in
-          (match itv with
+      | Abs_Loc.AVarLoc
+          { id = x; offset = Itv.Itv (Itv.Bound.Z 0, Itv.Bound.Z 0) }
+        when is_const_name x -> (
+          let itv, _ = v in
+          match itv with
           | Itv.Itv (Itv.Bound.Z n, Itv.Bound.Z m) when n = m ->
               Hashtbl.replace tbl x n
           | _ -> ())
@@ -682,10 +739,8 @@ let build_const_map (init_amem : Abs_Mem.t) : (string, int) Hashtbl.t =
     init_amem ();
   tbl
 
-
 (* Apply a pre-compiled scalar fixpoint effect to an abstract value *)
-let apply_fp_scalar (fps : fp_scalar) (((itv, u, l) as v) : Abs_Val.t) :
-    Abs_Val.t =
+let apply_fp_scalar (fps : fp_scalar) ((itv, l) as v : Abs_Val.t) : Abs_Val.t =
   match fps with
   | FPS_Unchanged -> v
   | FPS_Inc ->
@@ -694,33 +749,46 @@ let apply_fp_scalar (fps : fp_scalar) (((itv, u, l) as v) : Abs_Val.t) :
         | Itv.Bot -> Itv.Bot
         | Itv.Itv (lo, _) -> Itv.Itv (lo, Itv.Bound.P_inf)
       in
-      (new_itv, u, l)
+      (new_itv, l)
   | FPS_Dec ->
       let new_itv =
         match itv with
         | Itv.Bot -> Itv.Bot
         | Itv.Itv (_, hi) -> Itv.Itv (Itv.Bound.N_inf, hi)
       in
-      (new_itv, u, l)
+      (new_itv, l)
   | FPS_JoinConsts c -> Abs_Val.join v (abs_int c)
   | FPS_JoinVal v' -> Abs_Val.join v v'
-  | FPS_Top -> (Itv.top, u, l)
+  | FPS_Top -> (Itv.top, l)
 
-let apply_scalar_effects (effects : (fp_scalar * PPSet.t) list)
-    (v : Abs_Val.t) (existing_pps : PPSet.t) : Abs_Val.t * PPSet.t =
+let apply_scalar_effects (effects : (fp_scalar * PPSet.t) list) (v : Abs_Val.t)
+    (existing_pps : PPSet.t) : Abs_Val.t * PPSet.t =
   let all_pps =
-    List.fold_left (fun acc (_, pps) -> PPSet.union acc pps) existing_pps effects
+    List.fold_left
+      (fun acc (_, pps) -> PPSet.union acc pps)
+      existing_pps effects
   in
   let has_top = List.exists (fun (fps, _) -> fps = FPS_Top) effects in
   let has_inc = List.exists (fun (fps, _) -> fps = FPS_Inc) effects in
   let has_dec = List.exists (fun (fps, _) -> fps = FPS_Dec) effects in
-  if has_top || (has_inc && has_dec) then
-    (Abs_Val.top, all_pps)
+  if has_top || (has_inc && has_dec) then (Abs_Val.top, all_pps)
   else
-    let v' = List.fold_left (fun acc (fps, _) -> apply_fp_scalar fps acc) v effects in
+    let v' =
+      List.fold_left (fun acc (fps, _) -> apply_fp_scalar fps acc) v effects
+    in
     (v', all_pps)
 
-(* Map handler-local pointer variables to heap labels, handling simple aliases. *)
+let heap_label_of_locset (locs : Abs_LocSet.t) : Exp.Lbl.t option =
+  Abs_LocSet.fold
+    (fun loc acc ->
+      match (acc, loc) with
+      | Some _, _ -> acc
+      | None, Abs_Loc.AHeapLoc { lbl; _ } -> Some lbl
+      | None, _ -> None)
+    locs None
+
+(* Map handler-local pointer variables to heap labels, handling simple
+   aliases. *)
 let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
     (string, Exp.Lbl.t) Hashtbl.t =
   let tbl : (string, Exp.Lbl.t) Hashtbl.t = Hashtbl.create 4 in
@@ -732,7 +800,7 @@ let build_local_ptr_map (atoms : summary_atom list) (init_amem : Abs_Mem.t) :
   let resolve_ptr_lbl name =
     let loc = get_loc0 name in
     match Abs_Mem.LocMap.find_opt loc init_amem with
-    | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) -> Some lbl
+    | Some ((_, locs), _) -> heap_label_of_locset locs
     | _ -> Hashtbl.find_opt tbl name
   in
   List.iter
@@ -776,8 +844,8 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
         | Bop (Minus, { exp = Var y; _ }, { exp = Int n; _ })
           when Abs_Loc.compare loc (get_loc0 y) = 0 ->
             if n > 0 then FPS_Dec else if n < 0 then FPS_Inc else FPS_Unchanged
-        | Var y when is_const_name y ->
-            (match Hashtbl.find_opt const_map y with
+        | Var y when is_const_name y -> (
+            match Hashtbl.find_opt const_map y with
             | Some n -> FPS_JoinConsts (Itv.alpha n)
             | None -> FPS_Top)
         | _ -> FPS_Top
@@ -789,17 +857,19 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
           | None -> []
           | Some effects -> effects
         in
-        Hashtbl.replace scalar_tbl loc ((fps, PPSet.singleton handler_pp) :: old_effects)
+        Hashtbl.replace scalar_tbl loc
+          ((fps, PPSet.singleton handler_pp) :: old_effects)
       end
-  | Deref ({ exp = Var arr_name; _ }, idx_e) ->
-      (* Resolve target heap block: check init_amem first, then local_ptr_map. *)
+  | Deref ({ exp = Var arr_name; _ }, idx_e) -> (
+      (* Resolve target heap block: check init_amem first, then
+         local_ptr_map. *)
       let arr_var_loc = get_loc0 arr_name in
       let heap_lbl_opt =
         match Abs_Mem.LocMap.find_opt arr_var_loc init_amem with
-        | Some ((_, _, Abs_Loc.AHeapLoc { lbl; _ }), _) -> Some lbl
+        | Some ((_, locs), _) -> heap_label_of_locset locs
         | _ -> Hashtbl.find_opt local_ptr_map arr_name
       in
-      (match heap_lbl_opt with
+      match heap_lbl_opt with
       | Some lbl ->
           let fpa_idx =
             match idx_e.exp with
@@ -816,9 +886,15 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
           in
           let fpa_at = ProgramPoint.Label atom.assign_lbl in
           array_writes :=
-            { fpa_lbl = lbl; fpa_idx; fpa_rhs; fpa_at;
-              fpa_offset_pp = PPSet.singleton fpa_at; fpa_guards = atom.guards;
-              fpa_base_var = arr_var_loc }
+            {
+              fpa_lbl = lbl;
+              fpa_idx;
+              fpa_rhs;
+              fpa_at;
+              fpa_offset_pp = PPSet.singleton fpa_at;
+              fpa_guards = atom.guards;
+              fpa_base_var = arr_var_loc;
+            }
             :: !array_writes
       | None -> ())
   | _ -> ()
@@ -826,7 +902,9 @@ let classify_atom (atom : summary_atom) (init_amem : Abs_Mem.t)
 (* Build compiled_fixpoint from all Compiled handler summaries. *)
 let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
   let const_map = build_const_map init_amem in
-  let scalar_tbl : (Abs_Loc.t, (fp_scalar * PPSet.t) list) Hashtbl.t = Hashtbl.create 16 in
+  let scalar_tbl : (Abs_Loc.t, (fp_scalar * PPSet.t) list) Hashtbl.t =
+    Hashtbl.create 16
+  in
   let array_writes : fp_array_write list ref = ref [] in
   HandlerStore.IidMap.iter
     (fun _iid summary ->
@@ -835,7 +913,8 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
           let local_ptr_map = build_local_ptr_map atoms init_amem in
           List.iter
             (fun atom ->
-              classify_atom atom init_amem const_map local_ptr_map scalar_tbl array_writes)
+              classify_atom atom init_amem const_map local_ptr_map scalar_tbl
+                array_writes)
             atoms
       | Fallback _ -> ())
     !handler_summaries;
@@ -850,13 +929,16 @@ let compile_fixpoint (init_amem : Abs_Mem.t) : unit =
   in
   use_compiled_fp := not has_fallback
 
-(* Apply pre-compiled fixpoint: scalar pass, then array-write pass, then synthesize asem snapshots. *)
+(* Apply pre-compiled fixpoint: scalar pass, then array-write pass, then
+   synthesize asem snapshots. *)
 let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   (* Pass 1: scalar effects *)
   let amem1 =
     List.fold_left
       (fun amem (loc, effects) ->
-        let active = List.filter (fun (fps, _) -> fps <> FPS_Unchanged) effects in
+        let active =
+          List.filter (fun (fps, _) -> fps <> FPS_Unchanged) effects
+        in
         if active = [] then amem
         else
           match Abs_Mem.LocMap.find_opt loc amem with
@@ -874,16 +956,17 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
         let offset_itv =
           match fpa.fpa_idx with
           | `Const itv -> itv
-          | `Var idx_loc ->
-              (match Abs_Mem.LocMap.find_opt idx_loc amem_for_idx with
-              | Some ((itv, _, _), _) -> itv
+          | `Var idx_loc -> (
+              match Abs_Mem.LocMap.find_opt idx_loc amem_for_idx with
+              | Some ((itv, _), _) -> itv
               | None -> Itv.bot)
         in
         let write_loc =
           Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = offset_itv }
         in
         let in_itv, left_oob, right_oob = itv_overlap write_loc in
-        (* Report the original target, but write only the safe in-bounds part. *)
+        (* Report the original target, but write only the safe in-bounds
+           part. *)
         let in_bounds_write_loc =
           Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = in_itv }
         in
@@ -920,7 +1003,8 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
     errs := errs';
     amem
   in
-  (* Pass 3: synthesize asem snapshots for handler scalar assignments (for provenance). *)
+  (* Pass 3: synthesize asem snapshots for handler scalar assignments (for
+     provenance). *)
   let asem3 =
     List.fold_left
       (fun asem (loc, effects) ->
@@ -932,31 +1016,35 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
                 let contributed_itv =
                   match fps with
                   | FPS_JoinConsts c -> c
-                  | FPS_JoinVal (itv, _, _) -> itv
+                  | FPS_JoinVal (itv, _) -> itv
                   | _ -> Itv.top
                 in
                 let contributed_val =
                   match fps with
                   | FPS_JoinVal v -> v
-                  | _ -> (contributed_itv, Abs_Unit.bot, Abs_Loc.bot)
+                  | _ -> (contributed_itv, Abs_LocSet.bot)
                 in
                 PPSet.fold
                   (fun pp asem'' ->
-                    let snapshot = Abs_Mem.write Abs_Mem.bot loc contributed_val pp in
+                    let snapshot =
+                      Abs_Mem.write Abs_Mem.bot loc contributed_val pp
+                    in
                     Abs_Sem.weak_write asem'' pp snapshot)
                   handler_pps asem')
           asem effects)
       !asem fp.fp_scalars
   in
-  (* Pass 4: synthesize asem snapshots for handler array writes (for provenance). *)
+  (* Pass 4: synthesize asem snapshots for handler array writes (for
+     provenance). *)
   let scalar_pps_map =
     List.fold_left
       (fun m (loc, effects) ->
         let all_pps =
-          List.fold_left (fun acc (_, pps) -> PPSet.union acc pps) PPSet.empty effects
+          List.fold_left
+            (fun acc (_, pps) -> PPSet.union acc pps)
+            PPSet.empty effects
         in
-        if PPSet.is_empty all_pps then m
-        else Abs_Mem.LocMap.add loc all_pps m)
+        if PPSet.is_empty all_pps then m else Abs_Mem.LocMap.add loc all_pps m)
       Abs_Mem.LocMap.empty fp.fp_scalars
   in
   let asem4 =
@@ -973,7 +1061,8 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
                     (fun pp snap -> Abs_Mem.weak_write snap val_loc v pp)
                     existing_pps Abs_Mem.bot)
         in
-        (* Add base pointer variable to snapshot if assigned inside the handler. *)
+        (* Add base pointer variable to snapshot if assigned inside the
+           handler. *)
         let base_assign_pps =
           match Abs_Mem.LocMap.find_opt fpa.fpa_base_var scalar_pps_map with
           | Some pps -> pps
@@ -982,19 +1071,23 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
         let base_ptr_val_opt =
           if PPSet.is_empty base_assign_pps then None
           else
-            Some (abs_loc (Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = Itv.alpha 0 }))
+            Some
+              (abs_loc
+                 (Abs_Loc.AHeapLoc { lbl = fpa.fpa_lbl; offset = Itv.alpha 0 }))
         in
         let enriched_snapshot =
           match base_ptr_val_opt with
           | None -> rhs_snapshot
           | Some bpv ->
-              Abs_Mem.LocMap.add fpa.fpa_base_var (bpv, base_assign_pps) rhs_snapshot
+              Abs_Mem.LocMap.add fpa.fpa_base_var (bpv, base_assign_pps)
+                rhs_snapshot
         in
         let asem' =
           if enriched_snapshot = Abs_Mem.bot then asem
           else
             PPSet.fold
-              (fun pp asem_acc -> Abs_Sem.weak_write asem_acc pp enriched_snapshot)
+              (fun pp asem_acc ->
+                Abs_Sem.weak_write asem_acc pp enriched_snapshot)
               fpa.fpa_offset_pp asem
         in
         (* Synthesize snapshot at base-pointer assignment PP for trace. *)
@@ -1012,7 +1105,8 @@ let apply_compiled_fixpoint (fp : compiled_fixpoint) (c : abs_conf) : abs_conf =
   asem := asem4;
   { c with amem = amem2 }
 
-(* Use compiled fixpoint if all handlers compiled; otherwise fall back to iterative. *)
+(* Use compiled fixpoint if all handlers compiled; otherwise fall back to
+   iterative. *)
 let apply_fixpoint_to_conf (c : abs_conf) : abs_conf =
   if !use_compiled_fp then begin
     let saved_env = !aenv in
@@ -1046,59 +1140,58 @@ let string_of_handler_summary (iid : int) (s : handler_summary) : string =
 let print_handler_summaries () : unit =
   print_endline "=== Handler Summaries ===";
   HandlerStore.IidMap.iter
-    (fun iid s ->
-      print_endline (string_of_handler_summary iid s))
+    (fun iid s -> print_endline (string_of_handler_summary iid s))
     !handler_summaries;
   print_endline "========================="
 
 let is_comparison_bop (bop : Exp.bop) =
-  match bop with
-  | Eq | Ne | Lt | Le | Gt | Ge -> true
-  | _ -> false
+  match bop with Eq | Ne | Lt | Le | Gt | Ge -> true | _ -> false
 
-(* Extract branch guards for simple "Var cmp rhs" conditions:
-   returns (then_guard, else_guard). *)
-let extract_branch_guards (cond_e : Exp.lbl_t)
-    : (Exp.bop * Exp.lbl_t) option * (Exp.bop * Exp.lbl_t) option =
+(* Extract branch guards for simple "Var cmp rhs" conditions: returns
+   (then_guard, else_guard). *)
+let extract_branch_guards (cond_e : Exp.lbl_t) :
+    (Exp.bop * Exp.lbl_t) option * (Exp.bop * Exp.lbl_t) option =
   match cond_e.exp with
   | Bop (bop, { exp = Var _; _ }, _) when is_comparison_bop bop ->
       (Some (bop, cond_e), Some (negate_bop bop, cond_e))
   | _ -> (None, None)
 
-let attach_guard (g : (Exp.bop * Exp.lbl_t) option) (s : handler_summary)
-    : handler_summary =
+let attach_guard (g : (Exp.bop * Exp.lbl_t) option) (s : handler_summary) :
+    handler_summary =
   match s with
   | Compiled atoms ->
       Compiled
         (List.map
            (fun a ->
-             match g with None -> a | Some guard -> { a with guards = guard :: a.guards })
+             match g with
+             | None -> a
+             | Some guard -> { a with guards = guard :: a.guards })
            atoms)
   | Fallback _ -> s
 
-(* Compile handler body to a summary: assigns → atoms, if-branches flattened, loops/malloc → Fallback. *)
+(* Compile handler body to a summary: assigns → atoms, if-branches flattened,
+   loops/malloc → Fallback. *)
 let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
   match lbl_exp.exp with
-  | Assign (lhs, rhs) ->
+  | Assign (lhs, rhs) -> (
       let assign_lbl = lbl_exp.lbl in
-      (match lhs.exp with
+      match lhs.exp with
       | Var _ | Deref _ -> Compiled [ { lhs; rhs; assign_lbl; guards = [] } ]
       | _ -> Fallback lbl_exp)
   | Seq (e1, e2) -> (
       match (compile_handler e1, compile_handler e2) with
       | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
       | _ -> Fallback lbl_exp)
-  | If (cond_e, e_then, e_else) ->
+  | If (cond_e, e_then, e_else) -> (
       let then_guard, else_guard = extract_branch_guards cond_e in
       let then_summary = attach_guard then_guard (compile_handler e_then) in
       let else_summary = attach_guard else_guard (compile_handler e_else) in
-      (match (then_summary, else_summary) with
+      match (then_summary, else_summary) with
       | Compiled a1, Compiled a2 -> Compiled (a1 @ a2)
       | _ -> Fallback lbl_exp)
   | Enable | Disable | Unit | Int _ | Var _ | AddrOf _ | Bop _ | Deref _ ->
       Compiled []
-  | While _ | Malloc _ ->
-      Fallback lbl_exp
+  | While _ | Malloc _ -> Fallback lbl_exp
 
 let init_confa (pgm : Program.t) : abs_conf =
   reset_outputs ();
@@ -1125,10 +1218,7 @@ let init_confa (pgm : Program.t) : abs_conf =
   handler_summaries := summaries;
   compile_fixpoint c_globals.amem;
   print_handler_summaries ();
-  {
-    amem = c_globals.amem;
-    aimode = Interrupt.Enabled;
-  }
+  { amem = c_globals.amem; aimode = Interrupt.Enabled }
 
 let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
   Abs_Sem.fold
@@ -1145,8 +1235,8 @@ let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let _, _c_final = evalA c_init pgm.main in
   filter_main_sem !asem
 
-let abs_analyze ?(use_compile_opt = true) ?(use_selective_opt = true)
-    ?use_opt (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
+let abs_analyze ?(use_compile_opt = true) ?(use_selective_opt = true) ?use_opt
+    (pgm : Program.t) : Abs_Sem.t * ErrorSet.t =
   let c_init = init_confa pgm in
   let use_compile_opt, use_selective_opt =
     match use_opt with

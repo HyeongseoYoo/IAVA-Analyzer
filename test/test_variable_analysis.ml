@@ -1,7 +1,7 @@
 open Variable_analysis
 
 let pp n = Domain.ProgramPoint.Label (Syntax.Exp.Lbl.Main n)
-let int_v n = (Itv.alpha n, Abs_dom.Abs_Unit.bot, Abs_dom.Abs_Loc.bot)
+let int_v n = (Itv.alpha n, Abs_dom.Abs_LocSet.bot)
 
 let assert_itv msg expected actual =
   if Itv.compare expected actual <> 0 then
@@ -9,18 +9,18 @@ let assert_itv msg expected actual =
       (Printf.sprintf "%s: expected %s, got %s" msg (Itv.string_of_t expected)
          (Itv.string_of_t actual))
 
-let assert_int_value msg expected ((actual, _, _) : Abs_dom.Abs_Val.t) =
+let assert_int_value msg expected ((actual, _) : Abs_dom.Abs_Val.t) =
   assert_itv msg (Itv.alpha expected) actual
 
-let assert_loc_value msg expected ((_, _, actual) : Abs_dom.Abs_Val.t) =
-  if Abs_dom.Abs_Loc.compare expected actual <> 0 then
+let assert_loc_value msg expected ((_, actual) : Abs_dom.Abs_Val.t) =
+  let expected = Abs_dom.Abs_LocSet.singleton expected in
+  if Abs_dom.Abs_LocSet.compare expected actual <> 0 then
     failwith
       (Printf.sprintf "%s: expected %s, got %s" msg
-         (Abs_dom.Abs_Loc.string_of_t expected)
-         (Abs_dom.Abs_Loc.string_of_t actual))
+         (Abs_dom.Abs_LocSet.string_of_t expected)
+         (Abs_dom.Abs_LocSet.string_of_t actual))
 
-let heap_loc lbl n =
-  Abs_dom.Abs_Loc.AHeapLoc { lbl; offset = Itv.alpha n }
+let heap_loc lbl n = Abs_dom.Abs_Loc.AHeapLoc { lbl; offset = Itv.alpha n }
 
 let test_heap_strong_singleton_write () =
   let lbl = Syntax.Exp.Lbl.Main 10 in
@@ -53,11 +53,11 @@ let test_heap_interval_write_updates_overlapping_cells () =
   assert_int_value "non-overlapping cell should be unchanged" 0 v0;
   assert_itv "overlapping cell 1 should be weakly joined"
     (Itv.Itv (Itv.Bound.Z 1, Itv.Bound.Z 9))
-    (let i, _, _ = v1 in
+    (let i, _ = v1 in
      i);
   assert_itv "overlapping cell 2 should be weakly joined"
     (Itv.Itv (Itv.Bound.Z 2, Itv.Bound.Z 9))
-    (let i, _, _ = v2 in
+    (let i, _ = v2 in
      i)
 
 let test_top_write_updates_existing_locations () =
@@ -73,11 +73,11 @@ let test_top_write_updates_existing_locations () =
   let v_top, _ = Abs_dom.Abs_Mem.find m3 Abs_dom.Abs_Loc.Top in
   assert_itv "Top write should join into existing heap cell"
     (Itv.Itv (Itv.Bound.Z 0, Itv.Bound.Z 9))
-    (let i, _, _ = v_cell in
+    (let i, _ = v_cell in
      i);
   assert_itv "Top write should join into existing variable"
     (Itv.Itv (Itv.Bound.Z 1, Itv.Bound.Z 9))
-    (let i, _, _ = v_x in
+    (let i, _ = v_x in
      i);
   assert_int_value "Top write should keep a Top entry" 9 v_top
 
@@ -88,6 +88,71 @@ let run_abs s =
   let c0 = Analyzer.init_confa pgm in
   let _, c_final = Analyzer.evalA c0 pgm.main in
   c_final
+
+let run_abs_result s =
+  let pgm = parse s in
+  let c0 = Analyzer.init_confa pgm in
+  let r, _ = Analyzer.evalA c0 pgm.main in
+  r
+
+let run_concrete_result s =
+  let pgm = parse s in
+  let c0 = Interp.init_conf pgm in
+  let r, _ = Interp.eval c0 pgm.main in
+  r
+
+let assert_concrete_int msg expected (actual : Domain.Value.t) =
+  match actual with
+  | Domain.Value.Int n when n = expected -> ()
+  | _ ->
+      failwith
+        (Printf.sprintf "%s: expected Int %d, got %s" msg expected
+           (Domain.Value.string_of_t actual))
+
+let test_return_values_do_not_use_unit () =
+  let assign_src =
+    {|
+init {}
+
+main {
+  X := 7
+}
+|}
+  in
+  let abs_assign = run_abs_result assign_src in
+  assert_int_value "abstract assignment should return RHS value" 7
+    abs_assign.Analyzer.avalue;
+  let concrete_assign = run_concrete_result assign_src in
+  assert_concrete_int "concrete assignment should return RHS value" 7
+    concrete_assign.Interp.value;
+
+  let enable_src = {|
+init {}
+
+main {
+  enable
+}
+|} in
+  let abs_enable = run_abs_result enable_src in
+  assert_int_value "abstract enable should return 1" 1
+    abs_enable.Analyzer.avalue;
+  let concrete_enable = run_concrete_result enable_src in
+  assert_concrete_int "concrete enable should return 1" 1
+    concrete_enable.Interp.value;
+
+  let disable_src = {|
+init {}
+
+main {
+  disable
+}
+|} in
+  let abs_disable = run_abs_result disable_src in
+  assert_int_value "abstract disable should return 0" 0
+    abs_disable.Analyzer.avalue;
+  let concrete_disable = run_concrete_result disable_src in
+  assert_concrete_int "concrete disable should return 0" 0
+    concrete_disable.Interp.value
 
 let test_analyzer_reads_singleton_cell () =
   let c =
@@ -108,9 +173,7 @@ main {
   assert_int_value "reading A[0] should not join A[1]" 1 v
 
 let test_analyzer_reads_through_address_of () =
-  let c =
-    run_abs
-      {|
+  let c = run_abs {|
 init {
   X := 1;
   P := &X
@@ -119,15 +182,13 @@ init {
 main {
   Y := *P[0]
 }
-|}
-  in
+|} in
   let v, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Y") in
   assert_int_value "reading through &X should read X" 1 v
 
 let test_analyzer_writes_through_address_of () =
   let c =
-    run_abs
-      {|
+    run_abs {|
 init {
   X := 1;
   P := &X
@@ -191,10 +252,65 @@ main {
   assert_loc_value "compiled handler scalar assignment should preserve &Y"
     (Abs_dom.Abs_Loc.get "Y") addr
 
-let test_nonzero_offset_through_address_of_raises () =
-  match
+let test_pointer_powerset_read_joins_targets () =
+  let c =
     run_abs
       {|
+init {
+  X := 1;
+  Y := 2;
+  P := &X;
+
+  handler 0 {
+    P := &Y
+  }
+}
+
+main {
+  Tick := 0;
+  Z := *P[0]
+}
+|}
+  in
+  let z, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Z") in
+  assert_itv "reading through {&X,&Y} should join both targets"
+    (Itv.Itv (Itv.Bound.Z 1, Itv.Bound.Z 2))
+    (let i, _ = z in
+     i)
+
+let test_pointer_powerset_write_is_weak () =
+  let c =
+    run_abs
+      {|
+init {
+  X := 1;
+  Y := 2;
+  P := &X;
+
+  handler 0 {
+    P := &Y
+  }
+}
+
+main {
+  Tick := 0;
+  *P[0] := 3
+}
+|}
+  in
+  let x, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "X") in
+  let y, _ = Abs_dom.Abs_Mem.find c.Analyzer.amem (Abs_dom.Abs_Loc.get "Y") in
+  assert_itv "writing through {&X,&Y} should weakly update X"
+    (Itv.Itv (Itv.Bound.Z 1, Itv.Bound.Z 3))
+    (let i, _ = x in
+     i);
+  assert_itv "writing through {&X,&Y} should weakly update Y"
+    (Itv.Itv (Itv.Bound.Z 2, Itv.Bound.Z 3))
+    (let i, _ = y in
+     i)
+
+let test_nonzero_offset_through_address_of_raises () =
+  match run_abs {|
 init {
   X := 0;
   P := &X
@@ -203,8 +319,7 @@ init {
 main {
   Y := *P[1]
 }
-|}
-  with
+|} with
   | exception Interp.Runtime_error _ -> ()
   | _ ->
       failwith
@@ -271,18 +386,20 @@ main {
       errs
   in
   if Abs_dom.ErrorSet.is_empty matching then
-    failwith
-      "direct Bop index should keep handler provenance in offset_pp"
+    failwith "direct Bop index should keep handler provenance in offset_pp"
 
 let () =
   test_heap_strong_singleton_write ();
   test_heap_interval_write_updates_overlapping_cells ();
   test_top_write_updates_existing_locations ();
+  test_return_values_do_not_use_unit ();
   test_analyzer_reads_singleton_cell ();
   test_analyzer_reads_through_address_of ();
   test_analyzer_writes_through_address_of ();
   test_analyzer_compares_address_of ();
   test_compiled_handler_preserves_address_of_array_write ();
   test_compiled_handler_preserves_address_of_scalar_assignment ();
+  test_pointer_powerset_read_joins_targets ();
+  test_pointer_powerset_write_is_weak ();
   test_nonzero_offset_through_address_of_raises ();
   test_bop_index_propagates_handler_provenance ()

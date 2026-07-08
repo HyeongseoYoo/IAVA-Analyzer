@@ -41,8 +41,8 @@ module Abs_Loc = struct
   let alloc (lbl : Exp.Lbl.t) (offset : Itv.t) : t = AHeapLoc { lbl; offset }
 
   (* AVarLoc base pointers are always created with offset [0,0] via `get`, so
-     the only reachable case is adding the dereference index on top of that.
-     The Deref OOB check in analyzer.ml enforces that this index is [0,0]. *)
+     the only reachable case is adding the dereference index on top of that. The
+     Deref OOB check in analyzer.ml enforces that this index is [0,0]. *)
   let offset_add (base : t) (offset : Itv.t) : t =
     match base with
     | Top -> Top
@@ -135,36 +135,95 @@ module Abs_Loc = struct
           (Itv.string_of_t offset)
 end
 
-module Abs_Unit = struct
-  type t = Unit | Bot
+module Abs_LocSet = struct
+  module S = Set.Make (struct
+    type t = Abs_Loc.t
+
+    let compare = Abs_Loc.compare
+  end)
+
+  type t = Bot | Set of S.t | Top
 
   let bot = Bot
+  let top = Top
 
-  let compare (u1 : t) (u2 : t) : int =
-    match (u1, u2) with
-    | Bot, Bot | Unit, Unit -> 0
-    | Bot, Unit -> -1
-    | Unit, Bot -> 1
+  let singleton (l : Abs_Loc.t) : t =
+    match l with
+    | Abs_Loc.Bot -> Bot
+    | Abs_Loc.Top -> Top
+    | _ -> Set (S.singleton l)
 
-  let join (u1 : t) (u2 : t) : t =
-    match (u1, u2) with Unit, _ | _, Unit -> Unit | _ -> Bot
+  let is_bot = function Bot -> true | Set s -> S.is_empty s | Top -> false
+  let is_singleton = function Set s -> S.cardinal s = 1 | Bot | Top -> false
+  let normalize = function Set s when S.is_empty s -> Bot | other -> other
+
+  let compare l1 l2 =
+    match (normalize l1, normalize l2) with
+    | Bot, Bot | Top, Top -> 0
+    | Bot, _ -> -1
+    | _, Bot -> 1
+    | Top, _ -> 1
+    | _, Top -> -1
+    | Set s1, Set s2 -> S.compare s1 s2
+
+  let join l1 l2 =
+    match (normalize l1, normalize l2) with
+    | Bot, l | l, Bot -> l
+    | Top, _ | _, Top -> Top
+    | Set s1, Set s2 -> normalize (Set (S.union s1 s2))
 
   let widen = join
 
-  let leq (u1 : t) (u2 : t) : bool =
-    match (u1, u2) with
+  let leq l1 l2 =
+    match (normalize l1, normalize l2) with
     | Bot, _ -> true
-    | Unit, Unit -> true
-    | Unit, Bot -> false
+    | _, Top -> true
+    | Top, _ -> false
+    | _, Bot -> false
+    | Set s1, Set s2 ->
+        S.for_all (fun l1 -> S.exists (fun l2 -> Abs_Loc.leq l1 l2) s2) s1
 
-  let string_of_t = function Bot -> "⊥" | Unit -> "Unit"
+  let exists f = function
+    | Bot -> false
+    | Top -> f Abs_Loc.Top
+    | Set s -> S.exists f s
+
+  let fold f l acc =
+    match normalize l with
+    | Bot -> acc
+    | Top -> f Abs_Loc.Top acc
+    | Set s -> S.fold f s acc
+
+  let map_locs f = function
+    | Bot -> Bot
+    | Top -> f Abs_Loc.Top |> singleton
+    | Set s -> S.fold (fun l acc -> join acc (singleton (f l))) s Bot
+
+  let offset_add (base : t) (offset : Itv.t) : t =
+    map_locs (fun l -> Abs_Loc.offset_add l offset) base
+
+  let single_eq s1 s2 =
+    match (normalize s1, normalize s2) with
+    | Set a, Set b when S.cardinal a = 1 && S.cardinal b = 1 ->
+        Abs_Loc.single_eq (S.choose a) (S.choose b)
+    | _ -> false
+
+  let overlap s1 s2 =
+    exists (fun l1 -> exists (fun l2 -> Abs_Loc.overlap l1 l2) s2) s1
+
+  let string_of_t = function
+    | Bot -> "⊥"
+    | Top -> "⊤"
+    | Set s ->
+        S.elements s
+        |> List.map Abs_Loc.string_of_t
+        |> String.concat ", " |> Printf.sprintf "{%s}"
 end
 
 module Abs_Env = struct
   type t = Abs_Loc.t Var.Map.t
 
   let bot : t = Var.Map.empty
-
   let empty : t = bot
   let compare (e1 : t) (e2 : t) : int = Var.Map.compare Abs_Loc.compare e1 e2
 
@@ -208,49 +267,44 @@ module Abs_Env = struct
 end
 
 module Abs_Val = struct
-  type t = Itv.t * Abs_Unit.t * Abs_Loc.t
+  type t = Itv.t * Abs_LocSet.t
 
-  let top = (Itv.top, Abs_Unit.Unit, Abs_Loc.bot)
-  let bot = (Itv.bot, Abs_Unit.bot, Abs_Loc.bot)
+  let top = (Itv.top, Abs_LocSet.top)
+  let bot = (Itv.bot, Abs_LocSet.bot)
 
   let alpha (v : Value.t) : t =
     match v with
-    | Value.Int n -> (Itv.alpha n, Abs_Unit.bot, Abs_Loc.bot)
-    | Value.Unit -> (Itv.bot, Abs_Unit.Unit, Abs_Loc.bot)
-    | Value.Loc l -> (Itv.bot, Abs_Unit.bot, Abs_Loc.alpha l)
+    | Value.Int n -> (Itv.alpha n, Abs_LocSet.bot)
+    | Value.Loc l -> (Itv.bot, Abs_LocSet.singleton (Abs_Loc.alpha l))
 
   let compare (v1 : t) (v2 : t) : int =
-    let itv1, u1, l1 = v1 in
-    let itv2, u2, l2 = v2 in
+    let itv1, l1 = v1 in
+    let itv2, l2 = v2 in
     let c = Itv.compare itv1 itv2 in
-    if c <> 0 then c
-    else
-      let c = Abs_Unit.compare u1 u2 in
-      if c <> 0 then c else Abs_Loc.compare l1 l2
+    if c <> 0 then c else Abs_LocSet.compare l1 l2
 
   let join (v1 : t) (v2 : t) : t =
-    let itv1, u1, l1 = v1 in
-    let itv2, u2, l2 = v2 in
-    (Itv.join itv1 itv2, Abs_Unit.join u1 u2, Abs_Loc.join l1 l2)
+    let itv1, l1 = v1 in
+    let itv2, l2 = v2 in
+    (Itv.join itv1 itv2, Abs_LocSet.join l1 l2)
 
   let widen (v1 : t) (v2 : t) : t =
-    let itv1, u1, l1 = v1 in
-    let itv2, u2, l2 = v2 in
-    (Itv.widen itv1 itv2, Abs_Unit.widen u1 u2, Abs_Loc.widen l1 l2)
+    let itv1, l1 = v1 in
+    let itv2, l2 = v2 in
+    (Itv.widen itv1 itv2, Abs_LocSet.widen l1 l2)
 
   let leq (v1 : t) (v2 : t) : bool =
-    let itv1, u1, l1 = v1 in
-    let itv2, u2, l2 = v2 in
-    Itv.leq itv1 itv2 && Abs_Unit.leq u1 u2 && Abs_Loc.leq l1 l2
+    let itv1, l1 = v1 in
+    let itv2, l2 = v2 in
+    Itv.leq itv1 itv2 && Abs_LocSet.leq l1 l2
 
   let equal (v1 : t) (v2 : t) : bool = compare v1 v2 = 0
 
   let string_of_t (v : t) : string =
-    let itv, u, l = v in
+    let itv, l = v in
     let itv_str = Itv.string_of_t itv in
-    let u_str = Abs_Unit.string_of_t u in
-    let l_str = Abs_Loc.string_of_t l in
-    Printf.sprintf "<%s, %s, %s>" itv_str u_str l_str
+    let l_str = Abs_LocSet.string_of_t l in
+    Printf.sprintf "<%s, %s>" itv_str l_str
 end
 
 module Abs_Mem = struct
@@ -297,13 +351,13 @@ module Abs_Mem = struct
     | None -> (Abs_Val.bot, PPSet.empty)
 
   (* Strong update replaces both value and provenance. *)
-  let strong_write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t)
-      (pp : ProgramPoint.t) : t =
+  let strong_write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t)
+      : t =
     LocMap.add l (v, PPSet.singleton pp) m
 
   (* Weak update joins with the previous value at the same map key. *)
-  let weak_write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t)
-      (pp : ProgramPoint.t) : t =
+  let weak_write (m : t) (l : Abs_Loc.t) (v : Abs_Val.t) (pp : ProgramPoint.t) :
+      t =
     let old_v, old_pps = find m l in
     let new_v = Abs_Val.join old_v v in
     let new_pps = PPSet.add pp old_pps in
@@ -326,7 +380,9 @@ module Abs_Mem = struct
 
   (* Top may target any location, including already materialized cells. *)
   let weak_write_all (m : t) (v : Abs_Val.t) (pp : ProgramPoint.t) : t =
-    LocMap.fold (fun k _ acc -> weak_write acc k v pp) m
+    LocMap.fold
+      (fun k _ acc -> weak_write acc k v pp)
+      m
       (weak_write m Abs_Loc.Top v pp)
 
   (* Heap singleton targets are strong; heap interval targets are weak. *)

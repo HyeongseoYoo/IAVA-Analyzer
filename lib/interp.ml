@@ -15,9 +15,9 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
   let ({ lbl; exp; _ } : Exp.lbl_t) = lbl_exp in
   let ({ env = _; mem; imode = _ } : conf) = c in
   (* TODO: Done -> Non-Deterministic *)
-  let r = { value = Value.Unit; pp = Unit; out = Outcome.Done } in
+  let r = { value = Value.Int 0; pp = Unit; out = Outcome.Done } in
   (* TEST CODE *)
-  (* let r = (if lbl = Exp.Lbl.Main 3 then { value = Value.Unit; pp = Unit; out = Outcome.I 0 } else { value = Value.Unit; pp = Unit; out = Outcome.Done }) in  *)
+  (* let r = (if lbl = Exp.Lbl.Main 3 then { value = Value.Int 0; pp = Unit; out = Outcome.I 0 } else { value = Value.Int 0; pp = Unit; out = Outcome.Done }) in  *)
   let exp_r, exp_c =
     match exp with
     | Unit -> (r, c)
@@ -33,7 +33,8 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
                 (Runtime_error
                    ("[Mem] Location " ^ Loc.string_of_t l ^ " not found")))
     | AddrOf x -> ({ r with value = Value.Loc (Loc.get x) }, c)
-    | Enable -> (r, { c with imode = Interrupt.Enabled })
+    | Enable ->
+        ({ r with value = Value.Int 1 }, { c with imode = Interrupt.Enabled })
     | Disable -> (r, { c with imode = Interrupt.Disabled })
     | Malloc (e1, e2) ->
         let r1, c1 = eval c e1 in
@@ -153,7 +154,7 @@ let rec eval ?(lvalue = false) (c : conf) (lbl_exp : Exp.lbl_t) : result * conf
           | _ -> failwith "Left-hand side of assignment must be a location"
         in
         let mem' = Loc.Map.add l (r2.value, ProgramPoint.Label lbl) c2.mem in
-        (r, { c2 with mem = mem' })
+        ({ r with value = r2.value }, { c2 with mem = mem' })
     | Seq (e1, e2) ->
         let _, c1 = eval c e1 in
         eval c1 e2

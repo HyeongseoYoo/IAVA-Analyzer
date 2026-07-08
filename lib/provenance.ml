@@ -46,8 +46,7 @@ let rec fmt_exp : Exp.t -> string = function
   | Exp.Enable -> "enable"
   | Exp.Disable -> "disable"
   | Exp.Bop (bop, e1, e2) ->
-      Printf.sprintf "(%s %s %s)" (fmt_exp e1.exp)
-        (Exp.string_of_bop bop)
+      Printf.sprintf "(%s %s %s)" (fmt_exp e1.exp) (Exp.string_of_bop bop)
         (fmt_exp e2.exp)
   | Exp.Deref (e1, e2) ->
       Printf.sprintf "*%s[%s]" (fmt_exp e1.exp) (fmt_exp e2.exp)
@@ -63,8 +62,8 @@ let rec fmt_exp : Exp.t -> string = function
   | Exp.While (_, c, b) ->
       Printf.sprintf "while %s do (%s)" (fmt_exp c.exp) (fmt_exp b.exp)
 
-(* Extract variable names referenced in an expression. For Assign, only the
-   RHS is traversed so we follow the data that was written, not the target. *)
+(* Extract variable names referenced in an expression. For Assign, only the RHS
+   is traversed so we follow the data that was written, not the target. *)
 let rec vars_in_exp : Exp.t -> string list = function
   | Exp.Var x -> [ x ]
   | Exp.Int _ | Exp.Unit | Exp.AddrOf _ | Exp.Enable | Exp.Disable -> []
@@ -77,30 +76,34 @@ let rec vars_in_exp : Exp.t -> string list = function
       vars_in_exp c.exp @ vars_in_exp t.exp @ vars_in_exp f.exp
   | Exp.While (_, c, b) -> vars_in_exp c.exp @ vars_in_exp b.exp
 
-(* Resolve a Deref(base_e, idx_e) expression against a snapshot to find the
-   heap cell's (joined_value, joined_ppset).  Returns None when the base
-   expression does not resolve to a heap pointer in the snapshot.
-   Scans all cells in the snapshot whose lbl matches the base pointer and
-   whose offset interval overlaps the resolved index interval. *)
+let heap_labels_of_locset (locs : Abs_LocSet.t) : Exp.Lbl.t list =
+  Abs_LocSet.fold
+    (fun loc acc ->
+      match loc with Abs_Loc.AHeapLoc { lbl; _ } -> lbl :: acc | _ -> acc)
+    locs []
+
+(* Resolve a Deref(base_e, idx_e) expression against a snapshot to find the heap
+   cell's (joined_value, joined_ppset). Returns None when the base expression
+   does not resolve to a heap pointer in the snapshot. Scans all cells in the
+   snapshot whose lbl matches the base pointer and whose offset interval
+   overlaps the resolved index interval. *)
 let resolve_deref_cell (snapshot : Abs_Mem.t) (base_e : Exp.lbl_t)
     (idx_e : Exp.lbl_t) : (Abs_Val.t * PPSet.t) option =
   let base_lbl_opt =
     match base_e.exp with
     | Exp.Var base_name ->
-        let (_, _, ptr_loc), _ = Abs_Mem.find snapshot (Abs_Loc.get base_name) in
-        (match ptr_loc with
-        | Abs_Loc.AHeapLoc { lbl; _ } -> Some lbl
-        | _ -> None)
+        let (_, ptr_locs), _ = Abs_Mem.find snapshot (Abs_Loc.get base_name) in
+        Some (heap_labels_of_locset ptr_locs)
     | _ -> None
   in
   match base_lbl_opt with
-  | None -> None
-  | Some target_lbl ->
+  | None | Some [] -> None
+  | Some target_lbls ->
       let idx_itv =
         match idx_e.exp with
         | Exp.Int n -> Itv.alpha n
         | Exp.Var idx_name ->
-            let (itv, _, _), _ = Abs_Mem.find snapshot (Abs_Loc.get idx_name) in
+            let (itv, _), _ = Abs_Mem.find snapshot (Abs_Loc.get idx_name) in
             itv
         | _ -> Itv.top
       in
@@ -109,28 +112,28 @@ let resolve_deref_cell (snapshot : Abs_Mem.t) (base_e : Exp.lbl_t)
           (fun k (v, pps) (acc_v, acc_pps) ->
             match k with
             | Abs_Loc.AHeapLoc { lbl; offset }
-              when Exp.Lbl.compare lbl target_lbl = 0
+              when List.exists
+                     (fun target_lbl -> Exp.Lbl.compare lbl target_lbl = 0)
+                     target_lbls
                    && Itv.is_overlap idx_itv offset ->
                 (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
             | _ -> (acc_v, acc_pps))
           snapshot (Abs_Val.bot, PPSet.empty)
       in
-      if PPSet.is_empty cell_pps then None
-      else Some (cell_val, cell_pps)
+      if PPSet.is_empty cell_pps then None else Some (cell_val, cell_pps)
 
-(* Build a unified label → lbl_t table across the whole program so we can
-   look up the expression and line for any program point. *)
-let build_lbl_table (pgm : Program.t) :
-    Exp.lbl_t Syntax.Exp.Lbl_map.t =
+(* Build a unified label → lbl_t table across the whole program so we can look
+   up the expression and line for any program point. *)
+let build_lbl_table (pgm : Program.t) : Exp.lbl_t Syntax.Exp.Lbl_map.t =
   let add_lbl_t tbl (le : Exp.lbl_t) =
     let rec walk ({ lbl; exp; line } : Exp.lbl_t) acc =
       let acc =
-        Exp.Lbl_map.add (Either.Left lbl)
-          (({ lbl; exp; line } : Exp.lbl_t))
-          acc
+        Exp.Lbl_map.add (Either.Left lbl) ({ lbl; exp; line } : Exp.lbl_t) acc
       in
       match exp with
-      | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.AddrOf _ | Exp.Enable | Exp.Disable -> acc
+      | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.AddrOf _ | Exp.Enable
+      | Exp.Disable ->
+          acc
       | Exp.Bop (_, e1, e2)
       | Exp.Deref (e1, e2)
       | Exp.Malloc (e1, e2)
@@ -140,7 +143,7 @@ let build_lbl_table (pgm : Program.t) :
       | Exp.If (e1, e2, e3) -> acc |> walk e1 |> walk e2 |> walk e3
       | Exp.While (glbl, e1, e2) ->
           Exp.Lbl_map.add (Either.Right glbl)
-            (({ lbl = glbl; exp; line } : Exp.lbl_t))
+            ({ lbl = glbl; exp; line } : Exp.lbl_t)
             (acc |> walk e1 |> walk e2)
     in
     walk le tbl
@@ -156,17 +159,16 @@ let lookup_lbl_t (tbl : Exp.lbl_t Exp.Lbl_map.t) (pp : ProgramPoint.t) :
     Exp.lbl_t option =
   match pp with
   | ProgramPoint.Unit -> None
-  | ProgramPoint.Label lbl ->
-      Exp.Lbl_map.find_opt (Either.Left lbl) tbl
+  | ProgramPoint.Label lbl -> Exp.Lbl_map.find_opt (Either.Left lbl) tbl
 
 (* ===== Multi-hop provenance tracing ===== *)
 
 let max_depth = 10
 
-(* trace_pps and trace_heap_pps are mutually recursive.
-   trace_pps:      follows named scalar variables backward through asem snapshots.
-   trace_heap_pps: follows handler-PP sets that wrote to a heap cell; used when
-                   the expression being traced reads from a heap cell via Deref. *)
+(* trace_pps and trace_heap_pps are mutually recursive. trace_pps: follows named
+   scalar variables backward through asem snapshots. trace_heap_pps: follows
+   handler-PP sets that wrote to a heap cell; used when the expression being
+   traced reads from a heap cell via Deref. *)
 let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
     (tbl : Exp.lbl_t Exp.Lbl_map.t) (visited : PPSet.t) (depth : int) :
     prov_node list =
@@ -198,7 +200,8 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
                     (fun v ->
                       let v_loc = Abs_Loc.get v in
                       let _, sub_pps = Abs_Mem.find snapshot v_loc in
-                      trace_pps sub_pps v asem tbl visited_with_siblings (depth - 1))
+                      trace_pps sub_pps v asem tbl visited_with_siblings
+                        (depth - 1))
                     rhs_vars
                 in
                 (* When RHS is a heap read (Deref), resolve the cell in the
@@ -234,10 +237,10 @@ let rec trace_pps (pps : PPSet.t) (var_name : string) (asem : Abs_Sem.t)
           { site; children } :: acc)
       pps []
 
-(* Trace provenance for a set of handler PPs that wrote to a heap cell.
-   cell_val is the joined value stored in the cell (shown in the prov_node).
-   For each handler PP, shows the write statement and traces its RHS variables
-   one level deeper via trace_pps. *)
+(* Trace provenance for a set of handler PPs that wrote to a heap cell. cell_val
+   is the joined value stored in the cell (shown in the prov_node). For each
+   handler PP, shows the write statement and traces its RHS variables one level
+   deeper via trace_pps. *)
 and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
     (asem : Abs_Sem.t) (tbl : Exp.lbl_t Exp.Lbl_map.t) (visited : PPSet.t)
     (depth : int) : prov_node list =
@@ -255,21 +258,24 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
             | Some lt -> fmt_exp lt.exp
             | None -> "<unknown>"
           in
-          (* Choose the most precise value/ppset for this specific write PP:
-             - Scalar alias (Var lhs := rhs): look up lhs in the snapshot.
-             - Heap write (deref base[idx] := rhs): resolve the cell from the
-               snapshot to get the value as-of-this-write (e.g. [0,0] for the
-               init write, not the globally-joined [0,255]).
-               Falls back to cell_val when the snapshot is minimal and does not
-               contain the base pointer (handler fast-path snapshots).
-             - Anything else: use the passed cell_val / cell_pps. *)
+          (* Choose the most precise value/ppset for this specific write PP: -
+             Scalar alias (Var lhs := rhs): look up lhs in the snapshot. - Heap
+             write (deref base[idx] := rhs): resolve the cell from the snapshot
+             to get the value as-of-this-write (e.g. [0,0] for the init write,
+             not the globally-joined [0,255]). Falls back to cell_val when the
+             snapshot is minimal and does not contain the base pointer (handler
+             fast-path snapshots). - Anything else: use the passed cell_val /
+             cell_pps. *)
           let snapshot = Abs_Sem.find asem pp in
           let site_value, site_pps =
             match lbl_t_opt with
             | Some { exp = Exp.Assign ({ exp = Exp.Var lhs_var; _ }, _); _ } ->
                 Abs_Mem.find snapshot (Abs_Loc.get lhs_var)
-            | Some { exp = Exp.Assign
-                ({ exp = Exp.Deref (base_e, idx_e); _ }, _); _ } -> (
+            | Some
+                {
+                  exp = Exp.Assign ({ exp = Exp.Deref (base_e, idx_e); _ }, _);
+                  _;
+                } -> (
                 match resolve_deref_cell snapshot base_e idx_e with
                 | Some (v, pps) -> (v, pps)
                 | None -> (cell_val, cell_pps))
@@ -282,11 +288,12 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
             | Some lt ->
                 let rhs_vars = vars_in_exp lt.exp in
                 (* Also trace the LHS base pointer for heap writes like
-                   *base[idx] := rhs so the alias step (base := ...) appears. *)
+                 *base[idx] := rhs so the alias step (base := ...) appears. *)
                 let lhs_base_vars =
                   match lt.exp with
                   | Exp.Assign
-                      ({ exp = Exp.Deref ({ exp = Exp.Var bv; _ }, _); _ }, _) ->
+                      ({ exp = Exp.Deref ({ exp = Exp.Var bv; _ }, _); _ }, _)
+                    ->
                       [ bv ]
                   | _ -> []
                 in
@@ -294,7 +301,8 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
                   (fun v ->
                     let v_loc = Abs_Loc.get v in
                     let _, sub_pps = Abs_Mem.find snapshot v_loc in
-                    trace_pps sub_pps v asem tbl visited_with_siblings (depth - 1))
+                    trace_pps sub_pps v asem tbl visited_with_siblings
+                      (depth - 1))
                   (rhs_vars @ lhs_base_vars)
           in
           { site; children } :: acc)
@@ -313,8 +321,7 @@ and trace_heap_pps (cell_pps : PPSet.t) (cell_val : Abs_Val.t)
    rather than appearing as separate entries. *)
 let base_alloc_key (b : Abs_Loc.t) : Abs_Loc.t =
   match b with
-  | Abs_Loc.AHeapLoc { lbl; _ } ->
-      Abs_Loc.AHeapLoc { lbl; offset = Itv.bot }
+  | Abs_Loc.AHeapLoc { lbl; _ } -> Abs_Loc.AHeapLoc { lbl; offset = Itv.bot }
   | other -> other
 
 let merge_errors (errors : ErrorSet.t) : ErrorSet.t =
@@ -363,12 +370,12 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
           pps = PPSet.empty;
         }
       in
-      (* Determine which variable names to trace for base and offset.
-         We look at the expression at the error site to extract the base
-         variable (LHS of Deref) and offset variable (index of Deref).
-         off_e_opt carries the Deref sub-expression when the index is itself
-         a Deref (Pattern 2: heap-mediated index), so we can call
-         trace_heap_pps instead of trace_pps for the offset provenance. *)
+      (* Determine which variable names to trace for base and offset. We look at
+         the expression at the error site to extract the base variable (LHS of
+         Deref) and offset variable (index of Deref). off_e_opt carries the
+         Deref sub-expression when the index is itself a Deref (Pattern 2:
+         heap-mediated index), so we can call trace_heap_pps instead of
+         trace_pps for the offset provenance. *)
       let base_var, offset_var, off_e_opt =
         match err_lbl_opt with
         | Some { exp = Exp.Deref (base_e, off_e); _ } ->
@@ -383,7 +390,9 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
         | Some { exp = Exp.Assign (lhs, _); _ } -> (
             match lhs.exp with
             | Exp.Deref (base_e, off_e) ->
-                let bv = match base_e.exp with Exp.Var x -> x | _ -> "<base>" in
+                let bv =
+                  match base_e.exp with Exp.Var x -> x | _ -> "<base>"
+                in
                 let ov, deref =
                   match off_e.exp with
                   | Exp.Var x -> (x, None)
@@ -395,8 +404,8 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
         | _ -> ("<base>", "<offset>", None)
       in
       (* Look up the combined value and PPSet of the index at the error site.
-         For a simple Var index: join across contributing PP snapshots.
-         For a Deref index (heap-mediated): use the full abstract index range
+         For a simple Var index: join across contributing PP snapshots. For a
+         Deref index (heap-mediated): use the full abstract index range
          reconstructed from the error's OOB fields, attributed to the handler
          PPs in offset_pp. *)
       let is_deref_index = off_e_opt <> None in
@@ -412,15 +421,13 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
         if offset_var = "<offset>" then (Abs_Val.bot, PPSet.empty)
         else
           (* Reconstruct the actual index interval from the OOB fields recorded
-             at the error site.  Joining the variable's value across offset_pp
+             at the error site. Joining the variable's value across offset_pp
              snapshots gives a widened value (e.g. [0,∞] from loop widening)
              that disagrees with the in_itv/right_oob already shown on the same
-             line.  Using join(in_itv, left_oob, right_oob) is consistent with
+             line. Using join(in_itv, left_oob, right_oob) is consistent with
              how the deref-index (Pattern 2/3) case already works. *)
-          let full_itv =
-            Itv.join (Itv.join e.in_itv e.left_oob) e.right_oob
-          in
-          ((full_itv, Abs_Unit.bot, Abs_Loc.bot), e.offset_pp)
+          let full_itv = Itv.join (Itv.join e.in_itv e.left_oob) e.right_oob in
+          ((full_itv, Abs_LocSet.bot), e.offset_pp)
       in
       let err_site = { err_site with value = index_val; pps = index_pps } in
       let visited0 = PPSet.singleton e.at in
@@ -435,8 +442,8 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
             else
               trace_heap_pps e.offset_pp index_val asem tbl visited0 max_depth
           in
-          (* Also trace the inner base variable (e.g. NvmeCtrl) by looking it
-             up in the snapshot at the error site. This surfaces aliasing steps
+          (* Also trace the inner base variable (e.g. NvmeCtrl) by looking it up
+             in the snapshot at the error site. This surfaces aliasing steps
              like `NvmeCtrl := NvmeRegs` that are not part of the heap cell's
              own write history (offset_pp). *)
           let alias_prov =
@@ -456,8 +463,7 @@ let analyze (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
             | _ -> []
           in
           heap_prov @ alias_prov
-        else
-          trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
+        else trace_pps e.offset_pp offset_var asem tbl visited0 max_depth
       in
       { error = e; err_site; index_var = offset_var; base_prov; offset_prov }
       :: acc)
@@ -484,9 +490,7 @@ let handler_iids_in_chain (c : chain) : int list =
 let string_of_ppset (pps : PPSet.t) : string =
   if PPSet.is_empty pps then "{}"
   else
-    let elems =
-      PPSet.elements pps |> List.map ProgramPoint.string_of_t
-    in
+    let elems = PPSet.elements pps |> List.map ProgramPoint.string_of_t in
     "{" ^ String.concat ", " elems ^ "}"
 
 let string_of_site (s : source_site) : string =
@@ -551,17 +555,20 @@ let string_of_chain (c : chain) : string =
   in
   let base_str =
     if c.base_prov = [] then "  (no base provenance found)"
-    else
-      List.map (string_of_prov_node 1) c.base_prov |> String.concat "\n"
+    else List.map (string_of_prov_node 1) c.base_prov |> String.concat "\n"
   in
   let offset_str =
     if c.offset_prov = [] then "  (no offset provenance found)"
-    else
-      List.map (string_of_prov_node 1) c.offset_prov |> String.concat "\n"
+    else List.map (string_of_prov_node 1) c.offset_prov |> String.concat "\n"
   in
   Printf.sprintf
-    "Bug at %s: `%s`\n  %s %s\n%s%s%s\n  Base pointer provenance:\n%s\n  \
-     Offset provenance:\n%s"
+    "Bug at %s: `%s`\n\
+    \  %s %s\n\
+     %s%s%s\n\
+    \  Base pointer provenance:\n\
+     %s\n\
+    \  Offset provenance:\n\
+     %s"
     at_str c.err_site.expr access_str kind_str handler_str oob_str index_str
     base_str offset_str
 

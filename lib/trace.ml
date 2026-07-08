@@ -8,11 +8,7 @@ module VisitSet = Set.Make (struct
   let compare = compare
 end)
 
-type role =
-  | Base
-  | Index
-  | HeapValue
-  | Dependency
+type role = Base | Index | HeapValue | Dependency
 
 type trace_node = {
   pp : ProgramPoint.t;
@@ -60,8 +56,8 @@ let rec fmt_exp : Exp.t -> string = function
   | Exp.Enable -> "enable"
   | Exp.Disable -> "disable"
   | Exp.Bop (bop, e1, e2) ->
-      Printf.sprintf "(%s %s %s)" (fmt_exp e1.exp)
-        (Exp.string_of_bop bop) (fmt_exp e2.exp)
+      Printf.sprintf "(%s %s %s)" (fmt_exp e1.exp) (Exp.string_of_bop bop)
+        (fmt_exp e2.exp)
   | Exp.Deref (base_e, idx_e) ->
       Printf.sprintf "*%s[%s]" (fmt_exp base_e.exp) (fmt_exp idx_e.exp)
   | Exp.Malloc (n_e, init_e) ->
@@ -71,8 +67,8 @@ let rec fmt_exp : Exp.t -> string = function
   | Exp.Seq (e1, e2) ->
       Printf.sprintf "%s; %s" (fmt_exp e1.exp) (fmt_exp e2.exp)
   | Exp.If (c, t, f) ->
-      Printf.sprintf "if %s then %s else %s" (fmt_exp c.exp)
-        (fmt_exp t.exp) (fmt_exp f.exp)
+      Printf.sprintf "if %s then %s else %s" (fmt_exp c.exp) (fmt_exp t.exp)
+        (fmt_exp f.exp)
   | Exp.While (_, c, b) ->
       Printf.sprintf "while %s do (%s)" (fmt_exp c.exp) (fmt_exp b.exp)
 
@@ -81,8 +77,8 @@ let build_lbl_table (pgm : Program.t) : Exp.lbl_t Exp.Lbl_map.t =
     let labeled = ({ lbl; exp; line } : Exp.lbl_t) in
     let tbl = Exp.Lbl_map.add (Either.Left lbl) labeled tbl in
     match exp with
-    | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.AddrOf _ | Exp.Enable
-    | Exp.Disable ->
+    | Exp.Unit | Exp.Int _ | Exp.Var _ | Exp.AddrOf _ | Exp.Enable | Exp.Disable
+      ->
         tbl
     | Exp.Bop (_, e1, e2)
     | Exp.Deref (e1, e2)
@@ -117,8 +113,8 @@ let find_scalar (snapshot : Abs_Mem.t) (x : string) : Abs_Val.t * PPSet.t =
       (Abs_Val.join acc_v v, PPSet.union acc_pps pps))
     (Abs_Val.bot, PPSet.empty) (loc_candidates x)
 
-let int_of_value ((itv, _, _) : Abs_Val.t) : Itv.t = itv
-let loc_of_value ((_, _, loc) : Abs_Val.t) : Abs_Loc.t = loc
+let int_of_value ((itv, _) : Abs_Val.t) : Itv.t = itv
+let loc_of_value ((_, loc) : Abs_Val.t) : Abs_LocSet.t = loc
 
 let loc_overlap (l1 : Abs_Loc.t) (l2 : Abs_Loc.t) : bool =
   match (l1, l2) with
@@ -132,22 +128,26 @@ let loc_overlap (l1 : Abs_Loc.t) (l2 : Abs_Loc.t) : bool =
       Exp.Lbl.compare lbl1 lbl2 = 0 && Itv.is_overlap off1 off2
   | _ -> false
 
-let join_cells (snapshot : Abs_Mem.t) (target : Abs_Loc.t) :
+let join_cells (snapshot : Abs_Mem.t) (targets : Abs_LocSet.t) :
     Abs_Val.t * PPSet.t =
-  Abs_Mem.fold
-    (fun loc (v, pps) (acc_v, acc_pps) ->
-      if loc_overlap target loc then
-        (Abs_Val.join acc_v v, PPSet.union acc_pps pps)
-      else (acc_v, acc_pps))
-    snapshot (Abs_Val.bot, PPSet.empty)
+  Abs_LocSet.fold
+    (fun target (acc_v, acc_pps) ->
+      Abs_Mem.fold
+        (fun loc (v, pps) (inner_v, inner_pps) ->
+          if loc_overlap target loc then
+            (Abs_Val.join inner_v v, PPSet.union inner_pps pps)
+          else (inner_v, inner_pps))
+        snapshot (acc_v, acc_pps))
+    targets (Abs_Val.bot, PPSet.empty)
 
 let rec eval_value (snapshot : Abs_Mem.t) (e : Exp.lbl_t) : Abs_Val.t * PPSet.t
     =
   match e.exp with
-  | Exp.Unit -> ((Itv.bot, Abs_Unit.Unit, Abs_Loc.bot), PPSet.empty)
-  | Exp.Int n -> ((Itv.alpha n, Abs_Unit.bot, Abs_Loc.bot), PPSet.empty)
+  | Exp.Unit -> ((Itv.alpha 0, Abs_LocSet.bot), PPSet.empty)
+  | Exp.Int n -> ((Itv.alpha n, Abs_LocSet.bot), PPSet.empty)
   | Exp.Var x -> find_scalar snapshot x
-  | Exp.AddrOf x -> ((Itv.bot, Abs_Unit.bot, Abs_Loc.get x), PPSet.empty)
+  | Exp.AddrOf x ->
+      ((Itv.bot, Abs_LocSet.singleton (Abs_Loc.get x)), PPSet.empty)
   | Exp.Bop (bop, e1, e2) ->
       let v1, pps1 = eval_value snapshot e1 in
       let v2, pps2 = eval_value snapshot e2 in
@@ -167,9 +167,8 @@ let rec eval_value (snapshot : Abs_Mem.t) (e : Exp.lbl_t) : Abs_Val.t * PPSet.t
         | Exp.Or -> Itv.or_ i1 i2
         | Exp.Eq -> Itv.top
       in
-      ((itv, Abs_Unit.bot, Abs_Loc.bot), PPSet.union pps1 pps2)
-  | Exp.Deref (base_e, idx_e) ->
-      resolve_deref_cell snapshot base_e idx_e
+      ((itv, Abs_LocSet.bot), PPSet.union pps1 pps2)
+  | Exp.Deref (base_e, idx_e) -> resolve_deref_cell snapshot base_e idx_e
   | Exp.Malloc _ | Exp.Assign _ | Exp.Seq _ | Exp.If _ | Exp.While _
   | Exp.Enable | Exp.Disable ->
       (Abs_Val.bot, PPSet.empty)
@@ -178,9 +177,10 @@ and eval_index (snapshot : Abs_Mem.t) (e : Exp.lbl_t) : Itv.t * PPSet.t =
   let v, pps = eval_value snapshot e in
   (int_of_value v, pps)
 
-and eval_base_loc (snapshot : Abs_Mem.t) (e : Exp.lbl_t) : Abs_Loc.t * PPSet.t =
+and eval_base_loc (snapshot : Abs_Mem.t) (e : Exp.lbl_t) :
+    Abs_LocSet.t * PPSet.t =
   match e.exp with
-  | Exp.AddrOf x -> (Abs_Loc.get x, PPSet.empty)
+  | Exp.AddrOf x -> (Abs_LocSet.singleton (Abs_Loc.get x), PPSet.empty)
   | _ ->
       let v, pps = eval_value snapshot e in
       (loc_of_value v, pps)
@@ -189,7 +189,7 @@ and resolve_deref_cell (snapshot : Abs_Mem.t) (base_e : Exp.lbl_t)
     (idx_e : Exp.lbl_t) : Abs_Val.t * PPSet.t =
   let base_loc, _ = eval_base_loc snapshot base_e in
   let idx_itv, _ = eval_index snapshot idx_e in
-  let target = Abs_Loc.offset_add base_loc idx_itv in
+  let target = Abs_LocSet.offset_add base_loc idx_itv in
   join_cells snapshot target
 
 let assignment_rhs_for_subject (subject : string) (lt : Exp.lbl_t) :
@@ -239,12 +239,13 @@ let rec trace_scalar (name : string) (pps : PPSet.t) (role : role)
             match lbl_t_opt with
             | Some lt -> (
                 match assignment_rhs_for_subject name lt with
-                | Some { exp = Exp.Malloc _; _ } ->
-                    []
+                | Some { exp = Exp.Malloc _; _ } -> []
                 | Some rhs ->
-                    trace_expr rhs Dependency snapshot asem tbl visited' (depth - 1)
+                    trace_expr rhs Dependency snapshot asem tbl visited'
+                      (depth - 1)
                 | None ->
-                    trace_expr lt Dependency snapshot asem tbl visited' (depth - 1))
+                    trace_expr lt Dependency snapshot asem tbl visited'
+                      (depth - 1))
             | None -> []
           in
           {
@@ -367,8 +368,7 @@ and trace_expr (e : Exp.lbl_t) (role : role) (snapshot : Abs_Mem.t)
     | Exp.While (_, _, body) ->
         trace_expr body Dependency snapshot asem tbl visited (depth - 1)
 
-let deref_parts_at_error (lt : Exp.lbl_t) :
-    (Exp.lbl_t * Exp.lbl_t) option =
+let deref_parts_at_error (lt : Exp.lbl_t) : (Exp.lbl_t * Exp.lbl_t) option =
   match lt.exp with
   | Exp.Deref (base_e, idx_e) -> Some (base_e, idx_e)
   | Exp.Assign ({ exp = Exp.Deref (base_e, idx_e); _ }, _) ->
@@ -406,14 +406,16 @@ let merge_errors (errors : ErrorSet.t) : ErrorSet.t =
   Hashtbl.fold (fun _ e acc -> ErrorSet.add e acc) tbl ErrorSet.empty
 
 let rec handler_iids_in_node (n : trace_node) : int list =
-  let own = match handler_iid_of_pp n.pp with Some iid -> [ iid ] | None -> [] in
+  let own =
+    match handler_iid_of_pp n.pp with Some iid -> [ iid ] | None -> []
+  in
   own @ List.concat_map handler_iids_in_node n.children
 
 let handler_iids_of_traces traces =
   List.concat_map handler_iids_in_node traces |> List.sort_uniq Int.compare
 
-let trace_one (asem : Abs_Sem.t) (tbl : Exp.lbl_t Exp.Lbl_map.t)
-    (e : Error.t) : trace_chain option =
+let trace_one (asem : Abs_Sem.t) (tbl : Exp.lbl_t Exp.Lbl_map.t) (e : Error.t) :
+    trace_chain option =
   let err_lbl_opt = lookup_lbl_t tbl e.at in
   match Option.bind err_lbl_opt deref_parts_at_error with
   | None -> None
@@ -421,8 +423,11 @@ let trace_one (asem : Abs_Sem.t) (tbl : Exp.lbl_t Exp.Lbl_map.t)
       let err_snapshot = Abs_Sem.find asem e.at in
       let base_trace =
         match base_e.exp with
-        | Exp.Var x -> trace_scalar x e.base_pp Base asem tbl VisitSet.empty max_depth
-        | _ -> trace_expr base_e Base err_snapshot asem tbl VisitSet.empty max_depth
+        | Exp.Var x ->
+            trace_scalar x e.base_pp Base asem tbl VisitSet.empty max_depth
+        | _ ->
+            trace_expr base_e Base err_snapshot asem tbl VisitSet.empty
+              max_depth
       in
       let index_trace =
         match idx_e.exp with
@@ -439,15 +444,15 @@ let trace_one (asem : Abs_Sem.t) (tbl : Exp.lbl_t Exp.Lbl_map.t)
             let structural_trace =
               trace_expr inner_base_e Base err_snapshot asem tbl VisitSet.empty
                 (max_depth - 1)
-              @ trace_expr inner_idx_e Index err_snapshot asem tbl VisitSet.empty
-                  (max_depth - 1)
+              @ trace_expr inner_idx_e Index err_snapshot asem tbl
+                  VisitSet.empty (max_depth - 1)
             in
             cell_trace @ structural_trace
-        | _ -> trace_expr idx_e Index err_snapshot asem tbl VisitSet.empty max_depth
+        | _ ->
+            trace_expr idx_e Index err_snapshot asem tbl VisitSet.empty
+              max_depth
       in
-      let handler_iids =
-        handler_iids_of_traces (base_trace @ index_trace)
-      in
+      let handler_iids = handler_iids_of_traces (base_trace @ index_trace) in
       let err_line = Option.bind err_lbl_opt (fun lt -> lt.line) in
       let err_expr =
         match err_lbl_opt with Some lt -> fmt_exp lt.exp | None -> "<unknown>"
@@ -476,15 +481,16 @@ let trace_warnings (errors : ErrorSet.t) (asem : Abs_Sem.t) (pgm : Program.t) :
     trace_chain list =
   trace_errors errors asem pgm
   |> List.filter (fun c ->
-         c.handler_iids <> []
-         || PPSet.exists is_handler_pp c.error.base_pp
-         || PPSet.exists is_handler_pp c.error.offset_pp
-         || c.error.handler_caused)
+      c.handler_iids <> []
+      || PPSet.exists is_handler_pp c.error.base_pp
+      || PPSet.exists is_handler_pp c.error.offset_pp
+      || c.error.handler_caused)
 
 let string_of_ppset (pps : PPSet.t) : string =
   if PPSet.is_empty pps then "{}"
   else
-    PPSet.elements pps |> List.map ProgramPoint.string_of_t
+    PPSet.elements pps
+    |> List.map ProgramPoint.string_of_t
     |> String.concat ", " |> Printf.sprintf "{%s}"
 
 let string_of_oob_kind (e : Error.t) =
@@ -502,8 +508,8 @@ let rec string_of_node depth n =
   in
   let handler = if n.is_handler then " [handler]" else "" in
   let head =
-    Printf.sprintf "%s<- %s %s `%s` value=%s pps=%s%s%s"
-      (indent depth) (role_name n.role) n.subject n.expr
+    Printf.sprintf "%s<- %s %s `%s` value=%s pps=%s%s%s" (indent depth)
+      (role_name n.role) n.subject n.expr
       (Abs_Val.string_of_t n.value)
       (string_of_ppset n.pps) handler loc
   in
@@ -511,8 +517,7 @@ let rec string_of_node depth n =
   | [] -> head
   | children ->
       head ^ "\n"
-      ^ (List.map (string_of_node (depth + 1)) children
-        |> String.concat "\n")
+      ^ (List.map (string_of_node (depth + 1)) children |> String.concat "\n")
 
 let string_of_chain c =
   let loc =
@@ -523,8 +528,7 @@ let string_of_chain c =
   let handlers =
     match c.handler_iids with
     | [] -> "handler unknown"
-    | ids ->
-        ids |> List.map (Printf.sprintf "handler %d") |> String.concat ", "
+    | ids -> ids |> List.map (Printf.sprintf "handler %d") |> String.concat ", "
   in
   let base =
     match c.base_trace with
@@ -537,11 +541,18 @@ let string_of_chain c =
     | nodes -> List.map (string_of_node 1) nodes |> String.concat "\n"
   in
   Printf.sprintf
-    "Warning at %s: `%s`\n  access: %s, kind: %s, interrupt influence: %s\n  \
-     safe=%s left=%s right=%s\n  index expression: %s\n  Base provenance:\n%s\n  \
-     Index provenance:\n%s"
-    loc c.err_expr (Error.string_of_access c.error.access)
-    (string_of_oob_kind c.error) handlers
+    "Warning at %s: `%s`\n\
+    \  access: %s, kind: %s, interrupt influence: %s\n\
+    \  safe=%s left=%s right=%s\n\
+    \  index expression: %s\n\
+    \  Base provenance:\n\
+     %s\n\
+    \  Index provenance:\n\
+     %s"
+    loc c.err_expr
+    (Error.string_of_access c.error.access)
+    (string_of_oob_kind c.error)
+    handlers
     (Itv.string_of_t c.error.in_itv)
     (Itv.string_of_t c.error.left_oob)
     (Itv.string_of_t c.error.right_oob)

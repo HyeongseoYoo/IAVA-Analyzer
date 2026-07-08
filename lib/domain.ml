@@ -54,22 +54,18 @@ module Loc = struct
 end
 
 module Value = struct
-  type t = Int of int | Loc of Loc.t | Unit
+  type t = Int of int | Loc of Loc.t
 
   let compare v1 v2 =
     match (v1, v2) with
     | Int n1, Int n2 -> Int.compare n1 n2
     | Loc a1, Loc a2 -> Loc.compare a1 a2
-    | Unit, Unit -> 0
-    | Unit, _ -> -1
-    | _, Unit -> 1
     | Int _, _ -> -1
     | _, Int _ -> 1
 
   let string_of_t = function
     | Int n -> "Int " ^ string_of_int n
     | Loc a -> Loc.string_of_t a
-    | Unit -> "unit"
 end
 
 module IidSet = Set.Make (Int)
