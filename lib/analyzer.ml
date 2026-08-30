@@ -79,6 +79,9 @@ let reset_outputs () =
 let join_res r1 r2 =
   { avalue = Abs_Val.join r1.avalue r2.avalue; app = PPSet.union r1.app r2.app }
 
+let leq_res r1 r2 =
+  Abs_Val.leq r1.avalue r2.avalue && PPSet.subset r1.app r2.app
+
 let join_conf c1 c2 =
   {
     amem = Abs_Mem.join c1.amem c2.amem;
@@ -110,6 +113,100 @@ let leq_conf_noasem c1 c2 =
   | Interrupt.Disabled, Interrupt.Disabled -> true
   | Interrupt.Enabled, Interrupt.Enabled -> true
   | Interrupt.Enabled, Interrupt.Disabled -> false
+
+(* Stability check on Output# = abs_res * abs_conf for the tabulation
+   worklist: Tout is stable once a recomputed (r#, c_r#) no longer adds
+   anything on top of the previously tabled value. *)
+let leq_out ((r1, c1) : abs_res * abs_conf) ((r2, c2) : abs_res * abs_conf) :
+    bool =
+  leq_res r1 r2 && leq_conf c1 c2
+
+(* --- Tabulation infrastructure -----------------------------------------
+   Data structures for the Tabulate algorithm (T_in, T_out, worklist,
+   reverse dependency edges). T_in/T_out are wired into evA via evalA_tab
+   below. worklist/tab_deps have no consumer yet (evalA_tab recomputes
+   eagerly on demand instead of via Select/Add pumping) — kept for a
+   future worklist-driven scheduler. Keyed by Exp.Lbl.t, matching the
+   existing size_tbl/LblMap convention (evA's pp is always
+   ProgramPoint.Label lbl on a genuine, non-ghost label — see
+   analyzer.ml's use of `pp`). *)
+
+let bot_conf : abs_conf = { amem = Abs_Mem.bot; aimode = Interrupt.Disabled }
+let bot_res : abs_res = { avalue = Abs_Val.bot; app = PPSet.empty }
+let bot_out : abs_res * abs_conf = (bot_res, bot_conf)
+
+(* T_in : LExp -> Conf# *)
+let t_in : abs_conf LblMap.t ref = ref LblMap.empty
+
+(* T_out : LExp -> Output# (Output# = abs_res * abs_conf here) *)
+let t_out : (abs_res * abs_conf) LblMap.t ref = ref LblMap.empty
+
+module LblSet = Set.Make (Exp.Lbl)
+
+(* Worklist W of labels pending (re-)evaluation. *)
+let worklist : LblSet.t ref = ref LblSet.empty
+
+(* Reverse dependency edges: lbl -> { w' | w' reads T_out(lbl) while being
+   evaluated }. Used to re-queue dependents once T_out(lbl) changes
+   ("∀w' whose evaluation needs that of w: W := Add(W, w')"). *)
+let tab_deps : LblSet.t LblMap.t ref = ref LblMap.empty
+
+let reset_tabulation () : unit =
+  t_in := LblMap.empty;
+  t_out := LblMap.empty;
+  worklist := LblSet.empty;
+  tab_deps := LblMap.empty
+
+let t_in_find (lbl : Exp.Lbl.t) : abs_conf =
+  match LblMap.find_opt lbl !t_in with Some c -> c | None -> bot_conf
+
+let t_out_find (lbl : Exp.Lbl.t) : abs_res * abs_conf =
+  match LblMap.find_opt lbl !t_out with Some o -> o | None -> bot_out
+
+(* T_in(lbl) := T_in(lbl) ⊔# c#; returns whether T_in(lbl) grew. *)
+let t_in_join (lbl : Exp.Lbl.t) (c : abs_conf) : bool =
+  let old = t_in_find lbl in
+  let joined = join_conf old c in
+  if leq_conf joined old then false
+  else begin
+    t_in := LblMap.add lbl joined !t_in;
+    true
+  end
+
+(* T_out(lbl) := out (f is monotone in T_in, so an outright set is
+   equivalent to joining with the old value) — relies on old ⊑ out, checked
+   below. Returns whether T_out(lbl) changed. *)
+let t_out_set (lbl : Exp.Lbl.t) (out : abs_res * abs_conf) : bool =
+  let old = t_out_find lbl in
+  if not (leq_out old out) then
+    raise
+      (Runtime_error "[Tabulate] T_out shrank: f is not monotone in T_in");
+  if leq_out out old then false
+  else begin
+    t_out := LblMap.add lbl out !t_out;
+    true
+  end
+
+let worklist_add (lbl : Exp.Lbl.t) : unit =
+  worklist := LblSet.add lbl !worklist
+
+let worklist_select () : Exp.Lbl.t option =
+  match LblSet.min_elt_opt !worklist with
+  | None -> None
+  | Some lbl ->
+      worklist := LblSet.remove lbl !worklist;
+      Some lbl
+
+(* Record that evaluating `for_` reads T_out(`needs`). *)
+let record_dep ~(needs : Exp.Lbl.t) ~(for_ : Exp.Lbl.t) : unit =
+  let old =
+    match LblMap.find_opt needs !tab_deps with
+    | Some s -> s
+    | None -> LblSet.empty
+  in
+  tab_deps := LblMap.add needs (LblSet.add for_ old) !tab_deps
+
+(* -------------------------------------------------------------------- *)
 
 let record_sem (pp : ProgramPoint.t) (c : abs_conf) : unit =
   asem := Abs_Sem.weak_write !asem pp c.amem
@@ -645,6 +742,23 @@ let rec evalA ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
 let rec eval_no_post ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
     abs_res * abs_conf =
   evA eval_no_post ~lvalue { c with aimode = Interrupt.Disabled } lbl_exp
+
+(* Tabulated evalA: subexpressions are read/written through T_in/T_out
+   instead of raw recursion, including While. evA's own While case still
+   runs its local `iterate` loop (widening/termination logic untouched);
+   since `self` = evalA_tab there too, each round's econd/ebody calls now
+   join into T_in and get memoized like any other node. *)
+let rec evalA_tab ?(lvalue = false) (c : abs_conf) (lbl_exp : Exp.lbl_t) :
+    abs_res * abs_conf =
+  let lbl = lbl_exp.lbl in
+  let changed = t_in_join lbl c in
+  let unseen = not (LblMap.mem lbl !t_out) in
+  (* Always return what the table holds (not the freshly computed value
+     directly), so callers never see something t_out_set rejected as
+     non-monotone. *)
+  if changed || unseen then
+    ignore (t_out_set lbl (evA evalA_tab ~lvalue (t_in_find lbl) lbl_exp));
+  t_out_find lbl
 
 (* Apply a single compiled assignment atom without triggering post-step. *)
 let apply_atom (atom : summary_atom) (c : abs_conf) : abs_conf =
@@ -1195,8 +1309,9 @@ let rec compile_handler (lbl_exp : Exp.lbl_t) : handler_summary =
 
 let init_confa (pgm : Program.t) : abs_conf =
   reset_outputs ();
+  reset_tabulation ();
   let c0 = { amem = Abs_Mem.bot; aimode = Interrupt.Disabled } in
-  let _, c_globals = evalA c0 pgm.global in
+  let _, c_globals = evalA_tab c0 pgm.global in
   aenv0 := !aenv;
   let hs', iset' =
     List.fold_left
@@ -1232,7 +1347,7 @@ let filter_main_sem (asem : Abs_Sem.t) : Abs_Sem.t =
 
 let abs_def_intp (pgm : Program.t) : Abs_Sem.t =
   let c_init = init_confa pgm in
-  let _, _c_final = evalA c_init pgm.main in
+  let _, _c_final = evalA_tab c_init pgm.main in
   filter_main_sem !asem
 
 let abs_analyze ?(use_compile_opt = true) ?(use_selective_opt = true) ?use_opt
@@ -1245,5 +1360,5 @@ let abs_analyze ?(use_compile_opt = true) ?(use_selective_opt = true) ?use_opt
   in
   if not use_compile_opt then use_compiled_fp := false;
   use_selective_handler_application := use_selective_opt;
-  let _, _c_final = evalA c_init pgm.main in
+  let _, _c_final = evalA_tab c_init pgm.main in
   (!asem, !errs)
