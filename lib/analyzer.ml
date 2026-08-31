@@ -691,6 +691,7 @@ let evA (self : ?lvalue:bool -> abs_conf -> Exp.lbl_t -> abs_res * abs_conf)
           join_out (r2, c2) (r3, c3)
     | While (_id, econd, ebody) ->
         let rec iterate (i : int) (input : abs_conf) : abs_conf =
+          reset_tabulation ();
           let rcond, ccond = self input econd in
           let cond_itv = proj_int rcond.avalue in
           if cond_itv = Itv.Bool.false_ then
